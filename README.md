@@ -33,7 +33,7 @@ Power
 -> DHCP
 -> mDNS (_scrypted-viewport._tcp.local)
 -> If unconfigured: backlight on, show IP + hostname (persistent until `/config`)
--> If configured: enter sleep state (backlight off, wait for `/wake` or a tap)
+-> If configured: enter sleep state (backlight off, wait for `POST /state` or a tap)
 
 ## Resolution
 
@@ -64,7 +64,11 @@ Trust model: LAN-only, no auth, no TLS. Deploy on a trusted VLAN.
 
 ## API
 
-### GET /health
+Four endpoints. `GET /state` and `GET /config` are the read surface; `POST /config`, `POST /state`, and `POST /frame` are the write surface.
+
+### GET /state
+
+Returns the device's runtime status. Replaces the old `/health` endpoint.
 
 Returns `200 OK` with JSON:
 
@@ -79,9 +83,6 @@ Returns `200 OK` with JSON:
   "frames_received": 4271,
   "decode_errors": 0,
   "callback_failures": 2,
-  "idle_timeout_ms": 60000,
-  "brightness": 80,
-  "orientation": "portrait",
   "resolution": "480x800",
   "ip": "192.168.1.42",
   "free_heap": 123456,
@@ -91,6 +92,35 @@ Returns `200 OK` with JSON:
 
 `state` is `awake`, `asleep`, or `unconfigured`. `last_frame_ms_ago` is `null` if no frame has been received since boot.
 
+### POST /state
+
+```json
+{ "state": "wake" }
+```
+
+- `state` is `wake` or `sleep`. Anything else: `400`.
+- Idempotent. Already-in-that-state calls return `204` and do nothing.
+- `wake`: backlight on, render loading screen (until the next `/frame`), reset idle timer.
+- `sleep`: backlight off; framebuffer discarded.
+- No callback echo (Scrypted initiated).
+- Response: `204`.
+
+### GET /config
+
+Returns the persisted config:
+
+```json
+{
+  "display": "mudroom",
+  "callback": "http://scrypted.local:11080/api/viewport/touch",
+  "idle_timeout_ms": 60000,
+  "orientation": "portrait",
+  "brightness": 80
+}
+```
+
+Before first `/config`: returns `200` with an object whose fields are all `null` except defaults (`brightness: 80`, `orientation: "portrait"`, `idle_timeout_ms: 60000`).
+
 ### POST /config
 
 ```json
@@ -98,34 +128,25 @@ Returns `200 OK` with JSON:
   "display": "mudroom",
   "callback": "http://scrypted.local:11080/api/viewport/touch",
   "idle_timeout_ms": 60000,
-  "orientation": "portrait"
+  "orientation": "portrait",
+  "brightness": 80
 }
 ```
 
+- **Partial update**: only fields present in the body are changed; omitted fields keep their current values. The persisted config is replaced atomically with the merged result.
 - Persisted to NVS, survives reboot.
-- Idempotent; subsequent calls atomically replace prior config.
+- Idempotent; reposting the same body yields the same state.
 - `display` must be non-empty; `callback` must be `http://...`.
-- `idle_timeout_ms` optional, default `60000`. `0` disables the idle timer entirely. Non-zero values must be ≥ `5000`; otherwise `400`. Scrypted should use the same value for its own per-stream timeout so both ends agree, but they time independently — either can end the session.
-- `orientation` optional, default `portrait`. Values: `portrait` (480x800) or `landscape` (800x480). Changing orientation takes effect immediately, including for the IP and Loading screens. Scrypted must send JPEGs at the new effective resolution after a change.
+- `idle_timeout_ms`: `0` disables the idle timer; non-zero values must be ≥ `5000`. Otherwise `400`. Scrypted should use the same value for its own per-stream timeout so both ends agree, but they time independently — either can end the session.
+- `orientation`: `portrait` (480x800) or `landscape` (800x480). Default `portrait` on first boot. Changing orientation takes effect immediately, including for the IP and Loading screens. Scrypted must send JPEGs at the new effective resolution after a change.
+- `brightness`: integer `0`–`100`. Default `80` on first boot. Applied immediately if awake; takes effect on next wake if asleep. PWM is gamma-corrected so the scale is perceptual.
 - Response: `204 No Content`. Invalid body: `400`.
 
-### POST /wake
+To tweak only brightness:
 
-Transitions the device to the wake state (backlight on, loading screen) without painting a frame.
-
-- Idempotent. Already-awake calls return `204` and do nothing.
-- Resets the idle timer.
-- No callback to Scrypted (Scrypted already knows — it initiated).
-- Response: `204`.
-
-### POST /sleep
-
-Transitions the device to the sleep state.
-
-- Idempotent. Already-asleep calls return `204` and do nothing.
-- Backlight off; framebuffer is discarded (not preserved across sleep).
-- No callback to Scrypted.
-- Response: `204`.
+```json
+{ "brightness": 50 }
+```
 
 ### POST /frame
 
@@ -134,67 +155,56 @@ Paints a frame. Does **not** change wake/sleep state.
 - `Content-Type: image/jpeg`, body is raw JPEG bytes.
 - Image must match the effective resolution (480x800 portrait, 800x480 landscape) as a baseline JPEG. Device does not scale, rotate, or letterbox JPEG content.
 - Max size: 1 MB.
-- **Requires awake state.** While asleep, returns `409 Conflict` and does not paint. Scrypted must `POST /wake` first (or wait for a `wake` callback from a tap).
+- **Requires awake state.** While asleep, returns `409 Conflict` and does not paint. Scrypted must `POST /state {"state":"wake"}` first (or wait for a `wake` callback from a tap).
 - Resets the idle timer on success.
 - Single in-flight frame; concurrent posts may be rejected with `503`.
 - Returns `204` once decoded and pushed to the panel.
 - `400` malformed JPEG, `409` device asleep, `413` over size, `500` decode/display failure. On failure the previous frame stays on screen.
 
-### POST /brightness
-
-```json
-{ "brightness": 75 }
-```
-
-- Range `0`–`100`. Out-of-range: `400`.
-- Default on first boot: `80`.
-- Persisted to NVS. Applied immediately if awake, otherwise on next wake.
-- Idempotent. Response: `204`.
-
 ## Wake / Sleep
 
-Wake and sleep couple the device backlight with Scrypted's frame stream. The device owns the state; Scrypted just receives idempotent imperatives:
+Wake and sleep couple the device backlight with Scrypted's frame stream. The device owns the state; Scrypted just receives idempotent imperatives in callbacks:
 
-- `wake` → "start streaming to this display now"
-- `sleep` → "stop streaming to this display now"
+- `state=wake` → "start streaming to this display now"
+- `state=sleep` → "stop streaming to this display now"
 
-Scrypted does not track per-viewport state; it acts on the event and forgets. Repeat events are safe.
+Scrypted does not track per-viewport state; it acts on the callback and forgets. Repeats are safe.
 
 Transitions:
 
 | Trigger | Resulting state | Callback to Scrypted |
 | --- | --- | --- |
-| Tap while asleep | Awake (loading screen) | `wake` `type=tap` |
-| Tap while awake | Asleep | `sleep` `type=tap` |
-| Idle timer expires | Asleep | `sleep` `type=timeout` |
-| `POST /wake` | Awake (loading screen) | none |
-| `POST /sleep` | Asleep | none |
+| Tap while asleep | Awake (loading screen) | `state=wake event=tap` |
+| Tap while awake | Asleep | `state=sleep event=tap` |
+| Idle timer expires | Asleep | `state=sleep event=timeout` |
+| `POST /state {"state":"wake"}` | Awake (loading screen) | none |
+| `POST /state {"state":"sleep"}` | Asleep | none |
 | `POST /frame` | (no state change) | — |
 
-`/frame` never changes state. Scrypted must `POST /wake` (or wait for a tap-driven `wake` callback) before sending frames. This makes the protocol race-free: a `/frame` arriving after a tap-to-sleep is rejected with `409`, not silently re-woken.
+`/frame` never changes state. Scrypted must `POST /state {"state":"wake"}` (or wait for a tap-driven callback) before sending frames. This makes the protocol race-free: a `/frame` arriving after a tap-to-sleep is rejected with `409`, not silently re-woken.
 
-Only `tap` is detected on the touchscreen — long-press and swipes are out of scope for v1. `tap` itself is internal; what Scrypted sees is the resulting `wake` or `sleep`.
+Only `tap` is detected on the touchscreen — long-press and swipes are out of scope for v1. `tap` itself is internal; what Scrypted sees is the resulting `state`.
 
 Callback body:
 
 ```json
 {
   "display": "mudroom",
-  "event": "wake",
-  "type": "tap"
+  "state": "wake",
+  "event": "tap"
 }
 ```
 
-- `event` is `wake` or `sleep`.
-- `type` carries the cause: `tap` (any user tap), `timeout` (idle expiry — `sleep` only). Future types (e.g. `swipe_left`) can be added without changing the schema. Scrypted may ignore `type` in v1.
+- `state`: `wake` or `sleep` — the resulting state, also the imperative for Scrypted.
+- `event`: the cause. `tap` (any user tap) or `timeout` (idle expiry, sleep only). Future events (e.g. `swipe_left`) can be added without schema changes. Scrypted may ignore `event` in v1.
 
-Delivery: best-effort, ~1s timeout, no retry. Events before `/config` registers a callback are dropped. If the callback POST fails, the local state change still happens — Scrypted catches up via its own timeout or the next event.
+Delivery: best-effort, ~1s timeout, no retry. Callbacks before `/config` registers a URL are dropped. If the callback POST fails, the local state change still happens — Scrypted catches up via its own timeout or the next callback.
 
-No wall-clock timestamp is included. The device has no RTC and no SNTP. Scrypted timestamps events on receipt.
+No wall-clock timestamp is included. The device has no RTC and no SNTP. Scrypted timestamps callbacks on receipt.
 
 ## Idle
 
-After `idle_timeout_ms` (default 60s) with no `/frame`, the device sleeps and POSTs `sleep` with `type=timeout`. Scrypted should use the same timeout so its per-stream cutoff matches, but they run independently — either side can end the session, whichever notices first.
+After `idle_timeout_ms` (default 60s) with no `/frame`, the device sleeps and POSTs `state=sleep` with `event=timeout`. Scrypted should use the same timeout so its per-stream cutoff matches, but they run independently — either side can end the session, whichever notices first.
 
 ## Idempotency
 
@@ -202,14 +212,13 @@ All endpoints are safe to retry. Every state-change path converges to the same f
 
 | Endpoint | Idempotent? | Notes |
 | --- | --- | --- |
-| `GET /health` | yes | side-effect free |
-| `POST /config` | yes | atomically replaces prior config |
-| `POST /wake` | yes | no-op if already awake |
-| `POST /sleep` | yes | no-op if already asleep |
+| `GET /state` | yes | side-effect free |
+| `GET /config` | yes | side-effect free |
+| `POST /config` | yes | partial merge into persisted config, atomic |
+| `POST /state` | yes | no-op if already in that state |
 | `POST /frame` | yes (within state) | paints if awake; `409` if asleep — no partial state |
-| `POST /brightness` | yes | value is overwritten |
 
-Callbacks (`wake`, `sleep`) are imperatives, not notifications. Scrypted acts and forgets; the device never expects an ack. A dropped callback is recovered by the next user action, by Scrypted's own timeout, or by a `/frame` returning `409`.
+Callbacks (`state=wake`, `state=sleep`) are imperatives, not notifications. Scrypted acts and forgets; the device never expects an ack. A dropped callback is recovered by the next user action, by Scrypted's own timeout, or by a `/frame` returning `409`.
 
 Failure modes do not corrupt state:
 
@@ -253,7 +262,8 @@ await fetch(`${viewport}/config`, {
     display: "mudroom",
     callback: "http://scrypted.local:11080/api/viewport/touch",
     idle_timeout_ms: 60000,
-    orientation: "portrait"
+    orientation: "portrait",
+    brightness: 80
   })
 });
 ```
@@ -261,7 +271,12 @@ await fetch(`${viewport}/config`, {
 To start a session (camera event like doorbell, motion, person):
 
 ```ts
-await fetch(`${viewport}/wake`, { method: "POST" });   // device shows loading
+await fetch(`${viewport}/state`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ state: "wake" })
+});  // device shows loading
+
 // then stream frames:
 await fetch(`${viewport}/frame`, {
   method: "POST",
@@ -270,21 +285,21 @@ await fetch(`${viewport}/frame`, {
 });
 ```
 
-Handle wake/sleep callbacks at `POST /api/viewport/touch`:
+Handle callbacks at `POST /api/viewport/touch` (body: `{display, state, event}`):
 
-- `wake` → look up the camera bound to `display`, start streaming frames. (You do not need to POST `/wake` first — the device is already awake when it sends this.)
-- `sleep` → stop streaming frames to `display`.
+- `state=wake` → look up the camera bound to `display`, start streaming frames. (You do not need to `POST /state` first — the device is already awake when it sends this.)
+- `state=sleep` → stop streaming frames to `display`.
 
-Both are idempotent on Scrypted's side. Don't track viewport state; act on the event and forget. Ignore the `type` field in v1.
+Both are idempotent on Scrypted's side. Don't track viewport state; act on the callback and forget. Ignore the `event` field in v1.
 
-Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its own per-stream cutoff. The two timers run independently — either side can cut a session, whichever notices first. If the viewport's `sleep` callback is lost, the Scrypted-side timeout still ends the stream; the next `/frame` posted after the device idle-slept simply returns `409` and Scrypted stops.
+Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its own per-stream cutoff. The two timers run independently — either side can cut a session, whichever notices first. If the viewport's sleep callback is lost, the Scrypted-side timeout still ends the stream; the next `/frame` posted after the device idle-slept simply returns `409` and Scrypted stops.
 
 ## Ops
 
 - Firmware updates: reflash over USB. No OTA in v1 (planned post-v1: HTTP OTA from Scrypted).
 - Provisioning: flash the same firmware to every device. On first boot the screen shows its IP; register it from Scrypted via `POST /config`.
 - Display names must be unique across the LAN — mDNS hostnames are derived from `display` and two viewports configured with the same name will collide.
-- Factory reset: hold BOOT for 5s during normal operation to clear NVS (display name, callback, brightness, idle timeout) and reboot. The device returns to the IP screen.
+- Factory reset: hold BOOT for 5s during normal operation to clear NVS (display name, callback, brightness, idle timeout, orientation) and reboot. The device returns to the IP screen.
 - No DHCP lease: keep retrying; do not reboot. Screen shows "no network" if unconfigured.
 - Ethernet disconnect: reconnect automatically. If Scrypted is unreachable, displays go stale — nothing the device can do about it.
 - Watchdog: the ESP-IDF task watchdog reboots the device if a task hangs. Soft state is rebuilt from NVS on every boot.

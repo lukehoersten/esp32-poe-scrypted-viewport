@@ -114,16 +114,16 @@ asleep = backlight off, Scrypted not streaming
 State changes are strictly limited to these triggers:
 
 ```text
-tap while asleep      -> awake  (POST wake/tap callback)
-tap while awake       -> asleep (POST sleep/tap callback)
-idle timer expires    -> asleep (POST sleep/timeout callback)
-POST /wake (asleep)   -> awake  (no callback)
-POST /sleep (awake)   -> asleep (no callback)
+tap while asleep                     -> awake  (callback: state=wake event=tap)
+tap while awake                      -> asleep (callback: state=sleep event=tap)
+idle timer expires                   -> asleep (callback: state=sleep event=timeout)
+POST /state {"state":"wake"} asleep  -> awake  (no callback)
+POST /state {"state":"sleep"} awake  -> asleep (no callback)
 ```
 
 `/frame` never changes state. It paints if awake, returns `409` if asleep. This eliminates the race where a frame in flight could re-wake a device that just slept on a tap.
 
-Scrypted-initiated state changes (`/wake`, `/sleep`) do not echo a callback.
+Scrypted-initiated state changes via `POST /state` do not echo a callback.
 
 Frame flow (awake state only):
 
@@ -136,11 +136,11 @@ Scrypted POST /frame
   -> respond 204
 ```
 
-The callback events are `wake` and `sleep`, each with a `type` field carrying the cause:
-- `wake.type`: `tap` (future: `swipe_left`, etc.)
-- `sleep.type`: `tap`, `timeout` (future: more)
+Callback body has two fields:
+- `state`: `wake` or `sleep` — the resulting state and the imperative for Scrypted.
+- `event`: the cause. `tap` (any user tap) or `timeout` (idle expiry, sleep only). Forward-compat for future inputs like swipes.
 
-Events are idempotent imperatives — "start streaming" / "stop streaming" — not state notifications. Scrypted does not track per-viewport state. Scrypted may ignore `type` in v1.
+Callbacks are idempotent imperatives — "start streaming" / "stop streaming" — not state notifications. Scrypted does not track per-viewport state. Scrypted may ignore `event` in v1.
 
 Only `tap` is detected on the touchscreen. Long-press and swipes are out of scope for v1.
 
@@ -175,9 +175,11 @@ viewport.local
 viewport-mudroom.local
 ```
 
-### 5.1 GET /health
+Four endpoints total: `GET /state`, `GET /config`, `POST /config`, `POST /state`, `POST /frame`.
 
-Return JSON status.
+### 5.1 GET /state
+
+Return JSON status (replaces the old `/health`).
 
 Example response:
 
@@ -192,9 +194,6 @@ Example response:
   "frames_received": 4271,
   "decode_errors": 0,
   "callback_failures": 2,
-  "idle_timeout_ms": 60000,
-  "brightness": 80,
-  "orientation": "portrait",
   "resolution": "480x800",
   "ip": "192.168.1.42",
   "free_heap": 123456,
@@ -204,72 +203,90 @@ Example response:
 
 `state` is `awake`, `asleep`, or `unconfigured`. `last_frame_ms_ago` is `null` if no frame has been received since boot.
 
-Status code:
+Status code: `200 OK`.
 
-```text
-200 OK
-```
+### 5.2 GET /config
 
-### 5.2 POST /config
-
-Registers the controlling Scrypted callback.
-
-Request body:
+Return the persisted config:
 
 ```json
 {
   "display": "mudroom",
   "callback": "http://scrypted.local:11080/api/viewport/touch",
   "idle_timeout_ms": 60000,
-  "orientation": "portrait"
+  "orientation": "portrait",
+  "brightness": 80
 }
 ```
 
+Before first `/config`: `display` and `callback` are `null`; the rest carry their first-boot defaults (`idle_timeout_ms: 60000`, `orientation: "portrait"`, `brightness: 80`).
+
+Status code: `200 OK`.
+
+### 5.3 POST /config
+
+Sets or updates the device config. Partial-update semantics — only fields present in the body are changed; omitted fields keep their current values. The merged config is persisted to NVS atomically.
+
+Request body (full form):
+
+```json
+{
+  "display": "mudroom",
+  "callback": "http://scrypted.local:11080/api/viewport/touch",
+  "idle_timeout_ms": 60000,
+  "orientation": "portrait",
+  "brightness": 80
+}
+```
+
+To tweak only brightness:
+
+```json
+{ "brightness": 50 }
+```
+
 Behavior:
 
-- Store display name.
-- Store callback URL.
-- Store idle timeout (optional, default 60000).
-- Store orientation (optional, default `portrait`). Apply immediately, including to the IP/Loading screens and to the effective resolution reported in `/health` and mDNS TXT.
-- Persist all to NVS so it survives reboot.
-- May be called repeatedly.
-- Replaces old config atomically.
-
-Response:
-
-```text
-204 No Content
-```
+- For each present field: validate, then update the persisted record.
+- Apply orientation and brightness changes immediately. Orientation update redraws the IP/Loading screens (if shown) and updates mDNS TXT records.
+- Survive reboot.
+- Idempotent: re-posting the same body yields the same state.
 
 Validation:
 
-- `display` must be non-empty.
-- `callback` must be HTTP URL.
-- `idle_timeout_ms`: `0` disables the idle timer, non-zero must be ≥ `5000`. Anything else returns `400`.
-- `orientation`: must be `portrait` or `landscape`. Anything else returns `400`.
+- `display`: non-empty string.
+- `callback`: must be `http://...`.
+- `idle_timeout_ms`: `0` disables the idle timer; non-zero must be ≥ `5000`. Otherwise `400`.
+- `orientation`: `portrait` or `landscape`. Otherwise `400`.
+- `brightness`: integer `0`–`100`. Otherwise `400`.
 - HTTPS is not required for v1/v2.
-
-### 5.3 POST /wake
-
-Transitions the device to the awake state.
-
-Behavior:
-
-- If already awake: no-op, return `204`.
-- If asleep: backlight on, render loading screen, reset idle timer.
-- Do not POST a callback (Scrypted initiated).
 
 Response: `204 No Content`.
 
-### 5.4 POST /sleep
+### 5.4 POST /state
 
-Transitions the device to the asleep state.
+Sets the wake/sleep state.
+
+Request body:
+
+```json
+{ "state": "wake" }
+```
+
+or
+
+```json
+{ "state": "sleep" }
+```
 
 Behavior:
 
-- If already asleep: no-op, return `204`.
-- If awake: backlight off. Framebuffer is discarded (not preserved across sleep).
-- Do not POST a callback.
+- `wake`: backlight on, render loading screen, reset idle timer. No-op if already awake.
+- `sleep`: backlight off, framebuffer discarded. No-op if already asleep.
+- Do not POST a callback (Scrypted initiated).
+- Idempotent.
+
+Validation: `state` must be `wake` or `sleep`. Otherwise `400`.
 
 Response: `204 No Content`.
 
@@ -281,36 +298,20 @@ Headers: `Content-Type: image/jpeg`. Body: raw JPEG bytes. Expected image: basel
 
 Behavior:
 
-- If asleep: return `409 Conflict`. Do not paint. Scrypted must `POST /wake` first.
+- If asleep: return `409 Conflict`. Do not paint. Scrypted must `POST /state {"state":"wake"}` first.
 - If awake: decode, push to display, reset idle timer, return `204`.
 
 Failure responses:
 
 ```text
 400 Bad Request        invalid content-type or malformed JPEG
-409 Conflict           device is asleep; POST /wake first
+409 Conflict           device is asleep; POST /state {"state":"wake"} first
 413 Payload Too Large  JPEG exceeds configured maximum
 500 Internal Error     decode/display failure (previous frame remains)
+503 Service Unavailable concurrent frame in flight
 ```
 
-Single in-flight frame. Concurrent posts may be rejected `503`.
-
 Scrypted is responsible for scaling/cropping/composition. Scrypted Viewport does not scale.
-
-### 5.6 POST /brightness
-
-Sets backlight brightness.
-
-Request: `{"brightness": 75}`. Range `0`–`100`. Default on first boot: `80`.
-
-Behavior:
-
-- Reject out-of-range values with `400` (do not clamp).
-- Persist to NVS.
-- Apply immediately if awake; otherwise on next wake.
-- Idempotent.
-
-Response: `204 No Content`.
 
 ---
 
@@ -323,30 +324,30 @@ Example request body:
 ```json
 {
   "display": "mudroom",
-  "event": "wake",
-  "type": "tap"
+  "state": "wake",
+  "event": "tap"
 }
 ```
 
-Supported events and types:
+Supported combinations:
 
 ```text
-event=wake   type=tap            (touchscreen tap while asleep)
-event=sleep  type=tap            (touchscreen tap while awake)
-event=sleep  type=timeout        (idle timer expired)
+state=wake   event=tap        (touchscreen tap while asleep)
+state=sleep  event=tap        (touchscreen tap while awake)
+state=sleep  event=timeout    (idle timer expired)
 ```
 
 No wall-clock timestamp — the device has no RTC and no SNTP. Scrypted timestamps on receipt.
 
-`tap` is the touchscreen input; the callback event is the resulting state. The `type` field carries the cause and is forward-compatible with future inputs (swipes, long-press, hardware buttons). Scrypted may ignore `type` in v1.
+`state` is the resulting wake/sleep state, also the imperative for Scrypted. `event` carries the cause and is forward-compatible with future inputs (swipes, long-press, hardware buttons). Scrypted may ignore `event` in v1.
 
 Rules:
 
 - The device owns wake/sleep state. Scrypted does not track it.
 - Scrypted owns the viewport→camera binding and decides which stream goes to which viewport.
-- `wake`/`sleep` callbacks are idempotent imperatives: "start streaming" / "stop streaming". Scrypted acts on receipt and forgets.
+- Callbacks are idempotent imperatives: `state=wake` means "start streaming", `state=sleep` means "stop streaming". Scrypted acts on receipt and forgets.
 - Scrypted enforces its own per-stream timeout independently of the device's idle timer. Either can end a session, whichever notices first.
-- Scrypted-initiated `/sleep` and `/frame` do not echo a callback.
+- Scrypted-initiated `POST /state` and `POST /frame` do not echo a callback.
 
 Callback delivery:
 
@@ -484,13 +485,12 @@ Update TXT records when `orientation` changes via `/config`.
 Responsibilities:
 
 - Register routes:
-  - `GET /health`
+  - `GET /state`
+  - `GET /config`
   - `POST /config`
-  - `POST /wake`
-  - `POST /sleep`
+  - `POST /state`
   - `POST /frame`
-  - `POST /brightness`
-- Parse JSON for config/brightness.
+- Parse JSON for config and state bodies. Partial /config bodies are merged into the persisted record.
 - Stream JPEG request body into buffer.
 - Reject `/frame` with `409` when state is `asleep` (do not auto-wake).
 - All endpoints idempotent.
@@ -537,8 +537,8 @@ Responsibilities:
 - Detect `tap` only (touch-down + release within ~500ms, ignore movement). Long-press and swipes are out of scope.
 - Debounce.
 - On tap:
-  - If asleep: transition to awake — backlight on, render loading screen, POST `{"event":"wake","type":"tap"}`.
-  - If awake: transition to asleep — backlight off, POST `{"event":"sleep","type":"tap"}`.
+  - If asleep: transition to awake — backlight on, render loading screen, POST `{"state":"wake","event":"tap"}`.
+  - If awake: transition to asleep — backlight off, POST `{"state":"sleep","event":"tap"}`.
 - Also handle BOOT button:
   - Short press: ask `local_screens` to overlay the IP screen for 15s, then restore prior state. No callback.
   - Hold ≥5s: clear NVS via `nvs_config_reset()` and reboot.
@@ -556,8 +556,8 @@ Responsibilities:
 
 Responsibilities:
 
-- Reset timer on `/frame`, `/wake`, and tap-driven wake.
-- On expiry: transition to asleep (backlight off, POST `{"event":"sleep","type":"timeout"}`).
+- Reset timer on `/frame`, `POST /state {state:wake}`, and tap-driven wake.
+- On expiry: transition to asleep (backlight off, POST `{"state":"sleep","event":"timeout"}`).
 - Idle timeout: read from NVS (`idle_timeout_ms`), default 60000 ms. `0` disables the timer; non-zero values must be ≥ 5000 ms (validated at `/config`).
 - Scrypted is expected to use the same value as its own per-stream cutoff, but timers run independently — either side can end a session, whichever notices first.
 
@@ -698,12 +698,13 @@ for (const v of viewports) {
       callback: "http://scrypted.local:11080/api/viewport/touch",
       idle_timeout_ms: 60000,    // device uses this; Scrypted uses the same value
       orientation: "portrait",    // override per viewport if a screen is wall-mounted sideways
+      brightness: 80,
     }),
   });
 }
 ```
 
-Stream a session of frames to a viewport — triggered by either a camera event (doorbell, person, motion) or a `wake` callback from the viewport:
+Stream a session of frames to a viewport — triggered by either a camera event (doorbell, person, motion) or a `state=wake` callback from the viewport:
 
 ```ts
 await fetch(`${v.url}/frame`, {
@@ -718,7 +719,12 @@ Each viewport is bound to exactly one camera (1:1 in v1). Multi-camera cycling i
 Scrypted-initiated session (camera event):
 
 ```ts
-await fetch(`${v.url}/wake`, { method: "POST" });    // device shows loading screen
+await fetch(`${v.url}/state`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ state: "wake" }),
+});  // device shows loading screen
+
 // then push frames until the per-stream timeout elapses:
 for (const jpeg of frames) {
   const r = await fetch(`${v.url}/frame`, {
@@ -730,12 +736,12 @@ for (const jpeg of frames) {
 }
 ```
 
-Callback handler at `/api/viewport/touch`:
+Callback handler at `/api/viewport/touch` (body: `{display, state, event}`):
 
-- `wake` → look up viewport→camera binding, start streaming. No need to POST `/wake` first; device is already awake.
-- `sleep` → stop streaming to that viewport.
+- `state=wake` → look up viewport→camera binding, start streaming. No need to `POST /state` first; device is already awake.
+- `state=sleep` → stop streaming to that viewport.
 
-Both handlers are idempotent. Don't track viewport state. Apply a Scrypted-side per-stream timeout using the same `idle_timeout_ms` sent in `/config`, so streams end even if the `sleep` callback is dropped. Timers run independently — and if the device sleeps first (idle or tap), the next `/frame` returns `409` and Scrypted stops on that signal alone.
+Both handlers are idempotent. Don't track viewport state. Apply a Scrypted-side per-stream timeout using the same `idle_timeout_ms` sent in `/config`, so streams end even if the sleep callback is dropped. Timers run independently — and if the device sleeps first (idle or tap), the next `/frame` returns `409` and Scrypted stops on that signal alone.
 
 ---
 
@@ -758,16 +764,16 @@ Device gets DHCP lease over Ethernet.
 ### Milestone 2: HTTP + mDNS
 
 - Start HTTP server.
-- Implement `/health`.
-- Advertise `_scrypted-viewport._tcp.local`.
+- Implement `GET /state`.
+- Advertise `_scrypted-viewport._tcp.local` with TXT records.
 
 Acceptance:
 
 ```bash
-curl http://viewport.local/health
+curl http://viewport.local/state
 ```
 
-returns JSON.
+returns JSON with `state: "unconfigured"` on a fresh device.
 
 ### Milestone 3: Display Bring-Up
 
@@ -785,11 +791,12 @@ Screen displays deterministic test pattern.
 
 Done before any state-bearing endpoints so they can read values from NVS instead of working around hardcoded defaults.
 
-- Implement `/config` (display, callback, idle_timeout_ms, orientation).
-- Validate per spec (non-empty display, http callback, idle_timeout = 0 or ≥ 5000, orientation in {portrait, landscape}).
+- Implement `GET /config` and `POST /config` (display, callback, idle_timeout_ms, orientation, brightness).
+- Partial-update semantics on `POST /config`: only included fields are written.
+- Validate per spec (non-empty display, http callback, idle_timeout = 0 or ≥ 5000, orientation in {portrait, landscape}, brightness 0–100).
 - Persist all fields to NVS atomically.
-- Apply orientation immediately (mDNS TXT and `/health` reflect it).
-- Brightness defaults to 80 on first boot, persisted.
+- Apply orientation and brightness immediately (mDNS TXT and `/state` reflect them).
+- Brightness defaults to 80 on first boot.
 
 Acceptance:
 
@@ -797,9 +804,16 @@ Acceptance:
 curl -X POST -H "Content-Type: application/json" \
   -d '{"display":"mudroom","callback":"http://host/cb","orientation":"landscape"}' \
   http://viewport.local/config
+
+# Partial update — only brightness changes:
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"brightness":50}' \
+  http://viewport.local/config
+
+curl http://viewport.local/config
 ```
 
-After reboot, `/health` shows `configured=true`, name preserved, `orientation=landscape`, `resolution=800x480`.
+After reboot, `GET /state` shows `configured=true` and name preserved; `GET /config` shows `orientation=landscape`, `brightness=50`, and the original callback.
 
 ### Milestone 5: JPEG Frame Push
 
@@ -818,40 +832,40 @@ curl -X POST \
 
 updates screen. Re-running with `landscape` set via `/config` requires an 800×480 test image.
 
-### Milestone 6: Wake/Sleep/Brightness
+### Milestone 6: State + Idle Timer
 
-- Implement `/wake`, `/sleep`, `/brightness` (persisted to NVS).
+- Implement `POST /state` (`wake` / `sleep`, idempotent).
 - Make `/frame` reject with `409` when asleep — no auto-wake.
-- Add idle timer using `idle_timeout_ms` from NVS; on expiry, transition to sleep and POST `sleep:timeout` callback (callback target is a no-op until M7).
+- Add idle timer using `idle_timeout_ms` from NVS; on expiry, transition to sleep and POST `state=sleep event=timeout` callback (callback target is a no-op until M7).
 
 Acceptance:
 
 ```bash
-curl -X POST http://viewport.local/sleep   # backlight off
-curl -X POST http://viewport.local/wake    # backlight on, loading screen
+curl -X POST -d '{"state":"sleep"}' http://viewport.local/state  # backlight off
+curl -X POST -d '{"state":"wake"}'  http://viewport.local/state  # backlight on, loading
 ```
 
-`/frame` after `/sleep` returns 409. `/frame` after `/wake` paints. Brightness survives reboot.
+`/frame` after `state=sleep` returns 409. `/frame` after `state=wake` paints. Idle timer fires after `idle_timeout_ms` of no frames.
 
 ### Milestone 7: Touch Callback
 
 - Initialize touch controller.
 - Detect tap; toggle wake/sleep locally.
-- POST `wake:tap`, `sleep:tap`, and `sleep:timeout` callback JSON.
+- POST callback JSON for `state=wake event=tap`, `state=sleep event=tap`, and `state=sleep event=timeout`.
 
 Acceptance:
 
 ```text
-Tap on asleep device: backlight on, callback {event:wake,type:tap}.
-Tap on awake device: backlight off, callback {event:sleep,type:tap}.
-After idle_timeout_ms with no /frame: callback {event:sleep,type:timeout}.
+Tap on asleep device: backlight on, callback {state:wake,event:tap}.
+Tap on awake device: backlight off, callback {state:sleep,event:tap}.
+After idle_timeout_ms with no /frame: callback {state:sleep,event:timeout}.
 ```
 
 ### Milestone 8: Local Screens + BOOT button
 
 - Embed minimal bitmap font.
 - Render IP screen on boot when NVS has no callback (persistent).
-- Render loading screen on every wake (via tap or `/wake`); replaced by next `/frame`.
+- Render loading screen on every wake (via tap or `POST /state`); replaced by next `/frame`.
 - Wire BOOT short-press to 15s IP-screen overlay (no state change).
 - Wire BOOT 5s-hold to NVS-clear + reboot.
 
@@ -859,7 +873,7 @@ Acceptance:
 
 ```text
 Fresh device boots to IP screen.
-Tap (or POST /wake) shows "Loading…" until next /frame.
+Tap (or POST /state {state:wake}) shows "Loading…" until next /frame.
 BOOT short-press overlays IP for 15s, then restores prior state.
 BOOT 5s-hold returns the device to the IP screen.
 ```
@@ -871,7 +885,7 @@ The first post-`/frame` enhancement. Once `/frame` works end-to-end, add a strea
 - Implement `POST /stream`, `Content-Type: multipart/x-mixed-replace; boundary=…`.
 - Read chunked body, parse multipart boundaries, hand each part to the JPEG decoder.
 - Reset the idle timer on each part (not just connection open).
-- On `/sleep`, tap-to-sleep, or idle timeout: close the stream connection (signals Scrypted to stop).
+- On `POST /state {state:sleep}`, tap-to-sleep, or idle timeout: close the stream connection (signals Scrypted to stop).
 - Scrypted side moves from a Script polling `takePicture()` to a small plugin using `MediaManager` + FFmpeg to pipe MJPEG.
 
 `/frame` stays — useful forever for snapshots, doorbell stills, and curl-driven debug.
@@ -929,7 +943,7 @@ Ethernet disconnects:
 Display init fails:
 
 - log loudly
-- continue serving `/health` with `state="unconfigured"` if possible
+- continue serving `GET /state` with `state="unconfigured"` if possible
 
 Watchdog:
 
@@ -979,16 +993,16 @@ The project is successful when:
 
 1. Device powers from PoE.
 2. Device gets DHCP over Ethernet.
-3. Device advertises mDNS with TXT records (`version`, `resolution`, `name`).
-4. `/health` returns state, frame counters, and error counters.
-5. `/config` persists display, callback, idle timeout, brightness, and orientation across reboot.
-6. `/config` validates `idle_timeout_ms` (0 disables; non-zero ≥ 5000; else 400) and `orientation` (`portrait` or `landscape`; else 400). Default orientation is `portrait`.
-7. `/wake` transitions asleep→awake and is idempotent.
-8. `/sleep` transitions awake→asleep and is idempotent.
-9. `/frame` paints when awake, returns 409 when asleep, and never changes state.
-10. `/brightness` accepts 0–100 with default 80; persisted; applied with a gamma curve.
-11. Idle timer fires `sleep` with `type=timeout` after `idle_timeout_ms` of no `/frame`.
-12. Tap toggles wake/sleep locally and POSTs `wake/tap` or `sleep/tap`.
+3. Device advertises mDNS with TXT records (`version`, `resolution`, `orientation`, `name`).
+4. `GET /state` returns runtime state, frame counters, and error counters.
+5. `GET /config` returns the persisted config (with defaults filled in before first `/config`).
+6. `POST /config` persists display, callback, idle timeout, orientation, and brightness across reboot, with partial-update semantics.
+7. `POST /config` validates `idle_timeout_ms` (0 disables; non-zero ≥ 5000; else 400), `orientation` (`portrait` or `landscape`; else 400), and `brightness` (0–100; else 400). Defaults on first boot: `orientation=portrait`, `brightness=80`, `idle_timeout_ms=60000`.
+8. `POST /state` transitions wake↔sleep idempotently and rejects unknown state values with 400.
+9. `POST /frame` paints when awake, returns 409 when asleep, and never changes state.
+10. Brightness PWM is gamma-corrected (perceptual 0–100).
+11. Idle timer fires `state=sleep event=timeout` callback after `idle_timeout_ms` of no `/frame`.
+12. Tap toggles wake/sleep locally and POSTs `state=wake event=tap` or `state=sleep event=tap`.
 13. Unconfigured device shows its IP and `viewport.local` on screen.
 14. Loading screen is shown on every wake until the next `/frame` arrives.
 15. BOOT short-press overlays IP screen for 15s with no state change. BOOT 5s-hold factory-resets.
