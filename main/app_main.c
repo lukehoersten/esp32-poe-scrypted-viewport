@@ -1,6 +1,8 @@
+#include "button.h"
 #include "display.h"
 #include "http_api.h"
 #include "jpeg_decoder.h"
+#include "local_screens.h"
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
@@ -41,10 +43,12 @@ void app_main(void)
     // Display is best-effort — a missing/miswired panel must not kill
     // networking + /state.
     if (display_init() == ESP_OK) {
+        local_screens_init();
+
         // Reconcile panel with current run-state:
-        //   UNCONFIGURED -> placeholder test pattern (M8 replaces with IP screen)
+        //   UNCONFIGURED -> IP screen (so operator can register from Scrypted)
         //   ASLEEP       -> backlight off (configured device booted asleep)
-        //   AWAKE        -> leave on (shouldn't happen on a fresh boot)
+        //   AWAKE        -> leave on (not reached on fresh boot)
         viewport_state_lock();
         viewport_run_state_t s = viewport_state_get()->state;
         viewport_state_unlock();
@@ -53,8 +57,8 @@ void app_main(void)
             display_sleep();
             ESP_LOGI(TAG, "display up — configured, backlight off (asleep)");
         } else {
-            display_test_pattern();
-            ESP_LOGI(TAG, "display up — test pattern (unconfigured)");
+            local_screens_show_ip();
+            ESP_LOGI(TAG, "display up — IP screen (unconfigured)");
         }
     } else {
         ESP_LOGW(TAG, "display init failed — continuing without panel");
@@ -72,5 +76,9 @@ void app_main(void)
         }
     }
 
-    // TODO M8: Local screens (IP, loading) + BOOT button
+    // BOOT button — short press = IP overlay, hold 5s = factory reset.
+    // GPIO is a guess until confirmed against the Waveshare schematic.
+    if (button_init() != ESP_OK) {
+        ESP_LOGW(TAG, "BOOT button init failed — overlay + factory reset disabled");
+    }
 }

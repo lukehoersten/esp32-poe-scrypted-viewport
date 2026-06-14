@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 
 #include "display.h"
+#include "local_screens.h"
 #include "state_client.h"
 
 static const char *TAG = "state";
@@ -61,7 +62,10 @@ esp_err_t state_machine_set(viewport_run_state_t target)
     viewport_state_unlock();
 
     if (target == VIEWPORT_STATE_AWAKE) {
-        if (display_is_up()) display_wake();
+        if (display_is_up()) {
+            display_wake();
+            local_screens_show_loading();  // until next /frame paints
+        }
         arm_idle_timer_unlocked();
         ESP_LOGI(TAG, "AWAKE");
     } else {
