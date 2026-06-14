@@ -16,6 +16,7 @@
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
+#include "state_machine.h"
 #include "viewport_state.h"
 
 static const char *TAG = "http_api";
@@ -274,6 +275,51 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 }
 
 // ============================================================================
+// POST /state
+// ============================================================================
+static esp_err_t state_post_handler(httpd_req_t *req)
+{
+    char buf[64];
+    if (read_body(req, buf, sizeof(buf)) != ESP_OK)
+        return respond_400(req, "missing or oversized body");
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return respond_400(req, "invalid JSON");
+
+    cJSON *j = cJSON_GetObjectItemCaseSensitive(root, "state");
+    if (!cJSON_IsString(j)) {
+        cJSON_Delete(root);
+        return respond_400(req, "state must be 'wake' or 'sleep'");
+    }
+
+    viewport_run_state_t target;
+    if (strcmp(j->valuestring, "wake") == 0) {
+        target = VIEWPORT_STATE_AWAKE;
+    } else if (strcmp(j->valuestring, "sleep") == 0) {
+        target = VIEWPORT_STATE_ASLEEP;
+    } else {
+        cJSON_Delete(root);
+        return respond_400(req, "state must be 'wake' or 'sleep'");
+    }
+    cJSON_Delete(root);
+
+    esp_err_t err = state_machine_set(target);
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "device unconfigured", HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, esp_err_to_name(err), HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+// ============================================================================
 // POST /frame
 // ============================================================================
 static esp_err_t respond_status(httpd_req_t *req, const char *status, const char *body)
@@ -310,6 +356,12 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     if (!display_is_up()) {
         return respond_status(req, "500 Internal Server Error", "display not initialized");
+    }
+
+    // /frame requires AWAKE. Asleep / unconfigured → 409.
+    if (state_machine_current() != VIEWPORT_STATE_AWAKE) {
+        return respond_status(req, "409 Conflict",
+            "device asleep — POST /state {\"state\":\"wake\"} first");
     }
 
     // Single in-flight frame. Concurrent posts get 503 (spec).
@@ -368,6 +420,8 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     jpeg_decoder_unlock();
 
+    state_machine_frame_painted();  // reset idle timer
+
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
 }
@@ -383,6 +437,9 @@ static const httpd_uri_t s_config_get = {
 };
 static const httpd_uri_t s_config_post = {
     .uri = "/config", .method = HTTP_POST, .handler = config_post_handler,
+};
+static const httpd_uri_t s_state_post = {
+    .uri = "/state",  .method = HTTP_POST, .handler = state_post_handler,
 };
 static const httpd_uri_t s_frame_post = {
     .uri = "/frame",  .method = HTTP_POST, .handler = frame_post_handler,
@@ -403,10 +460,12 @@ esp_err_t http_api_start(void)
                        TAG, "register GET /config");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_config_post),
                        TAG, "register POST /config");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_state_post),
+                       TAG, "register POST /state");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_frame_post),
                        TAG, "register POST /frame");
 
     ESP_LOGI(TAG, "http server listening on :80 "
-                  "(GET /state, GET/POST /config, POST /frame)");
+                  "(GET/POST /state, GET/POST /config, POST /frame)");
     return ESP_OK;
 }

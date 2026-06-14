@@ -274,25 +274,112 @@ After every error: `decode_errors` in `GET /state` should increment.
 
 **How to verify**
 
-```bash
-curl -X POST -d '{"state":"sleep"}' http://<device-ip>/state   # backlight off
-curl -X POST -d '{"state":"wake"}'  http://<device-ip>/state   # backlight on, loading
+First make sure the device is configured (M4 must be done):
 
-# /frame while asleep:
-curl -X POST -d '{"state":"sleep"}' http://<device-ip>/state
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"viewport":"mudroom","scrypted":"http://host/cb","idle_timeout_ms":10000}' \
+  http://<device-ip>/config
+```
+
+Wake / sleep:
+
+```bash
+# Backlight off:
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"state":"sleep"}' http://<device-ip>/state
+# expect: 204
+
+# Backlight on (loading-screen placeholder until M8):
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"state":"wake"}' http://<device-ip>/state
+# expect: 204
+
+# Idempotency: repeating either is also 204 with no side effects:
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"state":"wake"}' http://<device-ip>/state
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"state":"wake"}' http://<device-ip>/state
+# Both: 204
+```
+
+`/frame` while asleep returns 409:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"state":"sleep"}' http://<device-ip>/state
 curl -i -X POST -H "Content-Type: image/jpeg" \
   --data-binary @test-480x800.jpg \
   http://<device-ip>/frame
-# expect: HTTP/1.1 409 Conflict
+# expect: HTTP/1.1 409 Conflict, body "device asleep — POST /state ..."
+```
 
-# Idle timer (assuming default 60000ms):
-curl -X POST -d '{"state":"wake"}' http://<device-ip>/state
-# wait 65s without sending /frame
+Idle timer:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"state":"wake"}' http://<device-ip>/state
+sleep 12   # idle_timeout_ms was set to 10000 above
 curl http://<device-ip>/state | jq .state
 # expect: "asleep"
 ```
 
-**Status**: ⬜ pending.
+When the timer fires, the serial log should print:
+
+```
+I (xxx) state: idle timer expired — sleeping
+I (xxx) state: ASLEEP
+```
+
+Disabling the idle timer:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"idle_timeout_ms":0}' http://<device-ip>/config
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"state":"wake"}' http://<device-ip>/state
+sleep 70
+curl http://<device-ip>/state | jq .state
+# expect: still "awake"
+```
+
+Resetting on `/frame`: every successful paint restarts the idle timer.
+
+```bash
+# Set short idle, then keep painting to keep awake:
+curl -X POST -d '{"idle_timeout_ms":10000}' \
+  -H "Content-Type: application/json" http://<device-ip>/config
+curl -X POST -d '{"state":"wake"}' \
+  -H "Content-Type: application/json" http://<device-ip>/state
+for i in 1 2 3 4 5; do
+  sleep 8
+  curl -X POST -H "Content-Type: image/jpeg" \
+    --data-binary @test-480x800.jpg http://<device-ip>/frame
+done
+curl http://<device-ip>/state | jq .state   # expect "awake"
+```
+
+Unconfigured device rejects `POST /state` with 409:
+
+```bash
+# (After factory reset / fresh boot, no /config yet)
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"state":"wake"}' http://<device-ip>/state
+# expect: 409 Conflict "device unconfigured"
+```
+
+Bad input:
+
+```bash
+curl -i -X POST -d '{"state":"middle"}' \
+  -H "Content-Type: application/json" http://<device-ip>/state    # 400
+curl -i -X POST -d 'not json' \
+  -H "Content-Type: application/json" http://<device-ip>/state    # 400
+```
+
+**Known gap (M7 closes this)**: when the idle timer fires the device transitions to ASLEEP locally but does NOT yet POST `{viewport,state:sleep}` to `<scrypted>/state`. That outbound POST lands with `state_client` in M7.
+
+**Status**: 🟡 builds clean against ESP-IDF 5.4. Awaiting hardware.
 
 ---
 
