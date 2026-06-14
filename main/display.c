@@ -249,6 +249,44 @@ esp_err_t display_fill(uint16_t rgb565)
                                      PANEL_H_ACTIVE, PANEL_V_ACTIVE, fb);
 }
 
+esp_err_t display_present_rgb565(const uint16_t *src,
+                                 uint16_t        src_w,
+                                 uint16_t        src_h)
+{
+    if (!s_up) return ESP_ERR_INVALID_STATE;
+
+    viewport_state_lock();
+    viewport_orientation_t orient = viewport_state_get()->orientation;
+    viewport_state_unlock();
+
+    void *fb = NULL;
+    esp_err_t err = esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &fb);
+    if (err != ESP_OK) return err;
+    uint16_t *dst = (uint16_t *)fb;
+
+    if (orient == VIEWPORT_ORIENTATION_LANDSCAPE) {
+        if (src_w != PANEL_H_ACTIVE || src_h != PANEL_V_ACTIVE)
+            return ESP_ERR_INVALID_SIZE;
+        memcpy(dst, src, (size_t)src_w * src_h * sizeof(uint16_t));
+    } else {
+        // Portrait: src is 480x800, rotate 90° CW into the 800x480 panel.
+        // dst dims = src_h x src_w. dst_stride = src_h.
+        // src(x,y) -> dst(x, src_h - 1 - y)
+        if (src_w != PANEL_V_ACTIVE || src_h != PANEL_H_ACTIVE)
+            return ESP_ERR_INVALID_SIZE;
+        const uint16_t dst_stride = src_h;
+        for (uint16_t y = 0; y < src_h; ++y) {
+            const uint16_t *srow = src + (size_t)y * src_w;
+            const uint16_t dst_col = (uint16_t)(src_h - 1 - y);
+            for (uint16_t x = 0; x < src_w; ++x) {
+                dst[(size_t)x * dst_stride + dst_col] = srow[x];
+            }
+        }
+    }
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE, fb);
+}
+
 esp_err_t display_test_pattern(void)
 {
     if (!s_up) return ESP_ERR_INVALID_STATE;

@@ -1,5 +1,6 @@
 #include "display.h"
 #include "http_api.h"
+#include "jpeg_decoder.h"
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
@@ -41,7 +42,12 @@ void app_main(void)
         ESP_LOGW(TAG, "display init failed — continuing without panel");
     }
 
-    // TODO M5: /frame JPEG decode -> framebuffer
+    // JPEG decoder is the M5 dependency for POST /frame. Best-effort:
+    // if it fails (e.g. hardware not present in sim) /frame just returns 500.
+    if (jpeg_decoder_init() != ESP_OK) {
+        ESP_LOGW(TAG, "jpeg decoder init failed — /frame will be unavailable");
+    }
+
     // TODO M6: POST /state + idle timer
     // TODO M7: Capacitive touch -> outbound /state POST
     // TODO M8: Local screens (IP, loading) + BOOT button

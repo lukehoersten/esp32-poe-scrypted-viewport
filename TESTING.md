@@ -201,25 +201,70 @@ Side-effects to confirm:
 
 ## M5 — JPEG Frame Push
 
-**Acceptance**: `POST /frame` paints an 800x480 (or 480x800 portrait) JPEG.
+**Acceptance**: `POST /frame` paints a 480x800 (portrait, default) or 800x480 (landscape) JPEG. Orientation determines the expected dimensions and the panel-side rotation.
 
 **How to verify**
 
 ```bash
-# After /config sets state=wake (M6 dep — for now test post-/wake or hardcode awake):
+# Default orientation (portrait) — send 480x800:
 curl -X POST -H "Content-Type: image/jpeg" \
   --data-binary @test-480x800.jpg \
   http://<device-ip>/frame
+
+# Then switch to landscape and re-test with an 800x480 JPEG:
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"orientation":"landscape"}' http://<device-ip>/config
+
+curl -X POST -H "Content-Type: image/jpeg" \
+  --data-binary @test-800x480.jpg \
+  http://<device-ip>/frame
 ```
 
-Visual: matching pattern appears on the panel. Re-test in landscape orientation with `test-800x480.jpg`.
+Visual: image fills the panel correctly oriented. After paint, `GET /state` shows `frames_received` incremented and `last_frame_ms_ago` populated.
+
+Generate test JPEGs with ImageMagick:
+
+```bash
+# 8 vertical color bars at 480x800 portrait:
+convert -size 60x800 gradient:white-black -duplicate 7 +append test-480x800.jpg
+# or just any 480x800 JPEG:
+convert -size 480x800 plasma: test-480x800.jpg
+convert -size 800x480 plasma: test-800x480.jpg
+```
 
 Negative tests:
-- Non-JPEG body → 400.
-- 1.1 MB body → 413.
-- 640x480 body (wrong size) → 400 or visible distortion (depends on decoder strictness).
 
-**Status**: ⬜ pending.
+```bash
+# Wrong Content-Type — expect 400:
+curl -i -X POST -H "Content-Type: image/png" --data-binary @anything \
+  http://<device-ip>/frame
+
+# Oversize — expect 413:
+dd if=/dev/urandom of=big.bin bs=1M count=2
+curl -i -X POST -H "Content-Type: image/jpeg" --data-binary @big.bin \
+  http://<device-ip>/frame
+
+# Wrong dimensions — expect 400 with "expected WxH, got WxH":
+convert -size 640x480 plasma: test-640x480.jpg
+curl -i -X POST -H "Content-Type: image/jpeg" --data-binary @test-640x480.jpg \
+  http://<device-ip>/frame
+
+# Concurrent posts — second gets 503:
+curl -X POST -H "Content-Type: image/jpeg" --data-binary @test-480x800.jpg \
+  http://<device-ip>/frame &
+curl -i -X POST -H "Content-Type: image/jpeg" --data-binary @test-480x800.jpg \
+  http://<device-ip>/frame   # expect 503 if first is still in flight
+
+# Garbage bytes claiming to be JPEG — expect 400:
+curl -i -X POST -H "Content-Type: image/jpeg" -d 'not a jpeg' \
+  http://<device-ip>/frame
+```
+
+After every error: `decode_errors` in `GET /state` should increment.
+
+**Known gap (M6 closes this)**: M5 paints regardless of wake/sleep state. The `/frame` → `409` when asleep rule is added with `POST /state` in M6. Until then, a configured device boots ASLEEP per spec but `/frame` still paints because the state guard isn't wired yet.
+
+**Status**: 🟡 builds clean against ESP-IDF 5.4. Awaiting hardware verification (the test pattern from M3 confirms paint works; M5 adds the JPEG path).
 
 ---
 

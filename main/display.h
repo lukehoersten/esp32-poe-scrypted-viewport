@@ -28,3 +28,12 @@ esp_err_t display_fill(uint16_t rgb565);
 
 // Show a deterministic test pattern (vertical color bars). M3 acceptance.
 esp_err_t display_test_pattern(void);
+
+// Blit an RGB565 source image to the panel, applying the current
+// orientation. Source dimensions must match the effective resolution:
+//   portrait  -> src is 480x800 (rotated 90° CW into the 800x480 panel)
+//   landscape -> src is 800x480 (copied 1:1)
+// Used by /frame after JPEG decode.
+esp_err_t display_present_rgb565(const uint16_t *src,
+                                 uint16_t        src_w,
+                                 uint16_t        src_h);

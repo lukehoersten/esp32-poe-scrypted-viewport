@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 
 #include "display.h"
+#include "jpeg_decoder.h"
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
@@ -273,6 +274,105 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 }
 
 // ============================================================================
+// POST /frame
+// ============================================================================
+static esp_err_t respond_status(httpd_req_t *req, const char *status, const char *body)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
+}
+
+static void expected_dims(uint16_t *w, uint16_t *h)
+{
+    viewport_state_lock();
+    bool portrait = (viewport_state_get()->orientation == VIEWPORT_ORIENTATION_PORTRAIT);
+    viewport_state_unlock();
+    if (portrait) { *w = 480; *h = 800; }
+    else          { *w = 800; *h = 480; }
+}
+
+static esp_err_t frame_post_handler(httpd_req_t *req)
+{
+    // Content-Type must be image/jpeg.
+    char ct[40] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK ||
+        strncasecmp(ct, "image/jpeg", 10) != 0) {
+        return respond_status(req, "400 Bad Request", "Content-Type must be image/jpeg");
+    }
+
+    if (req->content_len == 0) {
+        return respond_status(req, "400 Bad Request", "empty body");
+    }
+    if (req->content_len > JPEG_DECODER_MAX_INPUT_BYTES) {
+        return respond_status(req, "413 Payload Too Large", "JPEG > 1 MB");
+    }
+
+    if (!display_is_up()) {
+        return respond_status(req, "500 Internal Server Error", "display not initialized");
+    }
+
+    // Single in-flight frame. Concurrent posts get 503 (spec).
+    if (!jpeg_decoder_try_lock(0)) {
+        return respond_status(req, "503 Service Unavailable", "frame in flight");
+    }
+
+    esp_err_t result = ESP_OK;
+    uint8_t *in = jpeg_decoder_input_buffer();
+    size_t got = 0;
+    while (got < req->content_len) {
+        int n = httpd_req_recv(req, (char *)(in + got), req->content_len - got);
+        if (n <= 0) { result = ESP_FAIL; break; }
+        got += n;
+    }
+
+    if (result != ESP_OK) {
+        jpeg_decoder_unlock();
+        return respond_status(req, "400 Bad Request", "body read failed");
+    }
+
+    void   *rgb = NULL;
+    uint16_t w = 0, h = 0;
+    esp_err_t dec_err = jpeg_decoder_decode(got, &rgb, &w, &h);
+    if (dec_err != ESP_OK) {
+        viewport_state_lock();
+        viewport_state_get()->decode_errors++;
+        viewport_state_unlock();
+        jpeg_decoder_unlock();
+        return respond_status(req, "400 Bad Request", "JPEG decode failed");
+    }
+
+    uint16_t want_w, want_h;
+    expected_dims(&want_w, &want_h);
+    if (w != want_w || h != want_h) {
+        viewport_state_lock();
+        viewport_state_get()->decode_errors++;
+        viewport_state_unlock();
+        jpeg_decoder_unlock();
+        char msg[80];
+        snprintf(msg, sizeof(msg), "expected %ux%u, got %ux%u", want_w, want_h, w, h);
+        return respond_status(req, "400 Bad Request", msg);
+    }
+
+    esp_err_t paint_err = display_present_rgb565((const uint16_t *)rgb, w, h);
+    if (paint_err != ESP_OK) {
+        jpeg_decoder_unlock();
+        return respond_status(req, "500 Internal Server Error", "display paint failed");
+    }
+
+    viewport_state_lock();
+    viewport_state_t *st = viewport_state_get();
+    st->frames_received++;
+    st->last_frame_us = esp_timer_get_time();
+    viewport_state_unlock();
+
+    jpeg_decoder_unlock();
+
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+// ============================================================================
 // Route table + start
 // ============================================================================
 static const httpd_uri_t s_state_get = {
@@ -283,6 +383,9 @@ static const httpd_uri_t s_config_get = {
 };
 static const httpd_uri_t s_config_post = {
     .uri = "/config", .method = HTTP_POST, .handler = config_post_handler,
+};
+static const httpd_uri_t s_frame_post = {
+    .uri = "/frame",  .method = HTTP_POST, .handler = frame_post_handler,
 };
 
 esp_err_t http_api_start(void)
@@ -300,7 +403,10 @@ esp_err_t http_api_start(void)
                        TAG, "register GET /config");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_config_post),
                        TAG, "register POST /config");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_frame_post),
+                       TAG, "register POST /frame");
 
-    ESP_LOGI(TAG, "http server listening on :80 (GET /state, GET/POST /config)");
+    ESP_LOGI(TAG, "http server listening on :80 "
+                  "(GET /state, GET/POST /config, POST /frame)");
     return ESP_OK;
 }
