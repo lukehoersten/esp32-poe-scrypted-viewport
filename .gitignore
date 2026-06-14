@@ -5,6 +5,10 @@ dependencies.lock
 managed_components/
 /.cache/
 
+# Scrypted-side script: optional local type-checking
+scrypted/node_modules/
+scrypted/package-lock.json
+
 # Emacs lock files
 .#*
 \#*\#
