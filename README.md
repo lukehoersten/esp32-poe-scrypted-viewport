@@ -40,39 +40,132 @@ Power
 
 Scrypted always renders 800x480 JPEGs.
 
+## Network
+
+HTTP listen port: `80`.
+
+mDNS service: `_scrypted-viewport._tcp.local` advertised on port 80.
+
+mDNS TXT records:
+- `version=1.0.0`
+- `resolution=800x480`
+- `name=<display name>` (empty until `/config`)
+
+Hostname: `viewport.local` before configuration, `viewport-<display>.local` after.
+
+Trust model: LAN-only, no auth, no TLS. Deploy on a trusted VLAN.
+
 ## API
 
-GET /health
+### GET /health
 
-POST /config
+Returns `200 OK` with JSON:
+
+```json
 {
-  "display":"mudroom",
-  "callback":"http://scrypted.local:11080/api/viewport/touch"
+  "name": "mudroom",
+  "version": "1.0.0",
+  "configured": true,
+  "uptime_ms": 12345678,
+  "resolution": "800x480",
+  "ip": "192.168.1.42",
+  "free_heap": 123456,
+  "free_psram": 12345678
 }
+```
 
-POST /frame
-Content-Type: image/jpeg
+### POST /config
 
-POST /sleep
-
-POST /brightness
+```json
 {
-  "brightness":75
+  "display": "mudroom",
+  "callback": "http://scrypted.local:11080/api/viewport/touch"
 }
+```
+
+- Persisted to NVS, survives reboot.
+- Idempotent; subsequent calls atomically replace prior config.
+- `display` must be non-empty; `callback` must be `http://...`.
+- Response: `204 No Content`. Invalid body: `400`.
+
+### POST /frame
+
+- `Content-Type: image/jpeg`, body is raw JPEG bytes.
+- Image must be 800x480 baseline JPEG. Device does not scale or letterbox.
+- Max size: 1 MB.
+- Wakes display (backlight on) and resets the idle timer.
+- Single in-flight frame; concurrent posts may be rejected with `503`.
+- Returns `204` once decoded and pushed to the panel.
+- `400` malformed JPEG, `413` over size, `500` decode/display failure. On failure the previous frame stays on screen.
+
+### POST /sleep
+
+- Backlight off; framebuffer preserved.
+- Device stays online. Next `/frame` wakes the display. There is no `/wake`.
+- Response: `204`.
+
+### POST /brightness
+
+```json
+{ "brightness": 75 }
+```
+
+- Range `0`–`100`. Out-of-range: `400`.
+- Persisted to NVS. Applied immediately if awake, otherwise on next wake.
+- Response: `204`.
 
 ## Touch Callback
 
-{
-  "display":"mudroom",
-  "event":"tap",
-  "timestamp":1730000000
-}
+Device POSTs to the `callback` URL registered via `/config`:
 
-Supported:
-- tap
-- long_press
-- swipe_left
-- swipe_right
+```json
+{
+  "display": "mudroom",
+  "event": "tap",
+  "timestamp": 1730000000
+}
+```
+
+Events: `tap`, `long_press`, `swipe_left`, `swipe_right`. No coordinates — the device emits gestures, not points.
+
+Delivery: best-effort, ~1 second timeout, no retry queue. Events before `/config` registers a callback are dropped. The device does not interpret events; Scrypted decides what to show next.
+
+## Scrypted Integration
+
+Scrypted owns a static list of viewports and pushes frames to each. On startup, register every viewport:
+
+```ts
+await fetch(`${viewport}/config`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    display: "mudroom",
+    callback: "http://scrypted.local:11080/api/viewport/touch"
+  })
+});
+```
+
+Push a frame:
+
+```ts
+await fetch(`${viewport}/frame`, {
+  method: "POST",
+  headers: { "Content-Type": "image/jpeg" },
+  body: jpegBuffer  // 800x480 baseline JPEG, <1 MB
+});
+```
+
+Handle touch at `POST /api/viewport/touch`. The handler is the entire interaction layer — camera selection, page cycling, snapshot vs live, sleep — all in Scrypted, keyed off `display` and `event`.
+
+Idle behavior is device-local: the viewport sleeps the backlight after ~30s with no new frame. Scrypted does not need to send `/sleep` unless it wants to dim early.
+
+## Ops
+
+- Firmware updates: reflash over USB. No OTA in v1.
+- Factory reset: hold BOOT during power-on to clear NVS (display name, callback, brightness).
+- Boot screen: black until first `/frame`. `/health` is available as soon as DHCP completes.
+- No DHCP lease: keep retrying; do not reboot.
+- Ethernet disconnect: reconnect automatically; keep last frame on screen.
 
 ## Build
 
