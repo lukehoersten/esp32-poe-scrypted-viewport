@@ -781,14 +781,33 @@ Acceptance:
 Screen displays deterministic test pattern.
 ```
 
-### Milestone 4: JPEG Frame Push
+### Milestone 4: Config Persistence
 
-- Implement `/frame`.
-- Receive JPEG body.
-- Decode into framebuffer.
-- Display full frame.
+Done before any state-bearing endpoints so they can read values from NVS instead of working around hardcoded defaults.
+
+- Implement `/config` (display, callback, idle_timeout_ms, orientation).
+- Validate per spec (non-empty display, http callback, idle_timeout = 0 or ≥ 5000, orientation in {portrait, landscape}).
+- Persist all fields to NVS atomically.
+- Apply orientation immediately (mDNS TXT and `/health` reflect it).
+- Brightness defaults to 80 on first boot, persisted.
 
 Acceptance:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"display":"mudroom","callback":"http://host/cb","orientation":"landscape"}' \
+  http://viewport.local/config
+```
+
+After reboot, `/health` shows `configured=true`, name preserved, `orientation=landscape`, `resolution=800x480`.
+
+### Milestone 5: JPEG Frame Push
+
+- Implement `/frame`.
+- Receive JPEG body, decode into framebuffer, push to panel with current orientation applied.
+- Expected dimensions = effective resolution from M4.
+
+Acceptance (default portrait, so test image is 480×800):
 
 ```bash
 curl -X POST \
@@ -797,13 +816,13 @@ curl -X POST \
   http://viewport.local/frame
 ```
 
-updates screen.
+updates screen. Re-running with `landscape` set via `/config` requires an 800×480 test image.
 
-### Milestone 5: Wake/Sleep/Brightness
+### Milestone 6: Wake/Sleep/Brightness
 
-- Implement `/wake`, `/sleep`, `/brightness`.
-- Make `/frame` reject with `409` when asleep (no auto-wake).
-- Add idle timer with 60s default; fires sleep + `sleep:timeout` callback (callback target is a no-op until M7).
+- Implement `/wake`, `/sleep`, `/brightness` (persisted to NVS).
+- Make `/frame` reject with `409` when asleep — no auto-wake.
+- Add idle timer using `idle_timeout_ms` from NVS; on expiry, transition to sleep and POST `sleep:timeout` callback (callback target is a no-op until M7).
 
 Acceptance:
 
@@ -812,19 +831,7 @@ curl -X POST http://viewport.local/sleep   # backlight off
 curl -X POST http://viewport.local/wake    # backlight on, loading screen
 ```
 
-`/frame` after `/sleep` returns 409. `/frame` after `/wake` paints.
-
-### Milestone 6: Config Persistence
-
-- Implement `/config`.
-- Persist callback/name in NVS.
-- Confirm survives reboot.
-
-Acceptance:
-
-```text
-After reboot, /health shows configured=true and name preserved.
-```
+`/frame` after `/sleep` returns 409. `/frame` after `/wake` paints. Brightness survives reboot.
 
 ### Milestone 7: Touch Callback
 
