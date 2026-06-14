@@ -72,9 +72,9 @@ void app_main(void)
     // config is even slightly off; keeping that off the main task means
     // a misconfigured panel can't take down networking + /state. The
     // task also brings up the JPEG decoder and touch (touch shares the
-    // panel I²C bus and also handles long-press → identity overlay and
-    // very-long-press → factory reset, since the board's BOOT button is
-    // wired to a strap pin (GPIO35) that the EMAC owns at runtime).
+    // panel I²C bus and also handles long-press → info overlay, since
+    // the board's BOOT button is wired to a strap pin (GPIO35) that the
+    // EMAC owns at runtime).
     // ------------------------------------------------------------------
     ESP_LOGI(TAG, "boot complete — net subsystems [%s] ip=%s; "
                   "display init deferred to dsp_init task",

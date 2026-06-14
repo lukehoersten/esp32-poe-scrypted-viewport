@@ -71,6 +71,11 @@ esp_err_t jpeg_decoder_decode(size_t   jpeg_len,
     jpeg_decode_cfg_t dec_cfg = {
         .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
         .rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_RGB,
+        // TODO: known color bug on M5 — solid red renders correctly but solid
+        // green renders ~black and solid blue renders green. Likely a JPEG
+        // colorspace / channel-permutation issue, not a byte-order one
+        // (swapping to BGR turns red into blue, confirming RGB is the right
+        // element ordering). Needs follow-up.
         .conv_std      = JPEG_YUV_RGB_CONV_STD_BT601,
     };
 

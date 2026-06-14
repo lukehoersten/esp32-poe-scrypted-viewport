@@ -25,7 +25,7 @@ static const char *TAG = "touch";
 
 #define POLL_PERIOD_MS       30
 #define TAP_MAX_MS           500     // < this on release = short tap (toggle)
-#define LONG_PRESS_MS        1500    // ≥ this while held = identity overlay
+#define LONG_PRESS_MS        1500    // ≥ this while held = info overlay
 #define OVERLAY_MS           15000
 #define TAP_DEBOUNCE_MS      150
 
@@ -50,7 +50,7 @@ static void on_short_tap(void)
 
 static void on_long_press(void)
 {
-    ESP_LOGI(TAG, "long-press → identity overlay for %dms", OVERLAY_MS);
+    ESP_LOGI(TAG, "long-press → info overlay for %dms", OVERLAY_MS);
     if (display_is_up()) local_screens_overlay(OVERLAY_MS);
 }
 
@@ -119,7 +119,7 @@ esp_err_t touch_init(void)
         return err;
     }
     ESP_LOGI(TAG, "FT5426 ack'd (dev_mode=0x%02x); "
-                  "tap=toggle wake/sleep, %dms hold=identity overlay",
+                  "tap=toggle wake/sleep, %dms hold=info overlay",
              dev_mode, LONG_PRESS_MS);
 
     BaseType_t ok = xTaskCreate(touch_task, "touch", 3072, NULL, 4, &s_task);

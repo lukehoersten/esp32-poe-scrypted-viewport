@@ -49,7 +49,7 @@ Hardware unknowns — resolved:
 
 1. **DSI FPC pin count on the Waveshare board.** ✅ 22-pin DSI on board; bridge to the panel's 15-pin Pi FPC via a 15→22 adapter cable.
 2. **I²C jumper destinations.** ✅ `PIN_I2C_SDA=7`, `PIN_I2C_SCL=8` confirmed by ATTINY ack at 0x45 + FT5426 ack at 0x38.
-3. **BOOT button GPIO.** ✅ No usable GPIO — ESP32-P4 GPIO 35 strap pin is owned by EMAC TXD1 at runtime; no separate user button is wired on the Waveshare ESP32-P4-ETH. Both BOOT behaviours moved onto touch long-press (≥1.5 s → identity overlay) and very-long-press (≥5 s → factory reset).
+3. **BOOT button GPIO.** ✅ No usable GPIO — ESP32-P4 GPIO 35 strap pin is owned by EMAC TXD1 at runtime; no separate user button is wired on the Waveshare ESP32-P4-ETH. Info-overlay behaviour moved onto touch long-press (≥1.5 s). No factory-reset gesture — that path goes through USB reflash + `idf.py erase-flash`.
 4. **Flash size silkscreen.** `sdkconfig.defaults` declares 16 MB. If your SKU shipped with 32 MB the build still works but you waste half the flash.
 
 ---
@@ -71,7 +71,7 @@ Check serial for `net_eth: got ip` then `curl http://<ip>/state | jq .` and `dns
 
 ### Stage 2 — display panel (M3) ✅
 
-Look for `panel MCU id 0xc3 — Pi v1.1 architecture ack'd`, `TC358762 bridge configured`, and `DSI up: 800x480 26 MHz, 1-lane 600 Mbps, non-burst` in the serial log. Identity screen visible on tap-wake.
+Look for `panel MCU id 0xc3 — Pi v1.1 architecture ack'd`, `TC358762 bridge configured`, and `DSI up: 800x480 26 MHz, 1-lane 600 Mbps, non-burst` in the serial log. Info screen visible on tap-wake.
 
 ### Stage 3 — protocol (M4 + M5 + M6)
 
@@ -243,7 +243,7 @@ I (xxx) viewport: display up — test pattern on screen
 - Image but vertical/horizontal sync issues → adjust the `PANEL_*SYNC_*` timings in `display.c`; Pi 7" canonical values are the defaults.
 - Touch ack at `0x38` but no taps → polling task not running, or panel reset state wrong.
 
-**Status**: ✅ verified 2026-06-14 on Waveshare ESP32-P4-ETH + Hosyond 5" panel. ATTINY v1.1 firmware (ID 0xC3) acks; TC358762 bridge configured via 16 DSI Generic Long Writes; DSI 1-lane @ 600 Mbps non-burst; DPI 26 MHz RGB888; identity screen renders correctly. Bring-up notes captured in commit 6c1a26b.
+**Status**: ✅ verified 2026-06-14 on Waveshare ESP32-P4-ETH + Hosyond 5" panel. ATTINY v1.1 firmware (ID 0xC3) acks; TC358762 bridge configured via 16 DSI Generic Long Writes; DSI 1-lane @ 600 Mbps non-burst; DPI 26 MHz RGB888; info screen renders correctly. Bring-up notes captured in commit 6c1a26b.
 
 ---
 
@@ -469,7 +469,7 @@ curl http://<device-ip>/state | jq .state   # expect "awake"
 Unconfigured device rejects `POST /state` with 409:
 
 ```bash
-# (After factory reset / fresh boot, no /config yet)
+# (After fresh boot / NVS erase, no /config yet)
 curl -i -X POST -H "Content-Type: application/json" \
   -d '{"state":"wake"}' http://<device-ip>/state
 # expect: 409 Conflict "device unconfigured"
@@ -554,51 +554,40 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 
 **No POST when unconfigured**
 
-- After factory reset, tapping the screen does nothing (no Scrypted URL to call). No queue entries dropped to disk.
+- Before `/config` provides a Scrypted URL, tapping the screen does nothing outbound (no Scrypted URL to call). No queue entries dropped to disk.
 
-**Status**: ✅ verified 2026-06-14. FT5426 acks at 0x38; short tap toggles awake/sleep, ≥1.5s hold opens the identity overlay, ≥5s hold triggers factory reset. Outbound `/state` POST gated on configured flag (untested without Scrypted).
+**Status**: ✅ verified 2026-06-14. FT5426 acks at 0x38; short tap toggles awake/sleep, ≥1.5s hold opens the info overlay. Outbound `/state` POST gated on configured flag (untested without Scrypted).
 
 ---
 
-## M8 — Local Screens + BOOT button
+## M8 — Local Screens + touch long-press
 
-**Acceptance**: identity screen on first boot; loading screen on every wake; BOOT button works.
+**Acceptance**: info screen on first boot; loading screen on every wake; long-press shows the info overlay.
 
 **Visual checks (panel-attached)**
 
-- Fresh flash (or after factory reset) → screen shows four centered white-on-black lines (auto-scaled to fit):
-  ```
-  viewport
-  viewport.local
-  192.168.x.y
-  unconfigured
-  ```
+- Fresh flash → screen shows the info screen (~15 lines of `label  value` pairs, white on black, auto-scaled). When unconfigured it reports `name unset`, `config no`, `state unconfigured`.
 - `POST /config` with viewport + scrypted → device transitions to ASLEEP, backlight off.
 - `POST /state {state:wake}` (or tap) → backlight on, `Loading...` centered until the first `/frame` lands.
 - `POST /frame` while AWAKE → loading screen replaced by the JPEG.
-- **BOOT short-press while configured** → identity overlay for 15s showing four lines populated from current state, e.g.:
-  ```
-  mudroom
-  viewport-mudroom.local
-  192.168.1.42
-  asleep
-  ```
+- **Long-press (≥1.5s)** at any state → info overlay for 15 s with the full current config + state dump (name, host, ip, state, config, scrypt, orient, bright, idle, fw, up, frames, errs, heap, psram).
 - `POST /state {state:sleep}` (or idle timeout, or tap-while-awake) → backlight off.
 
-**BOOT button** (GPIO 0 placeholder — see Hardware note below)
+**Touch gestures** (no hardware button — see Hardware note)
 
-- Short press at any state: backlight wakes if it was off, identity screen overlays for 15s, then `local_screens_restore_for_state()` paints black (Scrypted's next `/frame` repaints if awake; the state machine handles backlight if asleep). Does not change wake/sleep state.
-- Hold ≥ 5s: serial logs `BOOT held 5000ms → factory reset`, NVS clears via `nvs_config_reset()`, `esp_restart()`. After reboot the device comes back UNCONFIGURED with the IP screen.
+- Short tap (<500 ms): toggle wake / sleep.
+- Long-press (≥1.5 s): info overlay for 15 s.
+- No factory-reset gesture. Use USB + `idf.py erase-flash` to clear NVS.
 
-**Hardware note**: `PIN_BOOT_BUTTON = 0` in `button.c` is a guess. ESP32-P4's official strap pin is GPIO35 but that's owned by RMII TXD1 at runtime. Most Waveshare ESP32-P4 boards expose a separate user button on a free GPIO — confirm against the schematic and update `PIN_BOOT_BUTTON` if needed. If the wrong pin is wired, the button just never triggers (input reads stuck-high) and the rest of M8 still works.
+**Hardware note**: ESP32-P4's strap pin GPIO35 is owned by EMAC TXD1 at runtime, and the Waveshare ESP32-P4-ETH doesn't expose any separate user button on a free GPIO. Both BOOT-button behaviours moved onto the touch panel (see M7).
 
 **Negative / edge**
 
-- BOOT overlay during AWAKE: the overlay paints over the live frame. Scrypted's next `/frame` (within ~1s in a normal stream) overwrites it. Acceptable: the operator sees the identity for ≤ 1 frame interval then the live view resumes.
-- BOOT overlay during ASLEEP: backlight comes on for the overlay, then `restore_for_state` paints black. The state machine's `display_sleep()` is NOT re-issued — that's an open follow-up if the screen stays lit after expiry.
-- Font fallback: any character outside the supported set (digits, period, colon, dash, slash, `L`, lowercase a–z, space) renders as blank. The identity screen, loading screen, and IPv4 strings are all covered.
+- Info overlay during AWAKE: the overlay paints over the live frame. Scrypted's next `/frame` (within ~1s in a normal stream) overwrites it. Acceptable: the operator sees the info for ≤ 1 frame interval then the live view resumes.
+- Info overlay during ASLEEP: backlight comes on for the overlay, then expires back to sleep when the 15 s timer fires.
+- Font fallback: any character outside the supported set (digits, period, colon, dash, slash, `L`, lowercase a–z, space) renders as blank. Info-screen labels and IPv4 strings are all covered.
 
-**Status**: ✅ verified 2026-06-14. Identity screen renders all four lines correctly; loading screen shown on wake when configured; identity overlay returns to prior state when its 15 s timer expires. BOOT button removed — its short-press and long-hold behaviours now live on touch (see M7).
+**Status**: ✅ verified 2026-06-14. Info screen renders the full config + state dump; loading screen shown on wake when configured; info overlay returns to prior state when its 15 s timer expires.
 
 ---
 

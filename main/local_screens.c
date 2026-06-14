@@ -72,6 +72,9 @@ static const uint8_t FONT[95][8] = {
 #define FG  0xFFFF   // white
 #define BG  0x0000   // black
 
+#define INFO_MAX_LINES   16
+#define INFO_LINE_BYTES  80   // generous: viewport_name is 64 chars max
+
 static uint16_t           *s_fb;            // PSRAM scratch at PANEL_W × PANEL_H
 static esp_timer_handle_t  s_overlay_timer;
 static volatile bool       s_overlay_active;
@@ -128,6 +131,17 @@ static void draw_centered(uint16_t fb_w, uint16_t fb_h, int y,
     }
 }
 
+// Draw a left-aligned line at (ox, oy).
+static void draw_left(uint16_t fb_w, uint16_t fb_h, int ox, int oy,
+                      const char *s, int scale)
+{
+    int n = (int)strlen(s);
+    int char_w = 8 * scale;
+    for (int i = 0; i < n; ++i) {
+        draw_char(fb_w, fb_h, ox + i * char_w, oy, s[i], scale);
+    }
+}
+
 static void overlay_expired_cb(void *arg);
 
 esp_err_t local_screens_init(void)
@@ -140,7 +154,7 @@ esp_err_t local_screens_init(void)
     }
     esp_timer_create_args_t args = {
         .callback = &overlay_expired_cb,
-        .name     = "ident_overlay",
+        .name     = "info_overlay",
     };
     esp_timer_create(&args, &s_overlay_timer);
     return ESP_OK;
@@ -166,7 +180,7 @@ esp_err_t local_screens_overlay(uint32_t duration_ms)
     if (!display_is_up()) return ESP_ERR_INVALID_STATE;
     esp_timer_stop(s_overlay_timer);
     display_wake();
-    esp_err_t err = local_screens_show_ip();
+    esp_err_t err = local_screens_show_info();
     if (err != ESP_OK) return err;
     s_overlay_active = true;
     return esp_timer_start_once(s_overlay_timer,
@@ -185,60 +199,148 @@ void local_screens_overlay_dismiss(void)
     if (display_is_up()) display_sleep();
 }
 
-esp_err_t local_screens_show_ip(void)
+// Format `n` as a compact value with K / M suffix for thousands / millions.
+// Output max 8 chars, e.g. "168k", "30M", "1234".
+static void fmt_bytes(char *out, size_t cap, uint32_t n)
+{
+    if (n >= 1000000) snprintf(out, cap, "%um", (unsigned)(n / 1000000));
+    else if (n >= 1000) snprintf(out, cap, "%uk", (unsigned)(n / 1000));
+    else snprintf(out, cap, "%u", (unsigned)n);
+}
+
+// Format an uptime in milliseconds as "h:mm:ss" or "m:ss".
+static void fmt_uptime(char *out, size_t cap, uint64_t ms)
+{
+    uint64_t s = ms / 1000;
+    unsigned hh = (unsigned)(s / 3600);
+    unsigned mm = (unsigned)((s % 3600) / 60);
+    unsigned ss = (unsigned)(s % 60);
+    if (hh > 0) snprintf(out, cap, "%u:%02u:%02u", hh, mm, ss);
+    else        snprintf(out, cap, "%u:%02u",         mm, ss);
+}
+
+esp_err_t local_screens_show_info(void)
 {
     if (!s_fb) return ESP_ERR_INVALID_STATE;
 
-    // Build the four identity lines from current state. This is the screen
-    // shown on first boot, after factory reset, and as a 15s BOOT-button
-    // overlay — it's the "who am I" view the operator needs to find the
-    // device on the LAN and confirm it's configured the way they expect.
-    //
-    //   line 1: viewport name      ("mudroom"   / "viewport" if unconfigured)
-    //   line 2: mDNS hostname      ("viewport-mudroom.local" or "viewport.local")
-    //   line 3: IP address         ("192.168.x.y" or "no network")
-    //   line 4: state              ("awake" / "asleep" / "unconfigured")
-
-    char line_name[64], line_host[80], line_ip[24], line_state[24];
+    // Snapshot every interesting value under a single lock acquisition so
+    // the render reflects a consistent point in time. The big buffers live
+    // in BSS so the call doesn't blow the caller's stack — the touch task
+    // is on a 3 KiB stack and can't carry ~1.6 KiB of locals here. Single
+    // caller protected by display ownership, so static is fine.
+    static char vp_name[64];
+    static char scrypt[256];
+    static char lines[INFO_MAX_LINES][INFO_LINE_BYTES];
+    bool configured;
+    viewport_run_state_t state;
+    viewport_orientation_t orient;
+    uint8_t bright;
+    uint32_t idle_ms;
+    uint64_t uptime_ms;
+    uint64_t frames, decode_err, post_err;
 
     viewport_state_lock();
     viewport_state_t *st = viewport_state_get();
-
-    if (st->viewport_name[0]) {
-        snprintf(line_name, sizeof(line_name), "%s", st->viewport_name);
-        snprintf(line_host, sizeof(line_host), "viewport-%s.local", st->viewport_name);
-    } else {
-        snprintf(line_name, sizeof(line_name), "viewport");
-        snprintf(line_host, sizeof(line_host), "viewport.local");
-    }
-    switch (st->state) {
-    case VIEWPORT_STATE_AWAKE:        snprintf(line_state, sizeof(line_state), "awake"); break;
-    case VIEWPORT_STATE_ASLEEP:       snprintf(line_state, sizeof(line_state), "asleep"); break;
-    default:                          snprintf(line_state, sizeof(line_state), "unconfigured"); break;
-    }
+    strncpy(vp_name, st->viewport_name, sizeof(vp_name));
+    strncpy(scrypt,  st->scrypted_url,  sizeof(scrypt));
+    vp_name[sizeof(vp_name) - 1] = '\0';
+    scrypt[sizeof(scrypt)   - 1] = '\0';
+    configured = st->configured;
+    state      = st->state;
+    orient     = st->orientation;
+    bright     = st->brightness;
+    idle_ms    = st->idle_timeout_ms;
+    uptime_ms  = ((uint64_t)esp_timer_get_time() - st->boot_us) / 1000;
+    frames     = st->frames_received;
+    decode_err = st->decode_errors;
+    post_err   = st->state_post_failures;
     viewport_state_unlock();
 
     const char *ip = net_eth_get_ip_str();
-    snprintf(line_ip, sizeof(line_ip), "%s", (ip && ip[0]) ? ip : "no network");
+    uint32_t free_heap  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
-    const char *lines[] = { line_name, line_host, line_ip, line_state };
-    const int   n_lines = (int)(sizeof(lines) / sizeof(lines[0]));
+    // ----- build label/value lines as "label value", left-aligned -----
+    int n_lines = 0;
 
+    // Capped at 32 chars so it doesn't blow past INFO_LINE_BYTES once the
+    // 8-char label is prefixed. Long names get visibly truncated; ok for
+    // an info dump on a 480-wide screen.
+    char host[32];
+    if (vp_name[0]) snprintf(host, sizeof(host), "viewport-%.15s.local", vp_name);
+    else            snprintf(host, sizeof(host), "viewport.local");
+
+    char scrypt_short[32];
+    if (!scrypt[0]) {
+        snprintf(scrypt_short, sizeof(scrypt_short), "none");
+    } else {
+        // Skip "http://" prefix to recover ~7 chars, then truncate.
+        const char *s = scrypt;
+        if (strncmp(s, "http://", 7) == 0) s += 7;
+        size_t len = strlen(s);
+        if (len > sizeof(scrypt_short) - 4) {
+            snprintf(scrypt_short, sizeof(scrypt_short), "%.*s...",
+                     (int)(sizeof(scrypt_short) - 5), s);
+        } else {
+            // Cap with precision so GCC can prove the snprintf bound.
+            snprintf(scrypt_short, sizeof(scrypt_short), "%.*s",
+                     (int)(sizeof(scrypt_short) - 1), s);
+        }
+    }
+
+    char idle_str[16];
+    if (idle_ms == 0) snprintf(idle_str, sizeof(idle_str), "off");
+    else              snprintf(idle_str, sizeof(idle_str), "%us",
+                               (unsigned)(idle_ms / 1000));
+
+    char up_str[16];   fmt_uptime(up_str, sizeof(up_str), uptime_ms);
+    char heap_str[12]; fmt_bytes(heap_str,  sizeof(heap_str),  free_heap);
+    char psram_str[12]; fmt_bytes(psram_str, sizeof(psram_str), free_psram);
+
+    const char *state_str =
+        (state == VIEWPORT_STATE_AWAKE)  ? "awake"
+      : (state == VIEWPORT_STATE_ASLEEP) ? "asleep"
+                                         : "unconfigured";
+
+    // Label width is fixed at 8 chars (trailing spaces pad it). Values are
+    // left-aligned at column 8. Auto-scaler then picks a font scale to fit.
+    #define ADD(fmt, ...) do { \
+        if (n_lines < INFO_MAX_LINES) \
+            snprintf(lines[n_lines++], INFO_LINE_BYTES, fmt, ##__VA_ARGS__); \
+    } while (0)
+
+    ADD("name    %s",  vp_name[0] ? vp_name : "unset");
+    ADD("host    %s",  host);
+    ADD("ip      %s",  (ip && ip[0]) ? ip : "no network");
+    ADD("state   %s",  state_str);
+    ADD("config  %s",  configured ? "yes" : "no");
+    ADD("scrypt  %s",  scrypt_short);
+    ADD("orient  %s",  (orient == VIEWPORT_ORIENTATION_LANDSCAPE) ? "landscape" : "portrait");
+    ADD("bright  %u",  (unsigned)bright);
+    ADD("idle    %s",  idle_str);
+    ADD("fw      %s",  VIEWPORT_VERSION);
+    ADD("up      %s",  up_str);
+    ADD("frames  %llu", (unsigned long long)frames);
+    ADD("errs    %llu", (unsigned long long)(decode_err + post_err));
+    ADD("heap    %s",  heap_str);
+    ADD("psram   %s",  psram_str);
+
+    #undef ADD
+
+    // Auto-scale: largest scale where the longest line fits within 90% of
+    // width and all lines + spacing fit within 90% of height.
     uint16_t w, h;
     effective_dims(&w, &h);
 
-    // Pick the largest integer scale where the longest line fits within
-    // 90% of the screen width and all four lines plus inter-line spacing
-    // (half a line each) fit within 90% of the screen height. Falls back
-    // to scale 1 if the longest line is unusually long.
     size_t longest = 0;
     for (int i = 0; i < n_lines; ++i) {
         size_t l = strlen(lines[i]);
         if (l > longest) longest = l;
     }
+
     int scale = 1;
     for (int s = 6; s >= 1; --s) {
-        int line_w = (int)longest * 8 * s;
+        int line_w  = (int)longest * 8 * s;
         int total_h = n_lines * 8 * s + (n_lines - 1) * 4 * s;
         if (line_w <= (w * 9) / 10 && total_h <= (h * 9) / 10) {
             scale = s;
@@ -246,14 +348,15 @@ esp_err_t local_screens_show_ip(void)
         }
     }
 
-    int line_h = 8 * scale;
+    int line_h  = 8 * scale;
     int spacing = 4 * scale;
     int total_h = n_lines * line_h + (n_lines - 1) * spacing;
-    int y0 = (h - total_h) / 2;
+    int y0      = (h - total_h) / 2;
+    int x0      = (w - (int)longest * 8 * scale) / 2;
 
     clear(BG);
     for (int i = 0; i < n_lines; ++i) {
-        draw_centered(w, h, y0 + i * (line_h + spacing), lines[i], scale);
+        draw_left(w, h, x0, y0 + i * (line_h + spacing), lines[i], scale);
     }
     return display_present_rgb565(s_fb, w, h);
 }
@@ -273,4 +376,3 @@ esp_err_t local_screens_show_loading(void)
 
     return display_present_rgb565(s_fb, w, h);
 }
-

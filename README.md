@@ -288,9 +288,9 @@ Don't design Scrypted-side logic that waits for the device to confirm a state ch
 
 **When the device does NOT POST**
 
-- Before `/config` has registered a `scrypted` URL (boot state, factory reset). Silently dropped.
+- Before `/config` has registered a `scrypted` URL (boot state, NVS-erased). Silently dropped.
 - For state changes Scrypted initiated (`POST /state`, `POST /frame` while asleep). Scrypted already knows; echoing would loop.
-- BOOT short-press IP overlay (not a state change).
+- Long-press info overlay (not a state change).
 
 **Trust model**
 
@@ -334,16 +334,20 @@ Failure modes do not corrupt state:
 - Network drop mid-stream: device idle-sleeps when the timer expires.
 - Concurrent `/frame` posts: one wins, the other gets `503`; no half-painted frames.
 
-## BOOT button
+## Touch gestures
 
-- **Short press**: overlay the IP screen for 15 seconds, then return to the prior state. Useful for identifying or re-registering a device that's already configured. Wakes the backlight temporarily; does not change the wake/sleep state and does not POST to Scrypted. An incoming `/frame` while the overlay is showing is rejected with `409` (state is still "sleep" underneath).
-- **Hold ≥5s**: factory reset — clear NVS, reboot. The device comes back unconfigured, showing the IP screen until Scrypted POSTs `/config`.
+The board has no usable user button (GPIO 35 is owned by EMAC TXD1 at runtime), so both behaviours live on the touch panel:
+
+- **Short tap** (<500 ms): toggle wake / sleep. POSTs `/state` to Scrypted when configured.
+- **Long-press** (≥1.5 s): overlay the info screen for 15 seconds, then return to the prior state. Useful for identifying or re-registering a device that's already configured. Wakes the backlight temporarily; does not change the wake/sleep state and does not POST to Scrypted. An incoming `/frame` while the overlay is showing is rejected with `409` (state is still "sleep" underneath).
+
+There is no factory-reset gesture. To wipe NVS, plug USB and run `idf.py erase-flash` followed by a normal reflash.
 
 ## Local rendering
 
 The device renders exactly two things itself; everything else is a JPEG from Scrypted:
 
-- **Identity screen**: four centered lines — viewport name, mDNS hostname, IP address, and current state. Shown on first boot until `/config`, after factory reset, and as a 15s overlay when BOOT is short-pressed. The font scale auto-fits the longest line within 90% of the screen width. Unconfigured devices show `viewport` / `viewport.local` / `<ip>` / `unconfigured`; configured devices show e.g. `mudroom` / `viewport-mudroom.local` / `192.168.1.42` / `asleep`.
+- **Info screen**: ~15 lines of `label  value` pairs (white on black, auto-scaled) covering the full `GET /config` + `GET /state` dump — name, host, ip, state, configured, scrypted, orientation, brightness, idle, firmware, uptime, frames, errors, free heap, free PSRAM. Shown on first boot until `/config`, on NVS erase, and as a 15 s overlay on a touch long-press.
 - **Loading screen**: shown between a wake and the next `/frame` arriving. Plain "Loading…" text. Rendered in the current orientation.
 
 Both use a small embedded bitmap font — full lowercase a–z, digits, period, colon, dash, slash, plus uppercase `L` for "Loading...". No LVGL, no general text engine.
@@ -421,7 +425,7 @@ Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its
 - Firmware updates: reflash over USB. No OTA in v1 (planned post-v1: HTTP OTA from Scrypted).
 - Provisioning: flash the same firmware to every device. On first boot the screen shows its IP; register it from Scrypted via `POST /config`.
 - Viewport names must be unique across the LAN — mDNS hostnames are derived from `viewport` and two devices configured with the same name will collide.
-- Factory reset: hold BOOT for 5s during normal operation to clear NVS (viewport name, scrypted URL, brightness, idle timeout, orientation) and reboot. The device returns to the IP screen.
+- NVS wipe: plug USB and run `idf.py erase-flash` followed by `idf.py flash`. The device boots clean and shows the info screen until `/config` is POSTed.
 - No DHCP lease: keep retrying; do not reboot. Screen shows "no network" if unconfigured.
 - Ethernet disconnect: reconnect automatically. If Scrypted is unreachable, displays go stale — nothing the device can do about it.
 - Watchdog: the ESP-IDF task watchdog reboots the device if a task hangs. Soft state is rebuilt from NVS on every boot.
@@ -443,7 +447,7 @@ idf.py -p /dev/cu.usbmodem* flash monitor
 
 | File | What it does |
 | --- | --- |
-| `app_main.c` | Boot sequence: NVS → state → Ethernet → mDNS → HTTP → state machine → state-client worker → display → JPEG decoder → touch → BOOT button. |
+| `app_main.c` | Boot sequence: NVS → state → Ethernet → mDNS → HTTP → state machine → state-client worker → display → JPEG decoder → touch. |
 | `viewport_state.{h,c}` | Shared runtime state behind a FreeRTOS mutex; every module reads/writes through `viewport_state_lock`. |
 | `nvs_config.{h,c}` | Persist viewport, scrypted URL, idle timeout, orientation, brightness to NVS. Load on boot; flip state UNCONFIGURED → ASLEEP when both name + URL are present. |
 | `net_eth.{h,c}` | Internal EMAC + IP101GRI PHY init, DHCP wait, IP getter. Pin map verified against Waveshare wiki + ESPHome's working config. |
@@ -455,7 +459,7 @@ idf.py -p /dev/cu.usbmodem* flash monitor
 | `state_client.{h,c}` | Worker task + `xQueueOverwrite()` depth-1 queue for outbound POSTs to `<scrypted>/state`. 1 s timeout, fire-and-forget, `state_post_failures` counter. |
 | `touch.{h,c}` | FT5426 polling at 30 ms over the shared I²C bus. Tap = down→up within 500 ms, 150 ms debounce. |
 | `local_screens.{h,c}` | 8×8 bitmap font (sparse 95-char table populated for the IP and Loading strings), centered text rendering at scale 3×/4× into a PSRAM scratch FB, routed through `display_present_rgb565()` so orientation is automatic. |
-| `button.{h,c}` | BOOT button polling. Short press → 15 s IP-screen overlay. ≥ 5 s hold → `nvs_config_reset()` + `esp_restart()`. |
+| `touch.{h,c}` | FT5426 polling. Short tap → toggle wake/sleep. ≥1.5 s hold → 15 s info-screen overlay. (Replaced `button.{h,c}` — no usable hardware button.) |
 
 ### Memory strategy
 
@@ -489,7 +493,7 @@ Every endpoint is idempotent; every failure leaves the device in a sane state.
 In rough priority order. Each entry links the relevant section so you can pick up cold.
 
 1. **Hardware bring-up of M1 + M2** — flash the board and confirm DHCP + `GET /state` over Ethernet. No panel needed; ~10 minutes once the board is reachable. See [`TESTING.md` Stage 1](TESTING.md#stage-1--board-comes-alive-m1--m2).
-2. **Schematic confirmation** — open the Waveshare ESP32-P4-ETH schematic PDF and confirm: DSI FPC pin count, I²C GPIO mapping (`PIN_I2C_SDA=7`, `PIN_I2C_SCL=8` in `display.c` are placeholders), BOOT button GPIO (`PIN_BOOT_BUTTON=0` in `button.c` is a guess), flash chip size silkscreen. See [`TESTING.md` Hardware prerequisites](TESTING.md#hardware-prerequisites).
+2. **Schematic confirmation** — open the Waveshare ESP32-P4-ETH schematic PDF and confirm flash chip size silkscreen against `sdkconfig.defaults`. DSI FPC pin count, I²C GPIOs (`PIN_I2C_SDA=7`, `PIN_I2C_SCL=8`), and BOOT button availability are already resolved on hardware — see [`TESTING.md` Hardware prerequisites](TESTING.md#hardware-prerequisites).
 3. **Source the DSI adapter cable** — 15-pin Pi-FPC → Waveshare-side DSI. Order matches what step 2 reveals.
 4. **Stage-by-stage bench verification (M3 → M8)** — work through [`TESTING.md` Recommended bench order](TESTING.md#recommended-bench-order) with the panel attached and jumpers wired. Each stage flips its milestones to ✅.
 5. **End-to-end with Scrypted** — paste [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts) into Scrypted's Scripts plugin, add a viewport device, trigger a bound camera, watch the panel light up. See [`scrypted/README.md`](scrypted/README.md).

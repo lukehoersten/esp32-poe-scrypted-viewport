@@ -63,9 +63,9 @@ esp_err_t state_machine_set(viewport_run_state_t target)
             display_wake();
             // Content choice: configured devices show "Loading…" until
             // Scrypted pushes a /frame; unconfigured devices show the
-            // identity screen since there's no Scrypted to push anything.
+            // info screen since there's no Scrypted to push anything.
             if (configured) local_screens_show_loading();
-            else            local_screens_show_ip();
+            else            local_screens_show_info();
         }
         arm_idle_timer_unlocked();
         ESP_LOGI(TAG, "AWAKE (%s)", configured ? "configured" : "unconfigured");
