@@ -64,11 +64,20 @@ Expected capabilities:
 
 5" 800×480 IPS capacitive-touch MIPI DSI display, Raspberry Pi-compatible Hosyond/Amazon model.
 
-Native resolution:
+Native panel resolution:
 
 ```text
-800x480
+800x480 (landscape)
 ```
+
+Effective resolution depends on `orientation` set via `/config`:
+
+```text
+portrait  (default) -> 480x800
+landscape           -> 800x480
+```
+
+Orientation is applied during framebuffer-to-panel push. JPEGs from Scrypted must match the effective resolution; the device never rotates or scales JPEG content.
 
 Firmware should target this exact hardware. No runtime display detection is required.
 
@@ -93,53 +102,52 @@ power on
   -> wait for API calls
 ```
 
-Frame flow:
-
-```text
-Scrypted renders 800x480 JPEG
-  -> HTTP POST /frame
-  -> Scrypted Viewport receives raw JPEG
-  -> decode JPEG into framebuffer/display buffer
-  -> push to DSI display
-  -> turn on backlight
-  -> reset idle timer
-```
-
 Wake/sleep model:
 
-Wake and sleep couple the backlight with Scrypted's frame stream. The two move together, never independently.
+Wake and sleep couple the backlight with Scrypted's frame stream. The two move together, never independently. The device owns the state.
 
 ```text
-wake  = backlight on  + Scrypted streaming frames
-sleep = backlight off + Scrypted not streaming
+awake = backlight on,  Scrypted streaming frames
+asleep = backlight off, Scrypted not streaming
 ```
 
-Touch flow:
+State changes are strictly limited to these triggers:
 
 ```text
-tap while asleep:
-  backlight on
-  render loading screen
-  POST {"event":"wake"} -> Scrypted starts streaming
-  next /frame replaces loading screen
-
-tap while awake:
-  backlight off
-  POST {"event":"sleep"} -> Scrypted stops streaming
-
-idle timer fires (60s with no /frame):
-  backlight off
-  POST {"event":"sleep"} -> Scrypted stops streaming
+tap while asleep      -> awake  (POST wake/tap callback)
+tap while awake       -> asleep (POST sleep/tap callback)
+idle timer expires    -> asleep (POST sleep/timeout callback)
+POST /wake (asleep)   -> awake  (no callback)
+POST /sleep (awake)   -> asleep (no callback)
 ```
 
-The callback events are `wake` and `sleep`; `tap` itself is internal. The events are idempotent imperatives — "start streaming" / "stop streaming" — not state notifications. Scrypted does not track per-viewport state; it acts on the event and forgets.
+`/frame` never changes state. It paints if awake, returns `409` if asleep. This eliminates the race where a frame in flight could re-wake a device that just slept on a tap.
 
-Scrypted-initiated `/sleep` and `/frame` do not echo a callback.
+Scrypted-initiated state changes (`/wake`, `/sleep`) do not echo a callback.
+
+Frame flow (awake state only):
+
+```text
+Scrypted POST /frame
+  -> Scrypted Viewport receives raw JPEG
+  -> decode JPEG into framebuffer
+  -> push to DSI display
+  -> reset idle timer
+  -> respond 204
+```
+
+The callback events are `wake` and `sleep`, each with a `type` field carrying the cause:
+- `wake.type`: `tap` (future: `swipe_left`, etc.)
+- `sleep.type`: `tap`, `timeout` (future: more)
+
+Events are idempotent imperatives — "start streaming" / "stop streaming" — not state notifications. Scrypted does not track per-viewport state. Scrypted may ignore `type` in v1.
 
 Only `tap` is detected on the touchscreen. Long-press and swipes are out of scope for v1.
 
+No wall-clock timestamps. The device has no RTC and no SNTP.
+
 BOOT button:
-- Short press: overlay IP screen for 15s, then return to prior state. Wakes backlight temporarily but does not change wake/sleep state and does not POST a callback.
+- Short press: overlay IP screen for 15s, then return to prior state. Wakes backlight for the overlay but does not change wake/sleep state and does not POST a callback. Incoming `/frame` during the overlay is rejected `409`.
 - Hold ≥5s: clear NVS and reboot. Device comes back unconfigured.
 
 ---
@@ -178,13 +186,23 @@ Example response:
   "name": "mudroom",
   "version": "1.0.0",
   "configured": true,
+  "state": "awake",
   "uptime_ms": 12345678,
-  "resolution": "800x480",
+  "last_frame_ms_ago": 1234,
+  "frames_received": 4271,
+  "decode_errors": 0,
+  "callback_failures": 2,
+  "idle_timeout_ms": 60000,
+  "brightness": 80,
+  "orientation": "portrait",
+  "resolution": "480x800",
   "ip": "192.168.1.42",
   "free_heap": 123456,
   "free_psram": 12345678
 }
 ```
+
+`state` is `awake`, `asleep`, or `unconfigured`. `last_frame_ms_ago` is `null` if no frame has been received since boot.
 
 Status code:
 
@@ -202,7 +220,8 @@ Request body:
 {
   "display": "mudroom",
   "callback": "http://scrypted.local:11080/api/viewport/touch",
-  "idle_timeout_ms": 60000
+  "idle_timeout_ms": 60000,
+  "orientation": "portrait"
 }
 ```
 
@@ -210,7 +229,8 @@ Behavior:
 
 - Store display name.
 - Store callback URL.
-- Store idle timeout (optional in body, default 60000).
+- Store idle timeout (optional, default 60000).
+- Store orientation (optional, default `portrait`). Apply immediately, including to the IP/Loading screens and to the effective resolution reported in `/health` and mDNS TXT.
 - Persist all to NVS so it survives reboot.
 - May be called repeatedly.
 - Replaces old config atomically.
@@ -225,109 +245,72 @@ Validation:
 
 - `display` must be non-empty.
 - `callback` must be HTTP URL.
+- `idle_timeout_ms`: `0` disables the idle timer, non-zero must be ≥ `5000`. Anything else returns `400`.
+- `orientation`: must be `portrait` or `landscape`. Anything else returns `400`.
 - HTTPS is not required for v1/v2.
 
-### 5.3 POST /frame
+### 5.3 POST /wake
 
-Displays a full-frame JPEG.
-
-Headers:
-
-```text
-Content-Type: image/jpeg
-```
-
-Body:
-
-```text
-raw JPEG bytes
-```
-
-Expected image:
-
-```text
-800x480 JPEG
-```
+Transitions the device to the awake state.
 
 Behavior:
 
-- Accept raw JPEG body.
-- Decode.
-- Display.
-- Turn on backlight.
-- Reset idle timer.
-- Return once frame is accepted/displayed.
+- If already awake: no-op, return `204`.
+- If asleep: backlight on, render loading screen, reset idle timer.
+- Do not POST a callback (Scrypted initiated).
 
-Response:
+Response: `204 No Content`.
 
-```text
-204 No Content
-```
+### 5.4 POST /sleep
+
+Transitions the device to the asleep state.
+
+Behavior:
+
+- If already asleep: no-op, return `204`.
+- If awake: backlight off. Framebuffer is discarded (not preserved across sleep).
+- Do not POST a callback.
+
+Response: `204 No Content`.
+
+### 5.5 POST /frame
+
+Paints a JPEG. Does not change wake/sleep state.
+
+Headers: `Content-Type: image/jpeg`. Body: raw JPEG bytes. Expected image: baseline JPEG at the current effective resolution (480x800 portrait, 800x480 landscape). Max size: 1 MB.
+
+Behavior:
+
+- If asleep: return `409 Conflict`. Do not paint. Scrypted must `POST /wake` first.
+- If awake: decode, push to display, reset idle timer, return `204`.
 
 Failure responses:
 
 ```text
 400 Bad Request        invalid content-type or malformed JPEG
+409 Conflict           device is asleep; POST /wake first
 413 Payload Too Large  JPEG exceeds configured maximum
-500 Internal Error     decode/display failure
+500 Internal Error     decode/display failure (previous frame remains)
 ```
 
-Recommended max JPEG size:
+Single in-flight frame. Concurrent posts may be rejected `503`.
 
-```text
-1 MB
-```
+Scrypted is responsible for scaling/cropping/composition. Scrypted Viewport does not scale.
 
-Implementation note:
-
-Scrypted is responsible for scaling/cropping/composition. Scrypted Viewport should not scale images in v1/v2.
-
-### 5.4 POST /sleep
-
-Turns off the backlight.
-
-Behavior:
-
-- Backlight off.
-- Preserve framebuffer.
-- Device remains online and ready for `/frame`.
-
-Response:
-
-```text
-204 No Content
-```
-
-### 5.5 POST /brightness
+### 5.6 POST /brightness
 
 Sets backlight brightness.
 
-Request:
-
-```json
-{
-  "brightness": 75
-}
-```
-
-Range:
-
-```text
-0-100
-```
+Request: `{"brightness": 75}`. Range `0`–`100`. Default on first boot: `80`.
 
 Behavior:
 
-- Clamp or reject out-of-range values. Prefer rejecting invalid values with 400.
-- Persist latest brightness to NVS.
-- If display is awake, apply immediately.
-- If asleep, store value for next wake.
+- Reject out-of-range values with `400` (do not clamp).
+- Persist to NVS.
+- Apply immediately if awake; otherwise on next wake.
+- Idempotent.
 
-Response:
-
-```text
-204 No Content
-```
+Response: `204 No Content`.
 
 ---
 
@@ -340,19 +323,22 @@ Example request body:
 ```json
 {
   "display": "mudroom",
-  "event": "tap",
-  "timestamp": 1730000000
+  "event": "wake",
+  "type": "tap"
 }
 ```
 
-Supported event names:
+Supported events and types:
 
 ```text
-wake
-sleep
+event=wake   type=tap            (touchscreen tap while asleep)
+event=sleep  type=tap            (touchscreen tap while awake)
+event=sleep  type=timeout        (idle timer expired)
 ```
 
-`tap` is the input the touchscreen detects; the callback event is the resulting state (`wake` or `sleep`). Idle-timer-driven sleep also sends `sleep`.
+No wall-clock timestamp — the device has no RTC and no SNTP. Scrypted timestamps on receipt.
+
+`tap` is the touchscreen input; the callback event is the resulting state. The `type` field carries the cause and is forward-compatible with future inputs (swipes, long-press, hardware buttons). Scrypted may ignore `type` in v1.
 
 Rules:
 
@@ -482,13 +468,16 @@ Responsibilities:
 
 - Set hostname.
 - Advertise `_scrypted-viewport._tcp.local` on port 80.
-- Include TXT records if easy:
+- Include TXT records:
 
 ```text
 version=1.0.0
-resolution=800x480
-name=mudroom
+resolution=<effective>    (480x800 or 800x480)
+orientation=<portrait|landscape>
+name=<display name>
 ```
+
+Update TXT records when `orientation` changes via `/config`.
 
 ### 8.4 `http_api.c`
 
@@ -497,12 +486,14 @@ Responsibilities:
 - Register routes:
   - `GET /health`
   - `POST /config`
-  - `POST /frame`
+  - `POST /wake`
   - `POST /sleep`
+  - `POST /frame`
   - `POST /brightness`
 - Parse JSON for config/brightness.
 - Stream JPEG request body into buffer.
-- Call display/JPEG functions.
+- Reject `/frame` with `409` when state is `asleep` (do not auto-wake).
+- All endpoints idempotent.
 - Return simple status codes.
 
 ### 8.5 `display.c`
@@ -510,9 +501,9 @@ Responsibilities:
 Responsibilities:
 
 - Initialize MIPI DSI display.
-- Initialize framebuffer or draw buffer.
+- Initialize framebuffer or draw buffer (always allocate 800x480x2 in RGB565; orientation determines mapping during push).
 - Control backlight.
-- Push decoded frames to display.
+- Push decoded frames to the panel with the current orientation applied (portrait = 90° rotation).
 - Sleep/wake backlight.
 
 Do not draw application UI.
@@ -546,8 +537,8 @@ Responsibilities:
 - Detect `tap` only (touch-down + release within ~500ms, ignore movement). Long-press and swipes are out of scope.
 - Debounce.
 - On tap:
-  - If asleep: transition to wake — backlight on, render loading screen, POST `{"event":"wake"}`.
-  - If awake: transition to sleep — backlight off, POST `{"event":"sleep"}`.
+  - If asleep: transition to awake — backlight on, render loading screen, POST `{"event":"wake","type":"tap"}`.
+  - If awake: transition to asleep — backlight off, POST `{"event":"sleep","type":"tap"}`.
 - Also handle BOOT button:
   - Short press: ask `local_screens` to overlay the IP screen for 15s, then restore prior state. No callback.
   - Hold ≥5s: clear NVS via `nvs_config_reset()` and reboot.
@@ -565,9 +556,10 @@ Responsibilities:
 
 Responsibilities:
 
-- Reset timer on `/frame` and on tap-driven wake.
-- On expiry: transition to sleep (backlight off, POST `{"event":"sleep"}`).
-- Idle timeout: read from NVS (`idle_timeout_ms`), default 60000 ms. Set via `/config`. Scrypted is expected to use the same value as its own per-stream cutoff, but timers run independently.
+- Reset timer on `/frame`, `/wake`, and tap-driven wake.
+- On expiry: transition to asleep (backlight off, POST `{"event":"sleep","type":"timeout"}`).
+- Idle timeout: read from NVS (`idle_timeout_ms`), default 60000 ms. `0` disables the timer; non-zero values must be ≥ 5000 ms (validated at `/config`).
+- Scrypted is expected to use the same value as its own per-stream cutoff, but timers run independently — either side can end a session, whichever notices first.
 
 ### 8.10 `local_screens.c`
 
@@ -593,6 +585,7 @@ Persist:
 - callback URL
 - brightness
 - idle timeout (ms)
+- orientation
 
 Do not persist frame data.
 
@@ -612,6 +605,7 @@ typedef struct {
 
     uint8_t brightness;      // 0-100
     uint32_t idle_timeout_ms;
+    uint8_t orientation;     // 0 = portrait, 1 = landscape
 
     char ip_addr[64];
 
@@ -665,7 +659,9 @@ Do not implement:
 - animations
 - transitions
 - LVGL UI
-- text rendering
+- general-purpose text rendering (only the tiny bitmap font in `local_screens.c`)
+
+Apply a gamma curve to the brightness PWM duty cycle. Linear 0–100 maps to non-linear perceptual brightness; without correction, `50` looks much brighter than half. A simple `duty = (level / 100) ^ 2.2` lookup table is enough.
 
 If the Waveshare ESP32-P4 examples include a working DSI display demo, start from that display initialization code and strip it down.
 
@@ -700,7 +696,8 @@ for (const v of viewports) {
     body: JSON.stringify({
       display: v.display,
       callback: "http://scrypted.local:11080/api/viewport/touch",
-      idle_timeout_ms: 60000,
+      idle_timeout_ms: 60000,    // device uses this; Scrypted uses the same value
+      orientation: "portrait",    // override per viewport if a screen is wall-mounted sideways
     }),
   });
 }
@@ -716,12 +713,29 @@ await fetch(`${v.url}/frame`, {
 });
 ```
 
+Each viewport is bound to exactly one camera (1:1 in v1). Multi-camera cycling is out of scope.
+
+Scrypted-initiated session (camera event):
+
+```ts
+await fetch(`${v.url}/wake`, { method: "POST" });    // device shows loading screen
+// then push frames until the per-stream timeout elapses:
+for (const jpeg of frames) {
+  const r = await fetch(`${v.url}/frame`, {
+    method: "POST",
+    headers: { "Content-Type": "image/jpeg" },
+    body: jpeg,
+  });
+  if (r.status === 409) break;  // device went to sleep; stop the loop
+}
+```
+
 Callback handler at `/api/viewport/touch`:
 
-- `wake` → look up viewport→camera binding, start streaming.
+- `wake` → look up viewport→camera binding, start streaming. No need to POST `/wake` first; device is already awake.
 - `sleep` → stop streaming to that viewport.
 
-Both are idempotent. Don't track viewport state. Apply a Scrypted-side per-stream timeout using the same `idle_timeout_ms` value sent in `/config`, so streams end even if the `sleep` callback is dropped. Timers run independently on each side.
+Both handlers are idempotent. Don't track viewport state. Apply a Scrypted-side per-stream timeout using the same `idle_timeout_ms` sent in `/config`, so streams end even if the `sleep` callback is dropped. Timers run independently — and if the device sleeps first (idle or tap), the next `/frame` returns `409` and Scrypted stops on that signal alone.
 
 ---
 
@@ -779,25 +793,26 @@ Acceptance:
 ```bash
 curl -X POST \
   -H "Content-Type: image/jpeg" \
-  --data-binary @test-800x480.jpg \
+  --data-binary @test-480x800.jpg \
   http://viewport.local/frame
 ```
 
 updates screen.
 
-### Milestone 5: Sleep/Brightness
+### Milestone 5: Wake/Sleep/Brightness
 
-- Implement `/sleep`.
-- Implement `/brightness`.
-- Add idle timer.
+- Implement `/wake`, `/sleep`, `/brightness`.
+- Make `/frame` reject with `409` when asleep (no auto-wake).
+- Add idle timer with 60s default; fires sleep + `sleep:timeout` callback (callback target is a no-op until M7).
 
 Acceptance:
 
 ```bash
-curl -X POST http://viewport.local/sleep
+curl -X POST http://viewport.local/sleep   # backlight off
+curl -X POST http://viewport.local/wake    # backlight on, loading screen
 ```
 
-turns off backlight.
+`/frame` after `/sleep` returns 409. `/frame` after `/wake` paints.
 
 ### Milestone 6: Config Persistence
 
@@ -814,33 +829,58 @@ After reboot, /health shows configured=true and name preserved.
 ### Milestone 7: Touch Callback
 
 - Initialize touch controller.
-- Detect tap.
-- POST callback JSON.
+- Detect tap; toggle wake/sleep locally.
+- POST `wake:tap`, `sleep:tap`, and `sleep:timeout` callback JSON.
 
 Acceptance:
 
 ```text
-Tap generates callback to test HTTP endpoint.
+Tap on asleep device: backlight on, callback {event:wake,type:tap}.
+Tap on awake device: backlight off, callback {event:sleep,type:tap}.
+After idle_timeout_ms with no /frame: callback {event:sleep,type:timeout}.
 ```
 
-### Milestone 8: Local Screens
+### Milestone 8: Local Screens + BOOT button
 
 - Embed minimal bitmap font.
-- Render unconfigured screen (IP + viewport.local) on boot when NVS has no callback.
-- Render loading screen on tap-wake; replaced by next `/frame`.
+- Render IP screen on boot when NVS has no callback (persistent).
+- Render loading screen on every wake (via tap or `/wake`); replaced by next `/frame`.
+- Wire BOOT short-press to 15s IP-screen overlay (no state change).
+- Wire BOOT 5s-hold to NVS-clear + reboot.
 
 Acceptance:
 
 ```text
-Fresh device boots to an IP-display screen.
-Tap on a sleeping configured device shows "Loading…" until next frame.
+Fresh device boots to IP screen.
+Tap (or POST /wake) shows "Loading…" until next /frame.
+BOOT short-press overlays IP for 15s, then restores prior state.
+BOOT 5s-hold returns the device to the IP screen.
+```
+
+### Milestone 9: Live Stream (`POST /stream`)
+
+The first post-`/frame` enhancement. Once `/frame` works end-to-end, add a streaming endpoint to lift the per-frame HTTP overhead and reach live frame rates.
+
+- Implement `POST /stream`, `Content-Type: multipart/x-mixed-replace; boundary=…`.
+- Read chunked body, parse multipart boundaries, hand each part to the JPEG decoder.
+- Reset the idle timer on each part (not just connection open).
+- On `/sleep`, tap-to-sleep, or idle timeout: close the stream connection (signals Scrypted to stop).
+- Scrypted side moves from a Script polling `takePicture()` to a small plugin using `MediaManager` + FFmpeg to pipe MJPEG.
+
+`/frame` stays — useful forever for snapshots, doorbell stills, and curl-driven debug.
+
+Acceptance:
+
+```text
+Live camera stream renders on viewport at >= 10 fps.
+Closing the stream connection from either side stops the session cleanly.
 ```
 
 ---
 
 ## 14. Test Images
 
-Generate test images at exactly 800×480:
+Generate test images at the effective resolution (480×800 for the default portrait orientation, 800×480 for landscape):
 
 - solid red
 - solid green
@@ -857,30 +897,43 @@ If colors are wrong, likely RGB/BGR or RGB565 byte-order issue.
 
 ## 15. Error Handling Philosophy
 
-Keep failure behavior simple.
+Keep failure behavior simple. Every endpoint is idempotent and every failure leaves the device in a sane state.
 
-If frame decode fails:
+Frame decode fails:
 
-- increment decode error counter
+- increment `decode_errors`
 - return 400 or 500
 - keep previous frame on screen
+- do not change wake/sleep state
 
-If callback fails:
+Callback POST fails:
 
 - log
-- increment counter
-- continue
+- increment `callback_failures`
+- continue — local state change still happens
+- do not retry; Scrypted catches up via its own timeout or the next event
 
-If Ethernet disconnects:
+Ethernet disconnects:
 
 - keep display running
 - reconnect automatically
 - no reboot loop
 
-If display init fails:
+Display init fails:
 
 - log loudly
-- continue serving `/health` if possible with display error status
+- continue serving `/health` with `state="unconfigured"` if possible
+
+Watchdog:
+
+- ESP-IDF task watchdog enabled on the main HTTP task and the touch task. If either hangs, the device reboots and rebuilds state from NVS.
+
+Status LED (on-board):
+
+- solid = configured & online
+- slow blink = unconfigured, waiting for `/config`
+- fast blink = no network
+- Drives the LED on the Waveshare board; visible when the screen is asleep.
 
 ---
 
@@ -919,20 +972,22 @@ The project is successful when:
 
 1. Device powers from PoE.
 2. Device gets DHCP over Ethernet.
-3. Device advertises mDNS.
-4. `/health` works.
-5. `/config` persists display name and callback URL.
-6. `/frame` accepts an 800×480 JPEG and updates screen.
-7. `/frame` implicitly wakes display.
-8. Idle timeout turns backlight off.
-9. `/sleep` works.
-10. `/brightness` works.
-11. Tap sends callback JSON to Scrypted/test server.
-12. Unconfigured device shows its IP on screen so it can be registered from Scrypted.
-13. Tap toggles the device between wake (backlight on + Scrypted streaming) and sleep (backlight off + Scrypted not streaming), via `wake`/`sleep` callback events.
-14. Idle timer fires `sleep` after `idle_timeout_ms` with no `/frame` (default 60s, set by Scrypted via `/config`).
-15. BOOT short-press overlays the IP screen for 15s; BOOT hold ≥5s factory-resets.
-16. Firmware has no Matter, HomeKit, polling, business logic, or config portal. The only locally-rendered UI is the IP screen and the loading screen.
+3. Device advertises mDNS with TXT records (`version`, `resolution`, `name`).
+4. `/health` returns state, frame counters, and error counters.
+5. `/config` persists display, callback, idle timeout, brightness, and orientation across reboot.
+6. `/config` validates `idle_timeout_ms` (0 disables; non-zero ≥ 5000; else 400) and `orientation` (`portrait` or `landscape`; else 400). Default orientation is `portrait`.
+7. `/wake` transitions asleep→awake and is idempotent.
+8. `/sleep` transitions awake→asleep and is idempotent.
+9. `/frame` paints when awake, returns 409 when asleep, and never changes state.
+10. `/brightness` accepts 0–100 with default 80; persisted; applied with a gamma curve.
+11. Idle timer fires `sleep` with `type=timeout` after `idle_timeout_ms` of no `/frame`.
+12. Tap toggles wake/sleep locally and POSTs `wake/tap` or `sleep/tap`.
+13. Unconfigured device shows its IP and `viewport.local` on screen.
+14. Loading screen is shown on every wake until the next `/frame` arrives.
+15. BOOT short-press overlays IP screen for 15s with no state change. BOOT 5s-hold factory-resets.
+16. Watchdog reboots a hung device; state recovers from NVS.
+17. Status LED indicates network and configuration state.
+18. Firmware has no Matter, HomeKit, business logic, or config portal. The only locally-rendered UI is the IP screen and the loading screen.
 
 ---
 
