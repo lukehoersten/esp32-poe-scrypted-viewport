@@ -26,7 +26,7 @@ On the "Scrypted Viewport" device page, click **+ Add Device**. You'll get a sma
 | Field | What to enter |
 | --- | --- |
 | **Viewport name** | Lowercase routing key, e.g. `mudroom`. Becomes the device's mDNS hostname (`viewport-mudroom.local`) and the value the firmware sends back in callbacks. |
-| **IP or hostname** | Viewport's LAN address, e.g. `192.168.1.42`. Set a DHCP reservation if you want it to stay put. |
+| **IP or hostname** | Optional. Leave blank and the script auto-resolves `viewport-<name>.local` via the OS mDNS resolver (Bonjour on macOS, nss-mdns on Linux, host networking in Docker). Set manually if mDNS resolution isn't available in your network. |
 | **Camera** | Dropdown — pick the camera whose events should wake this viewport. The dropdown is filtered to devices implementing `Camera`. |
 | **Orientation** | `portrait` (480×800, default) or `landscape` (800×480). Tells the device + script what dimensions to send. |
 
@@ -84,6 +84,17 @@ That pulls in `@scrypted/sdk` and `@types/node` so the TS server can resolve eve
 - Manual IP per viewport (no mDNS-SD discovery yet). DHCP reservation is the simplest workaround.
 - Camera must respect `picture.width` / `picture.height` in `PictureOptions` or be paired with a snapshot plugin that resizes. If the camera returns the wrong size, the device rejects `/frame` with 400 and you'll see warning logs. Workaround: configure the camera plugin's snapshot size, or wait for v2 (FFmpeg-side resize).
 - No retry on transport errors. Best-effort matches the device's own semantics; the next event or callback re-syncs.
+
+## How mDNS auto-resolve works
+
+Every time the script registers a viewport (on plugin start, every 5 minutes, on settings change, after a fresh `+ Add Device`), it tries `dns.lookup('viewport-<name>.local')` first. If the OS returns an IP, that IP overwrites the `host` field in the viewport's storage. Subsequent `POST /config` and `POST /frame` use the resolved IP.
+
+If the OS resolver doesn't know about `.local`:
+- **macOS**: works out of the box (Bonjour).
+- **Linux**: install `libnss-mdns` and ensure `mdns` is in `/etc/nsswitch.conf`'s `hosts:` line.
+- **Docker**: use `--network host` (Scrypted's recommended setup). Bridge networking breaks `.local` resolution.
+
+When mDNS doesn't resolve, the script silently falls back to the operator-entered `host`. You can disable mDNS per viewport via the **Auto-resolve via mDNS** toggle on its Settings page.
 
 ## End-to-end smoke test
 

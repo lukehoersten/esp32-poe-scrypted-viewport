@@ -50,6 +50,8 @@ import sdk, {
     SettingValue,
 } from "@scrypted/sdk";
 
+import { promises as dns } from "dns";
+
 const { systemManager, endpointManager, mediaManager, deviceManager } = sdk;
 
 // Tuning constants. Frame interval is also exposed on the parent's
@@ -59,6 +61,22 @@ const REREGISTER_INTERVAL_MS     = 5 * 60_000;
 const HTTP_TIMEOUT_MS            = 1_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
 const DEFAULT_BRIGHTNESS         = 80;
+const MDNS_LOOKUP_TIMEOUT_MS     = 1_500;
+
+// Resolve `viewport-<name>.local` via the OS resolver (Bonjour on macOS,
+// nss-mdns on Linux, host networking on Docker). Returns null on failure or
+// timeout — caller falls back to the operator-entered host.
+async function lookupMdns(hostname: string): Promise<string | null> {
+    try {
+        const lookup = dns.lookup(hostname, { family: 4 });
+        const timeout = new Promise<null>(r => setTimeout(() => r(null), MDNS_LOOKUP_TIMEOUT_MS));
+        const result = await Promise.race([lookup, timeout]);
+        if (!result) return null;
+        return (result as { address: string }).address || null;
+    } catch {
+        return null;
+    }
+}
 
 // ============================================================================
 // Child: one viewport binding
@@ -83,15 +101,25 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const v = this.storage.getItem("brightness");
         return v ? Math.max(0, Math.min(100, parseInt(v, 10) || 0)) : DEFAULT_BRIGHTNESS;
     }
+    get mdnsAuto(): boolean {
+        return this.storage.getItem("mdns_auto") !== "false";  // default true
+    }
 
     async getSettings(): Promise<Setting[]> {
         return [
             {
                 key: "host",
                 title: "IP or hostname",
-                description: "Viewport's address on the LAN. Update if DHCP renumbers (or use a DHCP reservation).",
+                description: "Viewport's address on the LAN. Auto-resolved via mDNS when the toggle below is on; otherwise set manually.",
                 placeholder: "192.168.1.42",
                 value: this.host,
+            },
+            {
+                key: "mdns_auto",
+                title: "Auto-resolve via mDNS",
+                description: "Look up viewport-<name>.local via the OS resolver on every register and overwrite the host field with the discovered IP. Disable for cross-VLAN setups or hosts where mDNS resolution doesn't work.",
+                type: "boolean",
+                value: this.mdnsAuto,
             },
             {
                 key: "cameraId",
@@ -231,8 +259,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             },
             {
                 key: "host",
-                title: "IP or hostname",
-                placeholder: "192.168.1.42",
+                title: "IP or hostname (optional)",
+                description: "Leave blank to auto-resolve via mDNS (viewport-<name>.local). Set manually if mDNS doesn't reach this network.",
+                placeholder: "auto-resolve via mDNS",
             },
             {
                 key: "cameraId",
@@ -270,6 +299,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         this.childIds = [...this.childIds, nativeId];
         this.console.log(`created viewport "${name}" (${nativeId})`);
+
+        // Fire-and-forget mDNS resolve so the host field is auto-populated
+        // by the time the operator opens the new device's settings page.
+        // getDevice() above already attempted a register; this catches the
+        // case where the operator left host blank and mDNS resolution was
+        // the only way to fill it.
+        const child = this.viewports.get(nativeId);
+        if (child) this.registerViewport(child).catch(() => {});
+
         return nativeId;
     }
 
@@ -314,8 +352,20 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
+    private async refreshHostFromMdns(v: Viewport): Promise<void> {
+        if (!v.mdnsAuto || !v.name) return;
+        const ip = await lookupMdns(`viewport-${v.name}.local`);
+        if (!ip || ip === v.host) return;
+        this.console.log(`mDNS: "${v.name}" host "${v.host || "(empty)"}" -> "${ip}"`);
+        v.storage.setItem("host", ip);
+    }
+
     private async registerViewport(v: Viewport) {
-        if (!v.host) return;
+        await this.refreshHostFromMdns(v);
+        if (!v.host) {
+            this.console.warn(`register "${v.name}" skipped — no host (set one manually or check mDNS)`);
+            return;
+        }
         try {
             await this.postJSON(`http://${v.host}/config`, {
                 viewport: v.name,
