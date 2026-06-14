@@ -944,7 +944,7 @@ curl -X POST -d '{"state":"wake"}'  http://viewport.local/state  # backlight on,
 
 `/frame` after `state=sleep` returns 409. `/frame` after `state=wake` paints. Idle timer fires after `idle_timeout_ms` of no frames.
 
-### Milestone 7: Touch Callback
+### Milestone 7: Touch + Outbound `/state` POST
 
 - Initialize touch controller.
 - Detect tap; toggle wake/sleep locally.
