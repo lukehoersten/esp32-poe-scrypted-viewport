@@ -127,6 +127,16 @@ ping 192.168.x.x
 > 2. **mDNS hostname order**: `mdns_service_add()` returns INVALID_ARG if hostname isn't set yet. Now init → hostname → service_add → TXT.
 > 3. **`app_main` best-effort everywhere**: any one missing subsystem (no LAN, no panel) used to abort the boot. Now each is independent; final log line summarizes which letters of `EMHDJTB` came up.
 
+**Link-loss & recovery also verified 2026-06-14** — important for PoE-only deployments where a switch reboot or briefly down VLAN won't kill power but will yank the link:
+
+```
+W (748316) net_eth: link down                                # cable pulled
+I (916316) net_eth: link up, mac e8:f6:0a:e0:90:94          # cable plugged back in (3 min later)
+I (924816) net_eth: got ip 10.0.13.83 gw 10.0.13.1 netmask 255.255.255.0   # DHCP renewed ~8.5s after link-up
+```
+
+Same boot throughout (uptime kept climbing past the disconnect, no reset). mDNS responder task and HTTP server stayed alive through the outage and resumed serving the moment DHCP came back. `free_heap` / `free_psram` identical to pre-disconnect — no leak from the cycle.
+
 ---
 
 ## M2 — HTTP + mDNS
@@ -614,7 +624,7 @@ Run these once all milestones are implemented and individually verified. The poi
 
 ### C. Failure modes
 
-- Cable pull mid-frame: device idle-sleeps after `idle_timeout_ms`. On reconnect, mDNS re-advertises; Scrypted re-finds and continues.
+- Cable pull mid-frame: device idle-sleeps after `idle_timeout_ms`. On reconnect, mDNS re-advertises; Scrypted re-finds and continues. (Link-loss/recovery part verified 2026-06-14 with the device idle — see M1 section. Mid-frame variant still pending.)
 - Scrypted unreachable on tap: device still toggles backlight, `state_post_failures` increments. Recovery: Scrypted comes back, next tap syncs.
 - DHCP lease change: device gets new IP, re-advertises via mDNS. Scrypted's periodic browse picks up the new address.
 - `/state_post_failures` count should be observable via `GET /state`.
