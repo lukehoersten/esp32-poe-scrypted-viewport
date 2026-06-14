@@ -4,7 +4,9 @@ Version: 1.0
 
 ## Overview
 
-Scrypted Viewport is an Ethernet-powered ambient display appliance optimized for Scrypted camera and doorbell events.
+Scrypted Viewport is an Ethernet-powered ambient display appliance optimized for Scrypted camera and doorbell
+events. It's meant to be plug and play onto a trusted POE VLAN connection with Scrypted access so there's no
+configuration done on the esp32 itself and instead is discoverd and configured within Scrypted.
 
 Design goals:
 - No Matter

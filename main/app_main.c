@@ -18,6 +18,16 @@
 
 static const char *TAG = "viewport";
 
+// Log a status line for one subsystem and accumulate a one-letter flag into
+// `status` (uppercase = up, lowercase = degraded/unavailable). Lets the
+// boot log end with a single line summarizing what's actually live, so
+// running with no LAN / no panel is a self-describing degraded mode rather
+// than a panic.
+static inline void mark(esp_err_t err, char up, char *slot)
+{
+    *slot = (err == ESP_OK) ? up : (char)(up + 0x20);  // 'A' -> 'a' on failure
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -28,57 +38,63 @@ void app_main(void)
     nvs_config_load();  // apply persisted config over defaults (best-effort)
     ESP_LOGI(TAG, "Scrypted Viewport boot (v%s)", VIEWPORT_VERSION);
 
-    ESP_ERROR_CHECK(net_eth_init());
-    if (net_eth_wait_for_ip(30 * 1000) == ESP_OK) {
-        ESP_LOGI(TAG, "online at %s", net_eth_get_ip_str());
-    } else {
-        ESP_LOGW(TAG, "no DHCP lease after 30s, will keep retrying in the background");
+    // ------------------------------------------------------------------
+    // Networking. Driver starts even with no cable plugged in; we just
+    // don't get a DHCP lease. mDNS + HTTP advertise / bind anyway and will
+    // start serving the moment the link comes up.
+    // ------------------------------------------------------------------
+    char flags[8] = { '-','-','-','-','-','-','-', 0 };  // E M H D J T B
+    esp_err_t eth_err = net_eth_init();
+    mark(eth_err, 'E', &flags[0]);
+
+    bool got_ip = false;
+    if (eth_err == ESP_OK) {
+        got_ip = (net_eth_wait_for_ip(15 * 1000) == ESP_OK);
+        if (got_ip) {
+            ESP_LOGI(TAG, "online at %s", net_eth_get_ip_str());
+        } else {
+            ESP_LOGW(TAG, "no DHCP lease after 15s — Ethernet driver will keep "
+                          "retrying in the background; mDNS + HTTP up anyway");
+        }
     }
 
     ESP_ERROR_CHECK(state_machine_init());
     ESP_ERROR_CHECK(state_client_init());
-    ESP_ERROR_CHECK(mdns_service_start());
-    ESP_ERROR_CHECK(http_api_start());
+    mark(mdns_service_start(), 'M', &flags[1]);
+    mark(http_api_start(),     'H', &flags[2]);
 
-    // Display is best-effort — a missing/miswired panel must not kill
-    // networking + /state.
-    if (display_init() == ESP_OK) {
+    // ------------------------------------------------------------------
+    // Display + I²C-bound peripherals. Missing/miswired panel must not
+    // kill networking + /state. Failures here log a warning and continue.
+    // ------------------------------------------------------------------
+    esp_err_t dsp_err = display_init();
+    mark(dsp_err, 'D', &flags[3]);
+    if (dsp_err == ESP_OK) {
         local_screens_init();
-
-        // Reconcile panel with current run-state:
-        //   UNCONFIGURED -> IP screen (so operator can register from Scrypted)
-        //   ASLEEP       -> backlight off (configured device booted asleep)
-        //   AWAKE        -> leave on (not reached on fresh boot)
         viewport_state_lock();
         viewport_run_state_t s = viewport_state_get()->state;
         viewport_state_unlock();
-
         if (s == VIEWPORT_STATE_ASLEEP) {
             display_sleep();
-            ESP_LOGI(TAG, "display up — configured, backlight off (asleep)");
         } else {
             local_screens_show_ip();
-            ESP_LOGI(TAG, "display up — IP screen (unconfigured)");
         }
+    }
+
+    mark(jpeg_decoder_init(), 'J', &flags[4]);
+
+    if (dsp_err == ESP_OK) {
+        mark(touch_init(), 'T', &flags[5]);
     } else {
-        ESP_LOGW(TAG, "display init failed — continuing without panel");
+        ESP_LOGI(TAG, "touch skipped (display not up)");
     }
 
-    // JPEG decoder is the M5 dependency for POST /frame. Best-effort.
-    if (jpeg_decoder_init() != ESP_OK) {
-        ESP_LOGW(TAG, "jpeg decoder init failed — /frame will be unavailable");
-    }
+    mark(button_init(), 'B', &flags[6]);
 
-    // Touch shares the panel I2C bus; only meaningful if display came up.
-    if (display_is_up()) {
-        if (touch_init() != ESP_OK) {
-            ESP_LOGW(TAG, "touch init failed — taps won't work");
-        }
-    }
-
-    // BOOT button — short press = IP overlay, hold 5s = factory reset.
-    // GPIO is a guess until confirmed against the Waveshare schematic.
-    if (button_init() != ESP_OK) {
-        ESP_LOGW(TAG, "BOOT button init failed — overlay + factory reset disabled");
-    }
+    // ------------------------------------------------------------------
+    // Boot summary. Uppercase letter = subsystem live; lowercase = down.
+    // E=Ethernet M=mDNS H=HTTP D=Display J=JPEG T=Touch B=BootButton
+    // ------------------------------------------------------------------
+    ESP_LOGI(TAG, "boot complete — subsystems [%s]  ip=%s",
+             flags, got_ip ? net_eth_get_ip_str() : "(no link)");
 }

@@ -24,8 +24,8 @@
 #define PIN_PHY_TXD0        34
 #define PIN_PHY_TXD1        35
 #define PIN_PHY_CRS_DV      28
-#define PIN_PHY_RXD0        30
-#define PIN_PHY_RXD1        29
+#define PIN_PHY_RXD0        29
+#define PIN_PHY_RXD1        30
 #define PIN_PHY_RESET       51
 #define PHY_ADDR            1
 
