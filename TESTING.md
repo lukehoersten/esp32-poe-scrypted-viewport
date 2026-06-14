@@ -91,11 +91,52 @@ Expected mDNS browse output should show a `_scrypted-viewport._tcp` instance wit
 
 ## M3 — Display Bring-Up
 
-**Acceptance**: panel shows a test pattern; backlight toggles via API.
+**Acceptance**: panel powers on, MCU at I2C 0x45 responds, color-bar test pattern renders, brightness control works.
 
-**How to verify**: TBD (write after M3 implementation).
+**Wiring** (Hosyond 5" 800x480 panel ↔ Waveshare ESP32-P4-ETH):
 
-**Status**: ⬜ pending.
+The DSI FPC adapter (15-pin Pi side → 22-pin Waveshare side) carries the DSI data lanes and power. I2C and panel power are jumpered separately from the ESP32-P4 board to the Hosyond's auxiliary header (the same header Pi users normally connect to the Pi's 40-pin GPIO):
+
+| Hosyond panel pin | Wire to ESP32-P4 board |
+| --- | --- |
+| 5V | board 5V rail |
+| GND | board GND |
+| SDA | GPIO 7 |
+| SCL | GPIO 8 |
+
+GPIO 7/8 match Waveshare's BSP convention for touch I2C on their bundled-panel kit. If different pins are more convenient, change `PIN_I2C_SDA` / `PIN_I2C_SCL` in `display.c`.
+
+**Bring-up sequence**
+
+1. Power the ESP32-P4 board over USB (don't plug DSI yet).
+2. Connect 5V + GND jumpers to the panel. Panel LED (if present) should light.
+3. Connect SDA + SCL jumpers.
+4. Plug the DSI FPC cable.
+5. Flash:
+
+```bash
+idf.py -p /dev/cu.usbmodem* flash monitor
+```
+
+**Expected log**
+
+```
+I (xxx) display: panel MCU id 0xC3 — Pi 7" architecture ack'd
+I (xxx) display: panel powered on
+I (xxx) display: DSI up: 800x480 30 MHz, 2-lane 480 Mbps
+I (xxx) viewport: display up — test pattern on screen
+```
+
+**Visual check**: 8 vertical color bars (white, yellow, cyan, green, magenta, red, blue, black) across the panel. Brightness should look perceptually mid-range (default 80/100 with gamma).
+
+**Failure-mode signals**
+
+- `panel MCU @0x45 unreachable` → jumper or pull-up problem on I2C, no need to suspect DSI yet.
+- I2C ack but no image → DSI cable / FPC adapter orientation. Pi FPCs are easy to install upside-down.
+- Image but wrong colors → check RGB565 byte order; flip `LCD_COLOR_PIXEL_FORMAT_RGB565` to a variant with swap.
+- Image but vertical/horizontal sync issues → adjust the `PANEL_*SYNC_*` timings; Pi 7" canonical values used as defaults.
+
+**Status**: 🟡 builds clean against ESP-IDF 5.4. Driver ported from Linux `panel-raspberrypi-touchscreen.c`. Awaiting hardware bring-up with confirmed jumper wiring.
 
 ---
 
@@ -123,9 +164,38 @@ curl -X POST -H "Content-Type: application/json" \
 curl http://<device-ip>/config | jq .
 ```
 
-Also verify validation: `idle_timeout_ms: 1000` (below 5000) returns 400; `orientation: "sideways"` returns 400; etc.
+Also verify validation:
 
-**Status**: ⬜ pending.
+```bash
+# idle_timeout_ms below 5000 (and non-zero) — expect 400:
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"idle_timeout_ms":1000}' http://<device-ip>/config
+
+# bogus orientation — expect 400:
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"orientation":"sideways"}' http://<device-ip>/config
+
+# brightness out of range — expect 400:
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"brightness":150}' http://<device-ip>/config
+
+# scrypted without http:// — expect 400:
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"scrypted":"scrypted.local"}' http://<device-ip>/config
+
+# Garbage JSON — expect 400:
+curl -i -X POST -H "Content-Type: application/json" \
+  -d 'not json' http://<device-ip>/config
+```
+
+Idle-timer disable (`idle_timeout_ms: 0`) is intentionally allowed.
+
+Side-effects to confirm:
+- After `POST /config` with `brightness`: panel brightness changes immediately (if display is up).
+- After `POST /config` with `viewport` or `orientation`: mDNS TXT records update; `viewport-<name>.local` resolves; browse shows new TXT.
+- After `POST /config` with both `viewport` and `scrypted` (any order, on any subsequent call): `GET /state` shows `configured: true`, `state: "asleep"`.
+
+**Status**: 🟡 builds clean against ESP-IDF 5.4. Logic exercised in code but unverified on hardware.
 
 ---
 

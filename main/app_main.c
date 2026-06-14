@@ -2,6 +2,7 @@
 #include "http_api.h"
 #include "mdns_service.h"
 #include "net_eth.h"
+#include "nvs_config.h"
 #include "viewport_state.h"
 
 #include "esp_event.h"
@@ -18,6 +19,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     viewport_state_init();
+    nvs_config_load();  // apply persisted config over defaults (best-effort)
     ESP_LOGI(TAG, "Scrypted Viewport boot (v%s)", VIEWPORT_VERSION);
 
     ESP_ERROR_CHECK(net_eth_init());
@@ -30,8 +32,8 @@ void app_main(void)
     ESP_ERROR_CHECK(mdns_service_start());
     ESP_ERROR_CHECK(http_api_start());
 
-    // Display is best-effort during bring-up: a missing/miswired panel must
-    // not kill networking + /state. M3 acceptance: show a test pattern.
+    // Display is best-effort — a missing/miswired panel must not kill
+    // networking + /state. M3 acceptance: show a test pattern.
     if (display_init() == ESP_OK) {
         display_test_pattern();
         ESP_LOGI(TAG, "display up — test pattern on screen");
@@ -39,7 +41,6 @@ void app_main(void)
         ESP_LOGW(TAG, "display init failed — continuing without panel");
     }
 
-    // TODO M4: /config persistence (NVS) + GET /config + POST /config
     // TODO M5: /frame JPEG decode -> framebuffer
     // TODO M6: POST /state + idle timer
     // TODO M7: Capacitive touch -> outbound /state POST
