@@ -194,29 +194,34 @@ Bare-board behavior (no panel, no ethernet) was also verified — the device boo
 
 **Acceptance**: panel powers on, MCU at I2C 0x45 responds, color-bar test pattern renders, brightness control works.
 
-**Wiring** (Hosyond 5" 800x480 panel ↔ Waveshare ESP32-P4-ETH):
+**Wiring** (Hosyond 5" 800x480 panel ↔ Waveshare ESP32-P4-ETH)
 
-The DSI FPC adapter (15-pin Pi side → 22-pin Waveshare side) carries the DSI data lanes and power. I2C and panel power are jumpered separately from the ESP32-P4 board to the Hosyond's auxiliary header (the same header Pi users normally connect to the Pi's 40-pin GPIO):
+The Hosyond panel exposes only the 15-pin Pi DSI FPC — no auxiliary GPIO header. **Everything goes through the FPC**: DSI data lanes, panel power (3.3V / 5V / GND), and the I²C bus (SDA / SCL) shared by the on-panel ATTINY MCU at `0x45` and the FT5426 touch at `0x38`. No jumper wires required.
 
-| Hosyond panel pin | Wire to ESP32-P4 board |
-| --- | --- |
-| 5V | board 5V rail |
-| GND | board GND |
-| SDA | GPIO 7 |
-| SCL | GPIO 8 |
+Verified board-side mapping (Waveshare ESP32-P4-ETH wiki + ESPHome device page):
 
-GPIO 7/8 match Waveshare's BSP convention for touch I2C on their bundled-panel kit. If different pins are more convenient, change `PIN_I2C_SDA` / `PIN_I2C_SCL` in `display.c`.
+| Signal | DSI FPC | ESP32-P4 GPIO |
+| --- | --- | --- |
+| DSI data lanes / clock | dedicated DSI PHY | (fixed silicon pins) |
+| I²C SDA | FPC pin | **GPIO 7** |
+| I²C SCL | FPC pin | **GPIO 8** |
+| 3.3V / 5V / GND | FPC pins | board rails (no GPIO) |
+| Backlight | I²C register `0x96` on the panel MCU | (no GPIO) |
+| Panel reset / power-on | I²C `REG_POWERON` (`0x85`) on the panel MCU | (no GPIO) |
+
+`PIN_I2C_SDA=7` / `PIN_I2C_SCL=8` in `display.c` already match this. **No code changes needed before flashing.**
+
+DSI connector: 22-pin (Pi 5 / CM4 style). The 15-pin Pi DSI FPC on the panel plugs into a **15→22 pin adapter cable** that goes into the board.
 
 **Bring-up sequence**
 
-1. Power the ESP32-P4 board over USB (don't plug DSI yet).
-2. Connect 5V + GND jumpers to the panel. Panel LED (if present) should light.
-3. Connect SDA + SCL jumpers.
-4. Plug the DSI FPC cable.
-5. Flash:
+1. Power the ESP32-P4 board (USB is fine for bench; PoE/12V in production).
+2. Plug the **15-pin** side of the DSI cable into the Hosyond panel.
+3. Plug the **22-pin** side into the Waveshare DSI connector. (Pi FPCs are easy to install upside-down — make sure the contact side faces the connector lock.)
+4. Reset the board (or `idf.py flash monitor` if you've changed firmware):
 
 ```bash
-idf.py -p /dev/cu.usbmodem* flash monitor
+idf.py -p /dev/cu.usbmodem* monitor
 ```
 
 **Expected log**
@@ -232,12 +237,13 @@ I (xxx) viewport: display up — test pattern on screen
 
 **Failure-mode signals**
 
-- `panel MCU @0x45 unreachable` → jumper or pull-up problem on I2C, no need to suspect DSI yet.
-- I2C ack but no image → DSI cable / FPC adapter orientation. Pi FPCs are easy to install upside-down.
-- Image but wrong colors → check RGB565 byte order; flip `LCD_COLOR_PIXEL_FORMAT_RGB565` to a variant with swap.
-- Image but vertical/horizontal sync issues → adjust the `PANEL_*SYNC_*` timings; Pi 7" canonical values used as defaults.
+- `panel MCU @0x45 unreachable` → either the FPC seating / orientation is wrong (most common — Pi FPCs are easy to install upside-down on either end), the adapter cable doesn't pass I²C straight through, or the panel is one of the rare Waveshare-bundled units with **GT911 touch at 0x5D/0x14** instead of the FT5426 Pi 7" architecture this driver targets (in which case the *panel MCU* check still fails because that variant has no ATTINY at all). No need to suspect DSI yet.
+- I²C ack but no image → DSI cable orientation on the 22-pin side, or `LCD_COLOR_PIXEL_FORMAT_RGB565` byte order if there's something on the panel but garbled.
+- Image but wrong colors → RGB565 byte order; flip to BGR variant.
+- Image but vertical/horizontal sync issues → adjust the `PANEL_*SYNC_*` timings in `display.c`; Pi 7" canonical values are the defaults.
+- Touch ack at `0x38` but no taps → polling task not running, or panel reset state wrong.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4. Driver ported from Linux `panel-raspberrypi-touchscreen.c`. Awaiting hardware bring-up with confirmed jumper wiring.
+**Status**: 🟡 builds clean against ESP-IDF 5.4. Driver ported from Linux `panel-raspberrypi-touchscreen.c`. Pin map confirmed against Waveshare ESP32-P4-ETH wiki + ESPHome device page (GPIO 7/8 I²C, 22-pin DSI). Awaiting hardware bring-up.
 
 ---
 

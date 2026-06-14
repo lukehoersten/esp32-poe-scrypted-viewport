@@ -13,7 +13,9 @@ void viewport_state_init(void)
 {
     memset(&s_state, 0, sizeof(s_state));
     s_state.configured      = false;
-    s_state.state           = VIEWPORT_STATE_UNCONFIGURED;
+    // State is always AWAKE or ASLEEP. UNCONFIGURED is reported via the
+    // `configured` flag, not as a state value. Boot is always asleep.
+    s_state.state           = VIEWPORT_STATE_ASLEEP;
     s_state.brightness      = 80;
     s_state.idle_timeout_ms = 60000;
     s_state.orientation     = VIEWPORT_ORIENTATION_PORTRAIT;

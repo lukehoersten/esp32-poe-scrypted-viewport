@@ -14,6 +14,8 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "viewport";
@@ -27,6 +29,8 @@ static inline void mark(esp_err_t err, char up, char *slot)
 {
     *slot = (err == ESP_OK) ? up : (char)(up + 0x20);  // 'A' -> 'a' on failure
 }
+
+static void display_setup_task(void *arg);
 
 void app_main(void)
 {
@@ -64,37 +68,50 @@ void app_main(void)
     mark(http_api_start(),     'H', &flags[2]);
 
     // ------------------------------------------------------------------
-    // Display + I²C-bound peripherals. Missing/miswired panel must not
-    // kill networking + /state. Failures here log a warning and continue.
+    // Display + I²C-bound peripherals run on their own task. ESP-IDF's
+    // esp_lcd_new_dsi_bus() spins forever in a PHY-PLL busy-wait if the
+    // config is even slightly off; keeping that off the main task means
+    // a misconfigured panel can't take down networking + /state. The
+    // task also brings up the JPEG decoder and touch (touch shares the
+    // panel I²C bus).
     // ------------------------------------------------------------------
+    mark(button_init(), 'B', &flags[6]);
+
+    ESP_LOGI(TAG, "boot complete — net subsystems [%s] ip=%s; "
+                  "display init deferred to dsp_init task",
+             flags, got_ip ? net_eth_get_ip_str() : "(no link)");
+
+    xTaskCreate(display_setup_task, "dsp_init", 4096, NULL, 1, NULL);
+}
+
+static void display_setup_task(void *arg)
+{
+    char flags[4] = {'-', '-', '-', 0}; // D J T + NUL
     esp_err_t dsp_err = display_init();
-    mark(dsp_err, 'D', &flags[3]);
+    mark(dsp_err, 'D', &flags[0]);
+
     if (dsp_err == ESP_OK) {
         local_screens_init();
-        viewport_state_lock();
-        viewport_run_state_t s = viewport_state_get()->state;
-        viewport_state_unlock();
-        if (s == VIEWPORT_STATE_ASLEEP) {
-            display_sleep();
-        } else {
-            local_screens_show_ip();
-        }
+        // Show solid-color test sequence for ~6 s so we can characterize the
+        // garble: solid red, then solid green, then solid blue, each for 2s.
+        // If the panel paints a single uniform color (or close to it) for
+        // each, the issue is the text rendering only. If even solid colors
+        // are garbled, it's a stride / pixel-format bug deeper down.
+        display_wake();
+        display_fill(0xF800); vTaskDelay(pdMS_TO_TICKS(2000));   // red
+        display_fill(0x07E0); vTaskDelay(pdMS_TO_TICKS(2000));   // green
+        display_fill(0x001F); vTaskDelay(pdMS_TO_TICKS(2000));   // blue
+        display_sleep();
     }
 
-    mark(jpeg_decoder_init(), 'J', &flags[4]);
+    mark(jpeg_decoder_init(), 'J', &flags[1]);
 
     if (dsp_err == ESP_OK) {
-        mark(touch_init(), 'T', &flags[5]);
+        mark(touch_init(), 'T', &flags[2]);
     } else {
         ESP_LOGI(TAG, "touch skipped (display not up)");
     }
 
-    mark(button_init(), 'B', &flags[6]);
-
-    // ------------------------------------------------------------------
-    // Boot summary. Uppercase letter = subsystem live; lowercase = down.
-    // E=Ethernet M=mDNS H=HTTP D=Display J=JPEG T=Touch B=BootButton
-    // ------------------------------------------------------------------
-    ESP_LOGI(TAG, "boot complete — subsystems [%s]  ip=%s",
-             flags, got_ip ? net_eth_get_ip_str() : "(no link)");
+    ESP_LOGI(TAG, "display subsystems [%s] up", flags);
+    vTaskDelete(NULL);
 }

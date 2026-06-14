@@ -6,6 +6,8 @@
 
 #include "driver/i2c_master.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_ldo_regulator.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -62,15 +64,31 @@ enum {
 // ============================================================================
 #define PANEL_H_ACTIVE        800
 #define PANEL_V_ACTIVE        480
-#define PANEL_HSYNC_PULSE     18
-#define PANEL_HSYNC_BP        20
-#define PANEL_HSYNC_FP        62
-#define PANEL_VSYNC_PULSE     4
-#define PANEL_VSYNC_BP        27
-#define PANEL_VSYNC_FP        18
-#define PANEL_PIXEL_CLOCK_MHZ 30
-#define DSI_LANE_RATE_MBPS    480
-#define DSI_NUM_DATA_LANES    2
+// Pi 7" canonical timings from the upstream RPi DTS panel binding.
+// Hosyond 5" panels are TC358762-based clones and use the same.
+#define PANEL_HSYNC_PULSE     1
+#define PANEL_HSYNC_BP        46
+#define PANEL_HSYNC_FP        16
+#define PANEL_VSYNC_PULSE     1
+#define PANEL_VSYNC_BP        33
+#define PANEL_VSYNC_FP        7
+#define PANEL_PIXEL_CLOCK_MHZ 25
+// Lane bit rate. ESP32-P4 MIPI-DSI PHY PLL is picky about valid lock
+// frequencies; 480 Mbps caused the PLL-lock busy-wait inside
+// esp_lcd_new_dsi_bus() to hang indefinitely. 1000 Mbps matches the
+// reference example and is well within the TC358762 bridge's max.
+// Pi 7"-style panels via the 15-pin FPC traditionally use a single DSI
+// data lane; the second data pair in the FPC stays unused. The DSI link
+// rate is bumped to compensate (PLL-valid: 720/20 = 36 even).
+#define DSI_LANE_RATE_MBPS    720
+#define DSI_NUM_DATA_LANES    1
+
+// The ESP32-P4 MIPI-DSI PHY needs VDD_MIPI_DPHY = 2.5V powered before its
+// PLL can lock. Internal LDO_VO3 (channel 3) is the source on this SoC,
+// per ESP-IDF's mipi_dsi example. Without this the PHY-lock busy-wait
+// inside esp_lcd_new_dsi_bus() spins forever.
+#define DSI_PHY_LDO_CHAN      3
+#define DSI_PHY_LDO_MV        2500
 
 // ============================================================================
 // Module state
@@ -81,6 +99,11 @@ static esp_lcd_dsi_bus_handle_t s_dsi_bus;
 static esp_lcd_panel_handle_t   s_panel;
 static bool                     s_up;
 static uint8_t                  s_last_pwm;
+// RGB888 scratch buffer used as the source to draw_bitmap. 3 bytes/pixel
+// matches the DPI driver's framebuffer stride; landscape and portrait
+// both go through here so we get a single consistent expand-from-RGB565
+// path. 800 * 480 * 3 = ~1.15 MB in PSRAM.
+static uint8_t                 *s_rot_buf;
 
 // ============================================================================
 // Panel-MCU I2C helpers
@@ -138,9 +161,33 @@ static esp_err_t panel_mcu_attach(void)
 
 static esp_err_t panel_power_on(void)
 {
+    // Full Pi 7" enable sequence, mirroring Linux's panel-raspberrypi-
+    // touchscreen.c. Without the PORTA/PORTB/PORTC writes the TC358762
+    // converts DSI to DPI fine, but the ATTINY never enables the actual
+    // panel chip + backlight — so the panel stays dark.
+
     ESP_RETURN_ON_ERROR(mcu_write_u8(REG_POWERON, 1), TAG, "POWERON=1");
     vTaskDelay(pdMS_TO_TICKS(PANEL_POWERON_DELAY_MS));
-    ESP_LOGI(TAG, "panel powered on");
+
+    // Optional: poll REG_PORTB bit 0 for nPWRDWN going high. Bounded
+    // wait so we don't hang on a non-responsive panel.
+    for (int i = 0; i < 100; ++i) {
+        uint8_t portb = 0;
+        if (mcu_read_u8(REG_PORTB, &portb) == ESP_OK && (portb & 0x01)) break;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    // Enable the panel chip via the ATTINY's GPIO expanders. Values match
+    // the upstream Linux driver and the original Pi 7" closed-source FW.
+    ESP_RETURN_ON_ERROR(mcu_write_u8(REG_PORTA, 0x04), TAG, "PORTA");
+    ESP_RETURN_ON_ERROR(mcu_write_u8(REG_PORTB, 0x00), TAG, "PORTB");
+    // Leave PWM at 0 (backlight off) — the boot sequence calls
+    // display_sleep() after init; first interaction (tap, BOOT, /state)
+    // brings the backlight up via display_wake().
+    ESP_RETURN_ON_ERROR(mcu_write_u8(REG_PWM,   0x00), TAG, "PWM init");
+    ESP_RETURN_ON_ERROR(mcu_write_u8(REG_PORTC, 0x01), TAG, "PORTC");
+
+    ESP_LOGI(TAG, "panel powered on (PORTA/B/C + PWM init)");
     return ESP_OK;
 }
 
@@ -149,6 +196,17 @@ static esp_err_t panel_power_on(void)
 // ============================================================================
 static esp_err_t dsi_bring_up(void)
 {
+    // 1. Power up the DSI PHY (VDD_MIPI_DPHY 2.5V) before any DSI calls.
+    esp_ldo_channel_handle_t phy_pwr = NULL;
+    esp_ldo_channel_config_t ldo_cfg = {
+        .chan_id    = DSI_PHY_LDO_CHAN,
+        .voltage_mv = DSI_PHY_LDO_MV,
+    };
+    ESP_RETURN_ON_ERROR(esp_ldo_acquire_channel(&ldo_cfg, &phy_pwr),
+                       TAG, "DSI PHY LDO acquire");
+    ESP_LOGI(TAG, "MIPI DSI PHY powered on (LDO%d @ %dmV)",
+             DSI_PHY_LDO_CHAN, DSI_PHY_LDO_MV);
+
     esp_lcd_dsi_bus_config_t bus_cfg = {
         .bus_id             = 0,
         .num_data_lanes     = DSI_NUM_DATA_LANES,
@@ -158,11 +216,30 @@ static esp_err_t dsi_bring_up(void)
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_cfg, &s_dsi_bus),
                        TAG, "esp_lcd_new_dsi_bus");
 
+    // DBI IO handle — the IDF reference example creates this even for
+    // panels that don't use DSI commands. Some DSI bridge state machines
+    // need the command-channel side initialized before video mode runs.
+    esp_lcd_dbi_io_config_t dbi_cfg = {
+        .virtual_channel = 0,
+        .lcd_cmd_bits    = 8,
+        .lcd_param_bits  = 8,
+    };
+    esp_lcd_panel_io_handle_t dbi_io;
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_dbi(s_dsi_bus, &dbi_cfg, &dbi_io),
+                       TAG, "esp_lcd_new_panel_io_dbi");
+
     esp_lcd_dpi_panel_config_t dpi_cfg = {
         .virtual_channel    = 0,
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = PANEL_PIXEL_CLOCK_MHZ,
-        .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB565,
+        // TC358762 only decodes 24-bit DSI Video Mode packets. Keep the
+        // entire pipeline RGB888 so the framebuffer stride (3 B/pixel)
+        // matches what the DSI engine sends on the wire. Our internal
+        // text/JPEG rendering still produces RGB565; the rotation step
+        // in display_present_rgb565() expands to RGB888 inline.
+        .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
+        .in_color_format    = LCD_COLOR_FMT_RGB888,
+        .out_color_format   = LCD_COLOR_FMT_RGB888,
         .num_fbs            = 1,
         .video_timing = {
             .h_size            = PANEL_H_ACTIVE,
@@ -174,11 +251,14 @@ static esp_err_t dsi_bring_up(void)
             .vsync_back_porch  = PANEL_VSYNC_BP,
             .vsync_front_porch = PANEL_VSYNC_FP,
         },
-        .flags.use_dma2d = true,
+        .flags.use_dma2d = false,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_dpi(s_dsi_bus, &dpi_cfg, &s_panel),
                        TAG, "esp_lcd_new_panel_dpi");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel_init");
+    // No esp_lcd_panel_reset() — the IDF DPI driver doesn't implement it
+    // (returns NOT_SUPPORTED). It only exists for panels with vendor
+    // drivers that toggle a hardware reset pin via DSI commands.
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel),  TAG, "panel_init");
 
     ESP_LOGI(TAG, "DSI up: %dx%d %d MHz, %d-lane %d Mbps",
              PANEL_H_ACTIVE, PANEL_V_ACTIVE, PANEL_PIXEL_CLOCK_MHZ,
@@ -197,14 +277,24 @@ esp_err_t display_init(void)
     ESP_RETURN_ON_ERROR(panel_power_on(),  TAG, "panel power-on");
     ESP_RETURN_ON_ERROR(dsi_bring_up(),    TAG, "DSI bring-up");
 
+    // PSRAM scratch (panel-native 800x480 RGB888 = 3 bytes/pixel).
+    s_rot_buf = (uint8_t *)heap_caps_malloc(
+        PANEL_H_ACTIVE * PANEL_V_ACTIVE * 3,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rot_buf) {
+        ESP_LOGE(TAG, "rotation scratch alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     s_up = true;
 
-    // Default brightness from shared state (set by /config in M4; 80 on
-    // first boot).
+    // Cache the brightness value but do NOT push it to the panel yet.
+    // The device boots with backlight off; first wake (BOOT short-press,
+    // tap, or POST /state {wake}) applies the brightness.
     viewport_state_lock();
-    uint8_t b = viewport_state_get()->brightness;
+    s_last_pwm = viewport_state_get()->brightness;
     viewport_state_unlock();
-    display_set_brightness(b);
+    mcu_write_u8(REG_PWM, 0);
 
     return ESP_OK;
 }
@@ -229,26 +319,44 @@ esp_err_t display_set_brightness(uint8_t pct)
 esp_err_t display_sleep(void)
 {
     if (!s_up) return ESP_ERR_INVALID_STATE;
-    return mcu_write_u8(REG_PWM, 0);
+    esp_err_t err = mcu_write_u8(REG_PWM, 0);
+    ESP_LOGI(TAG, "sleep: PWM=0 (%s)", esp_err_to_name(err));
+    return err;
 }
 
 esp_err_t display_wake(void)
 {
     if (!s_up) return ESP_ERR_INVALID_STATE;
-    return mcu_write_u8(REG_PWM, s_last_pwm);
+    esp_err_t err = mcu_write_u8(REG_PWM, s_last_pwm);
+    ESP_LOGI(TAG, "wake: PWM=%u (%s)", s_last_pwm, esp_err_to_name(err));
+    return err;
+}
+
+// Convert a 16-bit RGB565 to three bytes in B, G, R order.
+// The TC358762 → Pi-style panel pipeline expects BGR on the DPI wire,
+// matching the panel chip's native byte order. Swapping to RGB produced
+// garbled vertical bands; BGR aligns the pixel layout.
+static inline void rgb565_to_rgb888(uint16_t px, uint8_t *out)
+{
+    out[0] = (uint8_t)(( px        & 0x1F) * 255 / 31);  // B
+    out[1] = (uint8_t)(((px >> 5)  & 0x3F) * 255 / 63);  // G
+    out[2] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);  // R
 }
 
 esp_err_t display_fill(uint16_t rgb565)
 {
-    if (!s_up) return ESP_ERR_INVALID_STATE;
-    void *fb = NULL;
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &fb),
-                       TAG, "get frame buffer");
-    uint16_t *px = (uint16_t *)fb;
+    if (!s_up || !s_rot_buf) return ESP_ERR_INVALID_STATE;
+    uint8_t rgb[3];
+    rgb565_to_rgb888(rgb565, rgb);
     size_t n = PANEL_H_ACTIVE * PANEL_V_ACTIVE;
-    for (size_t i = 0; i < n; ++i) px[i] = rgb565;
+    for (size_t i = 0; i < n; ++i) {
+        s_rot_buf[i * 3 + 0] = rgb[0];
+        s_rot_buf[i * 3 + 1] = rgb[1];
+        s_rot_buf[i * 3 + 2] = rgb[2];
+    }
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
-                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE, fb);
+                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
+                                     s_rot_buf);
 }
 
 esp_err_t display_present_rgb565(const uint16_t *src,
@@ -261,43 +369,39 @@ esp_err_t display_present_rgb565(const uint16_t *src,
     viewport_orientation_t orient = viewport_state_get()->orientation;
     viewport_state_unlock();
 
-    void *fb = NULL;
-    esp_err_t err = esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &fb);
-    if (err != ESP_OK) return err;
-    uint16_t *dst = (uint16_t *)fb;
+    if (!s_rot_buf) return ESP_ERR_INVALID_STATE;
 
     if (orient == VIEWPORT_ORIENTATION_LANDSCAPE) {
         if (src_w != PANEL_H_ACTIVE || src_h != PANEL_V_ACTIVE)
             return ESP_ERR_INVALID_SIZE;
-        memcpy(dst, src, (size_t)src_w * src_h * sizeof(uint16_t));
+        // RGB565 → RGB888, no rotation.
+        size_t n = (size_t)src_w * src_h;
+        for (size_t i = 0; i < n; ++i) {
+            rgb565_to_rgb888(src[i], &s_rot_buf[i * 3]);
+        }
     } else {
-        // Portrait: src is 480x800, rotate 90° CW into the 800x480 panel.
-        // dst dims = src_h x src_w. dst_stride = src_h.
-        // src(x,y) -> dst(x, src_h - 1 - y)
+        // Portrait: src is 480x800; rotate 90° CW into 800x480 panel
+        // coordinates and expand to RGB888 in the same pass.
         if (src_w != PANEL_V_ACTIVE || src_h != PANEL_H_ACTIVE)
             return ESP_ERR_INVALID_SIZE;
-        const uint16_t dst_stride = src_h;
+        const uint16_t dst_stride = src_h;  // 800 panel-rows of 3 bytes each
         for (uint16_t y = 0; y < src_h; ++y) {
             const uint16_t *srow = src + (size_t)y * src_w;
             const uint16_t dst_col = (uint16_t)(src_h - 1 - y);
             for (uint16_t x = 0; x < src_w; ++x) {
-                dst[(size_t)x * dst_stride + dst_col] = srow[x];
+                size_t dst_idx = ((size_t)x * dst_stride + dst_col) * 3;
+                rgb565_to_rgb888(srow[x], &s_rot_buf[dst_idx]);
             }
         }
     }
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
-                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE, fb);
+                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
+                                     s_rot_buf);
 }
 
 esp_err_t display_test_pattern(void)
 {
-    if (!s_up) return ESP_ERR_INVALID_STATE;
-    void *fb = NULL;
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 1, &fb),
-                       TAG, "get frame buffer");
-    uint16_t *px = (uint16_t *)fb;
-
-    // 8 vertical color bars: white, yellow, cyan, green, magenta, red, blue, black.
+    if (!s_up || !s_rot_buf) return ESP_ERR_INVALID_STATE;
     static const uint16_t bars[8] = {
         0xFFFF, 0xFFE0, 0x07FF, 0x07E0,
         0xF81F, 0xF800, 0x001F, 0x0000,
@@ -307,9 +411,11 @@ esp_err_t display_test_pattern(void)
         for (int x = 0; x < PANEL_H_ACTIVE; ++x) {
             int b = x / bar_w;
             if (b > 7) b = 7;
-            px[y * PANEL_H_ACTIVE + x] = bars[b];
+            size_t idx = ((size_t)y * PANEL_H_ACTIVE + x) * 3;
+            rgb565_to_rgb888(bars[b], &s_rot_buf[idx]);
         }
     }
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
-                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE, fb);
+                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
+                                     s_rot_buf);
 }

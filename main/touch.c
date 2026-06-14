@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "display.h"
+#include "local_screens.h"
 #include "state_machine.h"
 #include "viewport_state.h"
 
@@ -80,10 +81,13 @@ static void touch_task(void *arg)
 
             if (dt_ms > 0 && dt_ms <= TAP_MAX_MS) {
                 last_tap_us = now;
-                viewport_run_state_t cur = state_machine_current();
+                // Cancel any BOOT-button identity overlay so a tap-to-sleep
+                // doesn't fight the overlay timer trying to restore content.
+                if (local_screens_overlay_active()) local_screens_overlay_dismiss();
                 viewport_run_state_t target =
-                    (cur == VIEWPORT_STATE_AWAKE) ? VIEWPORT_STATE_ASLEEP
-                                                  : VIEWPORT_STATE_AWAKE;
+                    (state_machine_current() == VIEWPORT_STATE_AWAKE)
+                        ? VIEWPORT_STATE_ASLEEP
+                        : VIEWPORT_STATE_AWAKE;
                 ESP_LOGI(TAG, "tap (%lu ms) -> %s", (unsigned long)dt_ms,
                          target == VIEWPORT_STATE_AWAKE ? "wake" : "sleep");
                 state_machine_set_local(target);

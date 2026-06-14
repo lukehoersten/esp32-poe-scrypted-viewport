@@ -25,28 +25,11 @@ static const char *TAG = "button";
 #define LONG_HOLD_MS         5000
 #define OVERLAY_MS           15000
 
-static esp_timer_handle_t s_overlay_timer;
-
-static void overlay_expired(void *arg)
-{
-    if (display_is_up()) {
-        local_screens_restore_for_state();
-        // Caller (state_machine_set) had backlight off if asleep — the
-        // overlay turned it on. Force it back off if we're asleep.
-        // Easiest: re-issue display_sleep, the wake_then_sleep path is
-        // owned by the state machine.
-    }
-    ESP_LOGI(TAG, "IP overlay expired");
-}
-
 static void start_overlay(void)
 {
     if (!display_is_up()) return;
-    esp_timer_stop(s_overlay_timer);
-    display_wake();  // turn backlight on in case we were asleep
-    local_screens_show_ip();
-    esp_timer_start_once(s_overlay_timer, (uint64_t)OVERLAY_MS * 1000ULL);
-    ESP_LOGI(TAG, "BOOT short-press → IP overlay for %dms", OVERLAY_MS);
+    local_screens_overlay(OVERLAY_MS);
+    ESP_LOGI(TAG, "BOOT short-press → identity overlay for %dms", OVERLAY_MS);
 }
 
 static void factory_reset(void)
@@ -103,12 +86,6 @@ esp_err_t button_init(void)
                  PIN_BOOT_BUTTON, esp_err_to_name(err));
         return err;
     }
-
-    esp_timer_create_args_t targs = {
-        .callback = &overlay_expired,
-        .name     = "boot_overlay",
-    };
-    esp_timer_create(&targs, &s_overlay_timer);
 
     BaseType_t ok = xTaskCreate(button_task, "boot_btn", 3072, NULL, 3, NULL);
     if (ok != pdPASS) return ESP_FAIL;

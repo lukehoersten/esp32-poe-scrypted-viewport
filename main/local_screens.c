@@ -4,6 +4,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "display.h"
 #include "net_eth.h"
@@ -71,7 +72,9 @@ static const uint8_t FONT[95][8] = {
 #define FG  0xFFFF   // white
 #define BG  0x0000   // black
 
-static uint16_t *s_fb;          // PSRAM scratch at PANEL_W × PANEL_H
+static uint16_t           *s_fb;            // PSRAM scratch at PANEL_W × PANEL_H
+static esp_timer_handle_t  s_overlay_timer;
+static volatile bool       s_overlay_active;
 
 static void clear(uint16_t color)
 {
@@ -125,6 +128,8 @@ static void draw_centered(uint16_t fb_w, uint16_t fb_h, int y,
     }
 }
 
+static void overlay_expired_cb(void *arg);
+
 esp_err_t local_screens_init(void)
 {
     s_fb = (uint16_t *)heap_caps_malloc(MAX_BUF_PX * sizeof(uint16_t),
@@ -133,7 +138,51 @@ esp_err_t local_screens_init(void)
         ESP_LOGE(TAG, "PSRAM alloc failed for scratch FB");
         return ESP_ERR_NO_MEM;
     }
+    esp_timer_create_args_t args = {
+        .callback = &overlay_expired_cb,
+        .name     = "ident_overlay",
+    };
+    esp_timer_create(&args, &s_overlay_timer);
     return ESP_OK;
+}
+
+static void overlay_expired_cb(void *arg)
+{
+    s_overlay_active = false;
+    // Backlight off after the overlay. Whether the device is UNCONFIGURED
+    // or ASLEEP, the result is the same: dark panel until next interaction.
+    // For AWAKE we leave the backlight on — Scrypted's next /frame
+    // overwrites the overlay anyway.
+    viewport_state_lock();
+    viewport_run_state_t s = viewport_state_get()->state;
+    viewport_state_unlock();
+    if (s != VIEWPORT_STATE_AWAKE && display_is_up()) {
+        display_sleep();
+    }
+}
+
+esp_err_t local_screens_overlay(uint32_t duration_ms)
+{
+    if (!display_is_up()) return ESP_ERR_INVALID_STATE;
+    esp_timer_stop(s_overlay_timer);
+    display_wake();
+    esp_err_t err = local_screens_show_ip();
+    if (err != ESP_OK) return err;
+    s_overlay_active = true;
+    return esp_timer_start_once(s_overlay_timer,
+                                (uint64_t)duration_ms * 1000ULL);
+}
+
+bool local_screens_overlay_active(void)
+{
+    return s_overlay_active;
+}
+
+void local_screens_overlay_dismiss(void)
+{
+    esp_timer_stop(s_overlay_timer);
+    s_overlay_active = false;
+    if (display_is_up()) display_sleep();
 }
 
 esp_err_t local_screens_show_ip(void)
@@ -225,20 +274,3 @@ esp_err_t local_screens_show_loading(void)
     return display_present_rgb565(s_fb, w, h);
 }
 
-esp_err_t local_screens_restore_for_state(void)
-{
-    if (!s_fb) return ESP_ERR_INVALID_STATE;
-
-    viewport_state_lock();
-    viewport_run_state_t s = viewport_state_get()->state;
-    viewport_state_unlock();
-
-    if (s == VIEWPORT_STATE_UNCONFIGURED) return local_screens_show_ip();
-
-    // Awake or asleep: clear the FB to black. For asleep the backlight is
-    // off anyway; for awake the next /frame will overwrite.
-    uint16_t w, h;
-    effective_dims(&w, &h);
-    clear(BG);
-    return display_present_rgb565(s_fb, w, h);
-}

@@ -50,24 +50,25 @@ esp_err_t state_machine_set(viewport_run_state_t target)
     viewport_state_lock();
     viewport_state_t *st = viewport_state_get();
 
-    if (!st->configured) {
-        viewport_state_unlock();
-        return ESP_ERR_INVALID_STATE;
-    }
     if (st->state == target) {
         viewport_state_unlock();
         return ESP_OK;  // idempotent no-op
     }
     st->state = target;
+    bool configured = st->configured;
     viewport_state_unlock();
 
     if (target == VIEWPORT_STATE_AWAKE) {
         if (display_is_up()) {
             display_wake();
-            local_screens_show_loading();  // until next /frame paints
+            // Content choice: configured devices show "Loading…" until
+            // Scrypted pushes a /frame; unconfigured devices show the
+            // identity screen since there's no Scrypted to push anything.
+            if (configured) local_screens_show_loading();
+            else            local_screens_show_ip();
         }
         arm_idle_timer_unlocked();
-        ESP_LOGI(TAG, "AWAKE");
+        ESP_LOGI(TAG, "AWAKE (%s)", configured ? "configured" : "unconfigured");
     } else {
         disarm_idle_timer();
         if (display_is_up()) display_sleep();
@@ -86,12 +87,14 @@ void state_machine_frame_painted(void)
 
 void state_machine_set_local(viewport_run_state_t target)
 {
-    // For idempotent no-op (already in target), state_machine_set returns OK
-    // without changing state; we still call state_client to keep Scrypted in
-    // sync if it's drifted. State POSTs are idempotent on both ends.
     esp_err_t err = state_machine_set(target);
-    if (err != ESP_OK) return;  // unconfigured / invalid
-    state_client_post(target);
+    if (err != ESP_OK) return;
+    // Only POST when there's a Scrypted to talk to. Unconfigured tap toggles
+    // change the local display state without notifying anyone.
+    viewport_state_lock();
+    bool configured = viewport_state_get()->configured;
+    viewport_state_unlock();
+    if (configured) state_client_post(target);
 }
 
 viewport_run_state_t state_machine_current(void)
