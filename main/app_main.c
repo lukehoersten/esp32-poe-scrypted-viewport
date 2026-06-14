@@ -1,4 +1,7 @@
+#include "http_api.h"
+#include "mdns_service.h"
 #include "net_eth.h"
+#include "viewport_state.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -13,7 +16,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    ESP_LOGI(TAG, "Scrypted Viewport boot");
+    viewport_state_init();
+    ESP_LOGI(TAG, "Scrypted Viewport boot (v%s)", VIEWPORT_VERSION);
 
     ESP_ERROR_CHECK(net_eth_init());
     if (net_eth_wait_for_ip(30 * 1000) == ESP_OK) {
@@ -22,12 +26,13 @@ void app_main(void)
         ESP_LOGW(TAG, "no DHCP lease after 30s, will keep retrying in the background");
     }
 
-    // TODO M2: mDNS _scrypted-viewport._tcp.local
-    // TODO M2: HTTP server: GET /state
+    ESP_ERROR_CHECK(mdns_service_start());
+    ESP_ERROR_CHECK(http_api_start());
+
     // TODO M3: MIPI-DSI panel init (800x480 IPS, default portrait 480x800)
-    // TODO M4: /config persistence (NVS)
+    // TODO M4: /config persistence (NVS) + GET /config + POST /config
     // TODO M5: /frame JPEG decode -> framebuffer
-    // TODO M6: /state POST + idle timer
+    // TODO M6: POST /state + idle timer
     // TODO M7: Capacitive touch -> outbound /state POST
     // TODO M8: Local screens (IP, loading) + BOOT button
 }
