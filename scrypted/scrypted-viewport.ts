@@ -34,31 +34,29 @@
 // - Camera must respect picture.width/height OR be paired with a snapshot
 //   plugin that resizes. Otherwise /frame returns 400.
 
-// The Scripts plugin (in @scrypted/core) evaluates this file inside a
-// sandbox that does NOT resolve ESM `import` of npm modules — it injects
-// `sdk` as a global and lets you `require()` Node built-ins. So we:
-//   - destructure runtime values from the injected `sdk` global
-//   - require('dns') for the Node mDNS lookup
-// Type aliases below are declared loosely as `any` so the script works
-// even when the SDK type package isn't installed locally (the Scrypted
-// runtime doesn't care about types).
+// The Scripts plugin (in @scrypted/core) evaluates this file inside the
+// scryptedEval sandbox. The runtime pre-injects the SDK names as scope
+// locals — no `import` is needed (or allowed: any `import ... from
+// "@scrypted/sdk"` compiles to a require() that fails to resolve).
+// All we do here is `declare` each one so TypeScript is happy; the
+// declarations erase at compile time and the values come from the
+// runtime scope.
 declare const sdk: any;
-declare const require: any;
-
-const {
-    ScryptedDeviceBase,
-    ScryptedDeviceType,
-    ScryptedInterface,
-    systemManager,
-    endpointManager,
-    mediaManager,
-    deviceManager,
-} = sdk;
+declare const ScryptedDeviceBase: any;
+declare const ScryptedDeviceType: any;
+declare const ScryptedInterface:  any;
+declare const systemManager:      any;
+declare const endpointManager:    any;
+declare const mediaManager:       any;
+declare const deviceManager:      any;
+declare const log:                any;
+declare const device:             any;
+declare const require:            any;
 
 const dns = require("dns").promises;
 
-// Loose type aliases — the runtime values come from `sdk`, so these
-// are purely cosmetic for the rest of the script's signatures.
+// Loose type aliases — purely cosmetic for the rest of the script's
+// signatures, since the runtime values are `any`.
 type DeviceCreator           = any;
 type DeviceCreatorSettings   = any;
 type DeviceProvider          = any;
