@@ -23,9 +23,9 @@ Status legend:
 | M1 | Board Bring-Up — Ethernet + DHCP | ✅ | ✅ |
 | M2 | HTTP + mDNS (`GET /state`) | ✅ | ✅ |
 | M3 | Display Bring-Up (Hosyond panel) | ✅ | ✅ |
-| M4 | Config Persistence (NVS, partial updates) | ✅ | 🟡 |
+| M4 | Config Persistence (NVS, partial updates) | ✅ | ✅ |
 | M5 | JPEG Frame Push (`POST /frame`) | ✅ | 🟡 |
-| M6 | State + Idle Timer (`POST /state`, 409 guard) | ✅ | 🟡 |
+| M6 | State + Idle Timer (`POST /state`, 409 guard) | ✅ | ✅ |
 | M7 | Touch + Outbound `/state` POST | ✅ | ✅ |
 | M8 | Local Screens + touch long-press | ✅ | ✅ |
 | M9 | Live Stream (`POST /stream`) | ⬜ | ⬜ |
@@ -302,7 +302,7 @@ Side-effects to confirm:
 - After `POST /config` with `viewport` or `orientation`: mDNS TXT records update; `viewport-<name>.local` resolves; browse shows new TXT.
 - After `POST /config` with both `viewport` and `scrypted` (any order, on any subsequent call): `GET /state` shows `configured: true`, `state: "asleep"`.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4. Logic exercised in code but unverified on hardware.
+**Status**: ✅ verified 2026-06-14. Full POST + partial POST + 5 validation failure modes all returned correctly. Config survives reboot (NVS persistence). `configured: true` was set automatically once both `viewport` and `scrypted` were supplied. Required raising httpd stack from 4 KiB to 8 KiB — the handler's 2 KiB body buffer plus locals were overflowing into the protect page.
 
 ---
 
@@ -486,7 +486,7 @@ curl -i -X POST -d 'not json' \
 
 **Known gap (M7 closes this)**: when the idle timer fires the device transitions to ASLEEP locally but does NOT yet POST `{viewport,state:sleep}` to `<scrypted>/state`. That outbound POST lands with `state_client` in M7.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4. Awaiting hardware.
+**Status**: ✅ verified 2026-06-14. Wake/sleep toggle 204, idempotent repeats 204, `/frame` while asleep returns 409 with expected body, bad inputs 400, idle timer fires after `idle_timeout_ms`, `idle_timeout_ms:0` correctly disables the timer.
 
 ---
 

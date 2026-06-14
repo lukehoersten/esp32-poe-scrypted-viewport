@@ -451,6 +451,11 @@ esp_err_t http_api_start(void)
     cfg.server_port      = 80;
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;
+    // Default 4 KiB is tight: /config alone has ~2.4 KiB of stack locals
+    // (2 KiB body buffer + 256 B scrypted URL + 64 B name + cJSON frames)
+    // and POST /frame pushes a JPEG header onto the stack too. 8 KiB gives
+    // both handlers comfortable headroom without doubling RAM usage.
+    cfg.stack_size       = 8192;
 
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start");
