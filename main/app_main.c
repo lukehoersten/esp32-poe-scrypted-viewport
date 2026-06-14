@@ -5,7 +5,7 @@
 
 static const char *TAG = "viewport";
 
-extern "C" void app_main(void)
+void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -15,8 +15,8 @@ extern "C" void app_main(void)
 
     // TODO: Ethernet (ESP32-P4 EMAC + Waveshare PoE PHY)
     // TODO: mDNS _scrypted-viewport._tcp.local
-    // TODO: HTTP server: /health /config /frame /sleep /brightness
-    // TODO: MIPI-DSI panel init (800x480 IPS)
+    // TODO: HTTP server: /state /config /frame
+    // TODO: MIPI-DSI panel init (800x480 IPS, default portrait 480x800)
     // TODO: JPEG decode -> framebuffer
-    // TODO: Capacitive touch -> callback POST
+    // TODO: Capacitive touch -> outbound /state POST
 }
