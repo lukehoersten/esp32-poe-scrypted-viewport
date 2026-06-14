@@ -82,12 +82,14 @@ Boot flow:
 power on
   -> initialize logging
   -> initialize NVS
+  -> load saved config (display name, callback, brightness)
   -> initialize Ethernet
   -> DHCP
   -> initialize mDNS
   -> initialize display/backlight/touch
   -> start HTTP server
   -> advertise _scrypted-viewport._tcp.local
+  -> if unconfigured: render IP + viewport.local on screen
   -> wait for API calls
 ```
 
@@ -103,15 +105,42 @@ Scrypted renders 800x480 JPEG
   -> reset idle timer
 ```
 
+Wake/sleep model:
+
+Wake and sleep couple the backlight with Scrypted's frame stream. The two move together, never independently.
+
+```text
+wake  = backlight on  + Scrypted streaming frames
+sleep = backlight off + Scrypted not streaming
+```
+
 Touch flow:
 
 ```text
-user taps display
-  -> firmware detects gesture
-  -> POST JSON event to configured callback URL
-  -> Scrypted decides what to do
-  -> Scrypted may POST a new frame/sleep/brightness
+tap while asleep:
+  backlight on
+  render loading screen
+  POST {"event":"wake"} -> Scrypted starts streaming
+  next /frame replaces loading screen
+
+tap while awake:
+  backlight off
+  POST {"event":"sleep"} -> Scrypted stops streaming
+
+idle timer fires (60s with no /frame):
+  backlight off
+  POST {"event":"sleep"} -> Scrypted stops streaming
 ```
+
+The callback events are `wake` and `sleep`; `tap` itself is internal. The events are idempotent imperatives — "start streaming" / "stop streaming" — not state notifications. Scrypted does not track per-viewport state; it acts on the event and forgets.
+
+Scrypted-initiated `/sleep` and `/frame` do not echo a callback.
+
+Only `tap` is detected on the touchscreen. Long-press and swipes are out of scope for v1.
+
+BOOT button:
+- Short press: overlay IP screen for 15s, then return to prior state. Wakes backlight temporarily but does not change wake/sleep state and does not POST a callback.
+- Hold ≥5s: clear NVS and reboot. Device comes back unconfigured.
 
 ---
 
@@ -172,7 +201,8 @@ Request body:
 ```json
 {
   "display": "mudroom",
-  "callback": "http://scrypted.local:11080/api/viewport/touch"
+  "callback": "http://scrypted.local:11080/api/viewport/touch",
+  "idle_timeout_ms": 60000
 }
 ```
 
@@ -180,7 +210,8 @@ Behavior:
 
 - Store display name.
 - Store callback URL.
-- Persist to NVS so it survives reboot.
+- Store idle timeout (optional in body, default 60000).
+- Persist all to NVS so it survives reboot.
 - May be called repeatedly.
 - Replaces old config atomically.
 
@@ -317,18 +348,19 @@ Example request body:
 Supported event names:
 
 ```text
-tap
-long_press
-swipe_left
-swipe_right
+wake
+sleep
 ```
+
+`tap` is the input the touchscreen detects; the callback event is the resulting state (`wake` or `sleep`). Idle-timer-driven sleep also sends `sleep`.
 
 Rules:
 
-- Scrypted Viewport does not interpret events.
-- Scrypted Viewport does not switch cameras.
-- Scrypted Viewport does not decide whether to stream.
-- Scrypted owns behavior.
+- The device owns wake/sleep state. Scrypted does not track it.
+- Scrypted owns the viewport→camera binding and decides which stream goes to which viewport.
+- `wake`/`sleep` callbacks are idempotent imperatives: "start streaming" / "stop streaming". Scrypted acts on receipt and forgets.
+- Scrypted enforces its own per-stream timeout independently of the device's idle timer. Either can end a session, whichever notices first.
+- Scrypted-initiated `/sleep` and `/frame` do not echo a callback.
 
 Callback delivery:
 
@@ -381,6 +413,9 @@ scrypted-viewport/
 
     idle_timer.h
     idle_timer.c
+
+    local_screens.h
+    local_screens.c
 
     nvs_config.h
     nvs_config.c
@@ -508,15 +543,14 @@ Output:
 Responsibilities:
 
 - Initialize capacitive touch controller.
-- Detect basic gestures:
-  - tap
-  - long press
-  - swipe left
-  - swipe right
+- Detect `tap` only (touch-down + release within ~500ms, ignore movement). Long-press and swipes are out of scope.
 - Debounce.
-- Send events to callback client.
-
-Gesture accuracy does not need to be perfect. The primary event is tap.
+- On tap:
+  - If asleep: transition to wake — backlight on, render loading screen, POST `{"event":"wake"}`.
+  - If awake: transition to sleep — backlight off, POST `{"event":"sleep"}`.
+- Also handle BOOT button:
+  - Short press: ask `local_screens` to overlay the IP screen for 15s, then restore prior state. No callback.
+  - Hold ≥5s: clear NVS via `nvs_config_reset()` and reboot.
 
 ### 8.8 `callback_client.c`
 
@@ -531,12 +565,25 @@ Responsibilities:
 
 Responsibilities:
 
-- Reset timer on `/frame`.
-- Turn off backlight after timeout.
-- Default idle timeout can be hardcoded initially, e.g. 30 seconds.
-- Future `/config` may add timeout, but not required now.
+- Reset timer on `/frame` and on tap-driven wake.
+- On expiry: transition to sleep (backlight off, POST `{"event":"sleep"}`).
+- Idle timeout: read from NVS (`idle_timeout_ms`), default 60000 ms. Set via `/config`. Scrypted is expected to use the same value as its own per-stream cutoff, but timers run independently.
 
-### 8.10 `nvs_config.c`
+### 8.10 `local_screens.c`
+
+The only application UI the firmware draws. Two screens, both via a small embedded bitmap font (no LVGL, no general text engine).
+
+Responsibilities:
+
+- `local_screens_show_ip(ip)` — centered IP address and `viewport.local`. Shown:
+  - on boot when no callback URL is in NVS (persistent until `/config` arrives), and
+  - as a 15s overlay on BOOT short-press (then restore prior state).
+- `local_screens_show_loading()` — centered "Loading…" text. Shown on wake until the next `/frame` lands.
+- Render into the same RGB565 framebuffer the JPEG decoder targets, then push to the panel.
+
+Keep it small. Hard-code the font glyphs for digits, dots, colons, and a-z. No string formatting library — write tiny inline blitters.
+
+### 8.11 `nvs_config.c`
 
 Responsibilities:
 
@@ -545,10 +592,7 @@ Persist:
 - display name
 - callback URL
 - brightness
-
-Optional:
-
-- idle timeout
+- idle timeout (ms)
 
 Do not persist frame data.
 
@@ -635,44 +679,49 @@ Acceptance criterion:
 
 ## 12. Scrypted Integration Assumptions
 
-Scrypted script owns a static display list:
+Scrypted owns a list of viewports, each bound to one camera device:
 
 ```ts
-const displays = [
-  "http://viewport-mudroom.local",
-  "http://viewport-kitchen.local",
+const viewports = [
+  { url: "http://viewport-mudroom.local", display: "mudroom", camera: "frontDoor" },
+  { url: "http://viewport-kitchen.local", display: "kitchen", camera: "driveway" },
 ];
 ```
+
+The binding lives in Scrypted config. The device knows nothing about cameras.
 
 Registration on startup:
 
 ```ts
-await fetch(`${display}/config`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    display: "mudroom",
-    callback: "http://scrypted.local:11080/api/viewport/touch"
-  })
-});
+for (const v of viewports) {
+  await fetch(`${v.url}/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      display: v.display,
+      callback: "http://scrypted.local:11080/api/viewport/touch",
+      idle_timeout_ms: 60000,
+    }),
+  });
+}
 ```
 
-Frame push:
+Stream a session of frames to a viewport — triggered by either a camera event (doorbell, person, motion) or a `wake` callback from the viewport:
 
 ```ts
-await fetch(`${display}/frame`, {
+await fetch(`${v.url}/frame`, {
   method: "POST",
   headers: { "Content-Type": "image/jpeg" },
-  body: jpegBuffer
+  body: jpegBuffer,
 });
 ```
 
-Touch callback handler decides:
+Callback handler at `/api/viewport/touch`:
 
-- latest snapshot
-- short live preview
-- cycle page/camera
-- sleep
+- `wake` → look up viewport→camera binding, start streaming.
+- `sleep` → stop streaming to that viewport.
+
+Both are idempotent. Don't track viewport state. Apply a Scrypted-side per-stream timeout using the same `idle_timeout_ms` value sent in `/config`, so streams end even if the `sleep` callback is dropped. Timers run independently on each side.
 
 ---
 
@@ -774,6 +823,19 @@ Acceptance:
 Tap generates callback to test HTTP endpoint.
 ```
 
+### Milestone 8: Local Screens
+
+- Embed minimal bitmap font.
+- Render unconfigured screen (IP + viewport.local) on boot when NVS has no callback.
+- Render loading screen on tap-wake; replaced by next `/frame`.
+
+Acceptance:
+
+```text
+Fresh device boots to an IP-display screen.
+Tap on a sleeping configured device shows "Loading…" until next frame.
+```
+
 ---
 
 ## 14. Test Images
@@ -866,7 +928,11 @@ The project is successful when:
 9. `/sleep` works.
 10. `/brightness` works.
 11. Tap sends callback JSON to Scrypted/test server.
-12. Firmware has no Matter, HomeKit, polling, local UI rendering, or config portal.
+12. Unconfigured device shows its IP on screen so it can be registered from Scrypted.
+13. Tap toggles the device between wake (backlight on + Scrypted streaming) and sleep (backlight off + Scrypted not streaming), via `wake`/`sleep` callback events.
+14. Idle timer fires `sleep` after `idle_timeout_ms` with no `/frame` (default 60s, set by Scrypted via `/config`).
+15. BOOT short-press overlays the IP screen for 15s; BOOT hold ≥5s factory-resets.
+16. Firmware has no Matter, HomeKit, polling, business logic, or config portal. The only locally-rendered UI is the IP screen and the loading screen.
 
 ---
 
