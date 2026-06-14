@@ -540,32 +540,41 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 
 ## M8 — Local Screens + BOOT button
 
-**Acceptance**: IP screen on first boot; loading screen on every wake; BOOT button works.
+**Acceptance**: identity screen on first boot; loading screen on every wake; BOOT button works.
 
 **Visual checks (panel-attached)**
 
-- Fresh flash (or after factory reset) → screen shows two centered white-on-black lines:
+- Fresh flash (or after factory reset) → screen shows four centered white-on-black lines (auto-scaled to fit):
   ```
+  viewport
   viewport.local
   192.168.x.y
+  unconfigured
   ```
 - `POST /config` with viewport + scrypted → device transitions to ASLEEP, backlight off.
 - `POST /state {state:wake}` (or tap) → backlight on, `Loading...` centered until the first `/frame` lands.
 - `POST /frame` while AWAKE → loading screen replaced by the JPEG.
+- **BOOT short-press while configured** → identity overlay for 15s showing four lines populated from current state, e.g.:
+  ```
+  mudroom
+  viewport-mudroom.local
+  192.168.1.42
+  asleep
+  ```
 - `POST /state {state:sleep}` (or idle timeout, or tap-while-awake) → backlight off.
 
 **BOOT button** (GPIO 0 placeholder — see Hardware note below)
 
-- Short press at any state: backlight wakes if it was off, IP screen overlays for 15s, then `local_screens_restore_for_state()` paints black (Scrypted's next `/frame` repaints if awake; the state machine handles backlight if asleep). Does not change wake/sleep state.
+- Short press at any state: backlight wakes if it was off, identity screen overlays for 15s, then `local_screens_restore_for_state()` paints black (Scrypted's next `/frame` repaints if awake; the state machine handles backlight if asleep). Does not change wake/sleep state.
 - Hold ≥ 5s: serial logs `BOOT held 5000ms → factory reset`, NVS clears via `nvs_config_reset()`, `esp_restart()`. After reboot the device comes back UNCONFIGURED with the IP screen.
 
 **Hardware note**: `PIN_BOOT_BUTTON = 0` in `button.c` is a guess. ESP32-P4's official strap pin is GPIO35 but that's owned by RMII TXD1 at runtime. Most Waveshare ESP32-P4 boards expose a separate user button on a free GPIO — confirm against the schematic and update `PIN_BOOT_BUTTON` if needed. If the wrong pin is wired, the button just never triggers (input reads stuck-high) and the rest of M8 still works.
 
 **Negative / edge**
 
-- BOOT overlay during AWAKE: the overlay paints over the live frame. Scrypted's next `/frame` (within ~1s in a normal stream) overwrites it. Acceptable: the operator sees the IP for ≤ 1 frame interval then the live view resumes.
-- BOOT overlay during ASLEEP: backlight comes on for the overlay, then `restore_for_state` paints black. The state machine's `display_sleep()` is NOT re-issued — that's an open follow-up if the test pattern stays lit after expiry.
-- Font fallback: any character outside the supported set (digits, dot, colon, `L`, lowercase a/c/d/e/g/i/l/n/o/p/r/t/v/w, space) renders as blank. Today the only strings drawn are `viewport.local`, the IPv4 string, and `Loading...` — all covered.
+- BOOT overlay during AWAKE: the overlay paints over the live frame. Scrypted's next `/frame` (within ~1s in a normal stream) overwrites it. Acceptable: the operator sees the identity for ≤ 1 frame interval then the live view resumes.
+- BOOT overlay during ASLEEP: backlight comes on for the overlay, then `restore_for_state` paints black. The state machine's `display_sleep()` is NOT re-issued — that's an open follow-up if the screen stays lit after expiry.
+- Font fallback: any character outside the supported set (digits, period, colon, dash, slash, `L`, lowercase a–z, space) renders as blank. The identity screen, loading screen, and IPv4 strings are all covered.
 
 **Status**: 🟡 builds clean against ESP-IDF 5.4 (binary ~870 KB). Hardware verification awaits panel + BOOT-pin confirmation.
 

@@ -15,13 +15,16 @@ static const char *TAG = "screens";
 #define PANEL_H      480
 #define MAX_BUF_PX   (PANEL_W * PANEL_H)
 
-// 8x8 bitmap font, lit pixels = foreground. Only the characters used by the
-// IP and Loading screens are defined; the rest stay zero ('?' shows up as a
-// blank box for unsupported characters). Designators keep the data sparse-
-// looking but the table is just a contiguous block (95 chars × 8 bytes).
+// 8x8 bitmap font, lit pixels = foreground. Covers the characters used by
+// any text the device draws locally: lowercase a–z, digits, period, colon,
+// dash, slash, plus uppercase L for "Loading...". Unsupported chars render
+// blank. The table is a contiguous 95-char × 8-byte block; designators
+// keep it readable.
 static const uint8_t FONT[95][8] = {
     [' '  - 0x20] = {0,0,0,0,0,0,0,0},
+    ['-'  - 0x20] = {0,0,0,0x7E,0,0,0,0},
     ['.'  - 0x20] = {0,0,0,0,0,0x18,0x18,0},
+    ['/'  - 0x20] = {0x06,0x0C,0x0C,0x18,0x18,0x30,0x30,0x60},
     [':'  - 0x20] = {0,0x18,0x18,0,0,0x18,0x18,0},
 
     ['0'  - 0x20] = {0x3C,0x66,0x66,0x66,0x66,0x66,0x66,0x3C},
@@ -38,19 +41,31 @@ static const uint8_t FONT[95][8] = {
     ['L'  - 0x20] = {0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x7E},
 
     ['a'  - 0x20] = {0,0,0x3C,0x06,0x3E,0x66,0x66,0x3E},
+    ['b'  - 0x20] = {0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x7C},
     ['c'  - 0x20] = {0,0,0x3C,0x66,0x60,0x60,0x66,0x3C},
     ['d'  - 0x20] = {0x06,0x06,0x3E,0x66,0x66,0x66,0x66,0x3E},
     ['e'  - 0x20] = {0,0,0x3C,0x66,0x7E,0x60,0x66,0x3C},
+    ['f'  - 0x20] = {0x1C,0x36,0x30,0x7C,0x30,0x30,0x30,0x30},
     ['g'  - 0x20] = {0,0,0x3E,0x66,0x66,0x3E,0x06,0x3C},
+    ['h'  - 0x20] = {0x60,0x60,0x7C,0x66,0x66,0x66,0x66,0x66},
     ['i'  - 0x20] = {0x18,0,0x18,0x18,0x18,0x18,0x18,0x18},
+    ['j'  - 0x20] = {0x06,0,0x06,0x06,0x06,0x06,0x66,0x3C},
+    ['k'  - 0x20] = {0x60,0x60,0x66,0x6C,0x78,0x6C,0x66,0x66},
     ['l'  - 0x20] = {0x38,0x18,0x18,0x18,0x18,0x18,0x18,0x3C},
+    ['m'  - 0x20] = {0,0,0x66,0x7F,0x7F,0x6B,0x63,0x63},
     ['n'  - 0x20] = {0,0,0x7C,0x66,0x66,0x66,0x66,0x66},
     ['o'  - 0x20] = {0,0,0x3C,0x66,0x66,0x66,0x66,0x3C},
     ['p'  - 0x20] = {0,0,0x7C,0x66,0x66,0x7C,0x60,0x60},
+    ['q'  - 0x20] = {0,0,0x3E,0x66,0x66,0x3E,0x06,0x06},
     ['r'  - 0x20] = {0,0,0x7C,0x66,0x60,0x60,0x60,0x60},
+    ['s'  - 0x20] = {0,0,0x3E,0x60,0x3C,0x06,0x06,0x7C},
     ['t'  - 0x20] = {0x18,0x18,0x3C,0x18,0x18,0x18,0x18,0x1C},
+    ['u'  - 0x20] = {0,0,0x66,0x66,0x66,0x66,0x66,0x3E},
     ['v'  - 0x20] = {0,0,0x66,0x66,0x66,0x66,0x3C,0x18},
     ['w'  - 0x20] = {0,0,0x66,0x66,0x66,0x6E,0x7E,0x36},
+    ['x'  - 0x20] = {0,0,0x66,0x3C,0x18,0x18,0x3C,0x66},
+    ['y'  - 0x20] = {0,0,0x66,0x66,0x66,0x3E,0x0C,0x78},
+    ['z'  - 0x20] = {0,0,0x7E,0x0C,0x18,0x30,0x60,0x7E},
 };
 
 #define FG  0xFFFF   // white
@@ -125,18 +140,72 @@ esp_err_t local_screens_show_ip(void)
 {
     if (!s_fb) return ESP_ERR_INVALID_STATE;
 
+    // Build the four identity lines from current state. This is the screen
+    // shown on first boot, after factory reset, and as a 15s BOOT-button
+    // overlay — it's the "who am I" view the operator needs to find the
+    // device on the LAN and confirm it's configured the way they expect.
+    //
+    //   line 1: viewport name      ("mudroom"   / "viewport" if unconfigured)
+    //   line 2: mDNS hostname      ("viewport-mudroom.local" or "viewport.local")
+    //   line 3: IP address         ("192.168.x.y" or "no network")
+    //   line 4: state              ("awake" / "asleep" / "unconfigured")
+
+    char line_name[64], line_host[80], line_ip[24], line_state[24];
+
+    viewport_state_lock();
+    viewport_state_t *st = viewport_state_get();
+
+    if (st->viewport_name[0]) {
+        snprintf(line_name, sizeof(line_name), "%s", st->viewport_name);
+        snprintf(line_host, sizeof(line_host), "viewport-%s.local", st->viewport_name);
+    } else {
+        snprintf(line_name, sizeof(line_name), "viewport");
+        snprintf(line_host, sizeof(line_host), "viewport.local");
+    }
+    switch (st->state) {
+    case VIEWPORT_STATE_AWAKE:        snprintf(line_state, sizeof(line_state), "awake"); break;
+    case VIEWPORT_STATE_ASLEEP:       snprintf(line_state, sizeof(line_state), "asleep"); break;
+    default:                          snprintf(line_state, sizeof(line_state), "unconfigured"); break;
+    }
+    viewport_state_unlock();
+
+    const char *ip = net_eth_get_ip_str();
+    snprintf(line_ip, sizeof(line_ip), "%s", (ip && ip[0]) ? ip : "no network");
+
+    const char *lines[] = { line_name, line_host, line_ip, line_state };
+    const int   n_lines = (int)(sizeof(lines) / sizeof(lines[0]));
+
     uint16_t w, h;
     effective_dims(&w, &h);
-    int scale = (w < 800) ? 3 : 4;   // 3x for portrait, 4x for landscape
+
+    // Pick the largest integer scale where the longest line fits within
+    // 90% of the screen width and all four lines plus inter-line spacing
+    // (half a line each) fit within 90% of the screen height. Falls back
+    // to scale 1 if the longest line is unusually long.
+    size_t longest = 0;
+    for (int i = 0; i < n_lines; ++i) {
+        size_t l = strlen(lines[i]);
+        if (l > longest) longest = l;
+    }
+    int scale = 1;
+    for (int s = 6; s >= 1; --s) {
+        int line_w = (int)longest * 8 * s;
+        int total_h = n_lines * 8 * s + (n_lines - 1) * 4 * s;
+        if (line_w <= (w * 9) / 10 && total_h <= (h * 9) / 10) {
+            scale = s;
+            break;
+        }
+    }
+
     int line_h = 8 * scale;
-    int spacing = line_h / 2;
-    int total_h = 2 * line_h + spacing;
+    int spacing = 4 * scale;
+    int total_h = n_lines * line_h + (n_lines - 1) * spacing;
     int y0 = (h - total_h) / 2;
 
     clear(BG);
-    draw_centered(w, h, y0,                       "viewport.local", scale);
-    draw_centered(w, h, y0 + line_h + spacing,    net_eth_get_ip_str(), scale);
-
+    for (int i = 0; i < n_lines; ++i) {
+        draw_centered(w, h, y0 + i * (line_h + spacing), lines[i], scale);
+    }
     return display_present_rgb565(s_fb, w, h);
 }
 

@@ -7,10 +7,13 @@
 // bitmap font.
 esp_err_t local_screens_init(void);
 
-// Render the unconfigured / identify screen — two centered lines:
-//   "viewport.local"
-//   <current IP>
-// Shown on first boot, after factory reset, and as a BOOT-button overlay.
+// Render the identity / "who am I" screen — four centered lines:
+//   <viewport name>            ("viewport" if unconfigured)
+//   viewport-<name>.local       (mDNS hostname)
+//   <current IP>                ("no network" if no DHCP lease)
+//   <state>                     ("awake" / "asleep" / "unconfigured")
+// Font scale is auto-picked to fit the longest line within 90% of width.
+// Shown on first boot, after factory reset, and as a 15s BOOT-button overlay.
 esp_err_t local_screens_show_ip(void);
 
 // Render the loading screen — centered "Loading…" — shown on every wake

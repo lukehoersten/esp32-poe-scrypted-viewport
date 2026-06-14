@@ -341,10 +341,10 @@ Failure modes do not corrupt state:
 
 The device renders exactly two things itself; everything else is a JPEG from Scrypted:
 
-- **IP screen**: IP address and `viewport.local` as plain centered text. Shown on first boot until `/config`, after factory reset, and as a 15s overlay when BOOT is short-pressed. Rendered in the current orientation (portrait by default).
+- **Identity screen**: four centered lines — viewport name, mDNS hostname, IP address, and current state. Shown on first boot until `/config`, after factory reset, and as a 15s overlay when BOOT is short-pressed. The font scale auto-fits the longest line within 90% of the screen width. Unconfigured devices show `viewport` / `viewport.local` / `<ip>` / `unconfigured`; configured devices show e.g. `mudroom` / `viewport-mudroom.local` / `192.168.1.42` / `asleep`.
 - **Loading screen**: shown between a wake and the next `/frame` arriving. Plain "Loading…" text. Rendered in the current orientation.
 
-Both use a small embedded bitmap font. No LVGL, no general text engine.
+Both use a small embedded bitmap font — full lowercase a–z, digits, period, colon, dash, slash, plus uppercase `L` for "Loading...". No LVGL, no general text engine.
 
 ## Scrypted Integration
 
