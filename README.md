@@ -22,10 +22,10 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 ## Hardware
 
 ### Controller
-Waveshare ESP32-P4-ETH-POE
+[Waveshare ESP32-P4-ETH](https://www.amazon.com/ESP32-P4-Ethernet-Development-MIPI-CSI-Microphone/dp/B0FN7JQ2V8/) — ESP32-P4 with IP101GRI PHY, 2-lane MIPI-DSI out, 32 MB PSRAM, 16/32 MB flash. PoE is an optional add-on module on the same SKU.
 
 ### Display
-5" 800x480 IPS Capacitive Touch MIPI DSI display
+[Hosyond 5" 800x480 IPS Capacitive Touch MIPI DSI display](https://www.amazon.com/dp/B0CXTFN8K9) — Pi-compatible panel (TC358762 DSI-to-DPI bridge + ATTINY-class init MCU at I²C `0x45`, FT5426 touch at `0x38`). 15-pin Pi FPC for the DSI lanes + power; I²C runs as jumpers off the panel's auxiliary header (see [`TESTING.md`](TESTING.md) M3 for the wiring table).
 
 ## Boot
 
