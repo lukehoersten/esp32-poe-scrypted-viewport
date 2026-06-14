@@ -5,14 +5,12 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "display.h"
 #include "local_screens.h"
-#include "nvs_config.h"
 #include "state_machine.h"
 #include "viewport_state.h"
 
@@ -28,7 +26,6 @@ static const char *TAG = "touch";
 #define POLL_PERIOD_MS       30
 #define TAP_MAX_MS           500     // < this on release = short tap (toggle)
 #define LONG_PRESS_MS        1500    // ≥ this while held = identity overlay
-#define FACTORY_RESET_MS     5000    // ≥ this while held = factory reset
 #define OVERLAY_MS           15000
 #define TAP_DEBOUNCE_MS      150
 
@@ -57,20 +54,11 @@ static void on_long_press(void)
     if (display_is_up()) local_screens_overlay(OVERLAY_MS);
 }
 
-static void on_factory_reset(void)
-{
-    ESP_LOGW(TAG, "very-long-press %dms → factory reset", FACTORY_RESET_MS);
-    nvs_config_reset();
-    vTaskDelay(pdMS_TO_TICKS(200));
-    esp_restart();
-}
-
 static void touch_task(void *arg)
 {
     bool     was_down       = false;
     uint64_t down_us        = 0;
     bool     long_fired     = false;
-    bool     reset_fired    = false;
     uint64_t last_tap_us    = 0;
     uint8_t  buf[7];
 
@@ -83,19 +71,14 @@ static void touch_task(void *arg)
 
         if (touches > 0) {
             if (!was_down) {
-                was_down    = true;
-                down_us     = now;
-                long_fired  = false;
-                reset_fired = false;
+                was_down   = true;
+                down_us    = now;
+                long_fired = false;
             } else {
                 uint64_t held_ms = (now - down_us) / 1000ULL;
                 if (!long_fired && held_ms >= LONG_PRESS_MS) {
                     long_fired = true;
                     on_long_press();
-                }
-                if (!reset_fired && held_ms >= FACTORY_RESET_MS) {
-                    reset_fired = true;
-                    on_factory_reset();   // does not return
                 }
             }
         } else if (was_down) {
@@ -136,8 +119,8 @@ esp_err_t touch_init(void)
         return err;
     }
     ESP_LOGI(TAG, "FT5426 ack'd (dev_mode=0x%02x); "
-                  "tap=toggle, %dms hold=ID overlay, %dms hold=factory reset",
-             dev_mode, LONG_PRESS_MS, FACTORY_RESET_MS);
+                  "tap=toggle wake/sleep, %dms hold=identity overlay",
+             dev_mode, LONG_PRESS_MS);
 
     BaseType_t ok = xTaskCreate(touch_task, "touch", 3072, NULL, 4, &s_task);
     return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
