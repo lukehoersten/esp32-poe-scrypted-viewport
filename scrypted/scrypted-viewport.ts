@@ -34,25 +34,41 @@
 // - Camera must respect picture.width/height OR be paired with a snapshot
 //   plugin that resizes. Otherwise /frame returns 400.
 
-import sdk, {
-    DeviceCreator,
-    DeviceCreatorSettings,
-    DeviceProvider,
-    EventListenerRegister,
-    HttpRequest,
-    HttpRequestHandler,
-    HttpResponse,
+// The Scripts plugin (in @scrypted/core) evaluates this file inside a
+// sandbox that does NOT resolve ESM `import` of npm modules — it injects
+// `sdk` as a global and lets you `require()` Node built-ins. So we:
+//   - destructure runtime values from the injected `sdk` global
+//   - require('dns') for the Node mDNS lookup
+// Type aliases below are declared loosely as `any` so the script works
+// even when the SDK type package isn't installed locally (the Scrypted
+// runtime doesn't care about types).
+declare const sdk: any;
+declare const require: any;
+
+const {
     ScryptedDeviceBase,
     ScryptedDeviceType,
     ScryptedInterface,
-    Setting,
-    Settings,
-    SettingValue,
-} from "@scrypted/sdk";
+    systemManager,
+    endpointManager,
+    mediaManager,
+    deviceManager,
+} = sdk;
 
-import { promises as dns } from "dns";
+const dns = require("dns").promises;
 
-const { systemManager, endpointManager, mediaManager, deviceManager } = sdk;
+// Loose type aliases — the runtime values come from `sdk`, so these
+// are purely cosmetic for the rest of the script's signatures.
+type DeviceCreator           = any;
+type DeviceCreatorSettings   = any;
+type DeviceProvider          = any;
+type EventListenerRegister   = any;
+type HttpRequest             = any;
+type HttpRequestHandler      = any;
+type HttpResponse            = any;
+type Setting                 = any;
+type Settings                = any;
+type SettingValue            = any;
 
 // Tuning constants. Frame interval is also exposed on the parent's
 // Settings page so it can be tweaked without editing the script.
@@ -385,7 +401,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // ------------------------------------------------------------------------
 
     private handleCameraEvent(v: Viewport, details: any, data: any) {
-        const iface = details.eventInterface as ScryptedInterface;
+        const iface = details.eventInterface;
         let trigger = false;
         if (iface === ScryptedInterface.BinarySensor && data === true) trigger = true;
         if (iface === ScryptedInterface.MotionSensor && data === true) trigger = true;
