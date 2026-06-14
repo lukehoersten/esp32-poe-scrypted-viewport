@@ -61,14 +61,14 @@ esp_err_t state_machine_set(viewport_run_state_t target)
     if (target == VIEWPORT_STATE_AWAKE) {
         if (display_is_up()) {
             display_wake();
-            // Content choice: configured devices show "Loading…" until
-            // Scrypted pushes a /frame; unconfigured devices show the
-            // info screen since there's no Scrypted to push anything.
+            // Content choice: a configured device shows "Loading…" until
+            // Scrypted pushes a /frame; a device with no scrypted URL
+            // shows the info screen since there's no Scrypted to push.
             if (configured) local_screens_show_loading();
             else            local_screens_show_info();
         }
         arm_idle_timer_unlocked();
-        ESP_LOGI(TAG, "AWAKE (%s)", configured ? "configured" : "unconfigured");
+        ESP_LOGI(TAG, "AWAKE (%s)", configured ? "configured" : "no scrypted URL");
     } else {
         disarm_idle_timer();
         if (display_is_up()) display_sleep();
@@ -89,8 +89,8 @@ void state_machine_set_local(viewport_run_state_t target)
 {
     esp_err_t err = state_machine_set(target);
     if (err != ESP_OK) return;
-    // Only POST when there's a Scrypted to talk to. Unconfigured tap toggles
-    // change the local display state without notifying anyone.
+    // Only POST when there's a Scrypted to talk to. Without a scrypted URL,
+    // tap toggles change the local display state without notifying anyone.
     viewport_state_lock();
     bool configured = viewport_state_get()->configured;
     viewport_state_unlock();

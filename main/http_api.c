@@ -26,11 +26,7 @@ static const char *TAG = "http_api";
 
 static const char *state_name(viewport_run_state_t s)
 {
-    switch (s) {
-    case VIEWPORT_STATE_AWAKE:  return "awake";
-    case VIEWPORT_STATE_ASLEEP: return "asleep";
-    default:                    return "unconfigured";
-    }
+    return (s == VIEWPORT_STATE_AWAKE) ? "awake" : "asleep";
 }
 
 static const char *orientation_name(viewport_orientation_t o)
@@ -246,10 +242,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
 
     // A configured device has both a viewport name and a scrypted URL.
-    if (st->viewport_name[0] && st->scrypted_url[0] && !st->configured) {
-        st->configured = true;
-        if (st->state == VIEWPORT_STATE_UNCONFIGURED) st->state = VIEWPORT_STATE_ASLEEP;
-    }
+    st->configured = (st->viewport_name[0] && st->scrypted_url[0]);
 
     viewport_state_unlock();
 
@@ -304,11 +297,6 @@ static esp_err_t state_post_handler(httpd_req_t *req)
     cJSON_Delete(root);
 
     esp_err_t err = state_machine_set(target);
-    if (err == ESP_ERR_INVALID_STATE) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "text/plain");
-        return httpd_resp_send(req, "device unconfigured", HTTPD_RESP_USE_STRLEN);
-    }
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_set_type(req, "text/plain");
@@ -358,7 +346,7 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return respond_status(req, "500 Internal Server Error", "display not initialized");
     }
 
-    // /frame requires AWAKE. Asleep / unconfigured → 409.
+    // /frame requires AWAKE. Asleep → 409.
     if (state_machine_current() != VIEWPORT_STATE_AWAKE) {
         return respond_status(req, "409 Conflict",
             "device asleep — POST /state {\"state\":\"wake\"} first");

@@ -13,9 +13,8 @@ typedef enum {
 } viewport_orientation_t;
 
 typedef enum {
-    VIEWPORT_STATE_UNCONFIGURED = 0,
+    VIEWPORT_STATE_ASLEEP = 0,   // boot default; backlight off
     VIEWPORT_STATE_AWAKE,
-    VIEWPORT_STATE_ASLEEP,
 } viewport_run_state_t;
 
 // Read-mostly snapshot of device state used by /state. Counters are

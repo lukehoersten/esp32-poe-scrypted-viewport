@@ -297,10 +297,7 @@ esp_err_t local_screens_show_info(void)
     char heap_str[12]; fmt_bytes(heap_str,  sizeof(heap_str),  free_heap);
     char psram_str[12]; fmt_bytes(psram_str, sizeof(psram_str), free_psram);
 
-    const char *state_str =
-        (state == VIEWPORT_STATE_AWAKE)  ? "awake"
-      : (state == VIEWPORT_STATE_ASLEEP) ? "asleep"
-                                         : "unconfigured";
+    const char *state_str = (state == VIEWPORT_STATE_AWAKE) ? "awake" : "asleep";
 
     // Label width is fixed at 8 chars (trailing spaces pad it). Values are
     // left-aligned at column 8. Auto-scaler then picks a font scale to fit.

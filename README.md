@@ -49,7 +49,7 @@ See [`TESTING.md`](TESTING.md) for the full milestone-by-milestone status and th
 Power
 -> DHCP
 -> mDNS (_scrypted-viewport._tcp.local)
--> If unconfigured: backlight on, show IP + hostname (persistent until `/config`)
+-> If no `scrypted` URL set: backlight on, show info screen (persistent until `/config`)
 -> If configured: enter sleep state (backlight off, wait for `POST /state` or a tap)
 
 ## Resolution
@@ -121,7 +121,7 @@ Returns `200 OK` with JSON:
 }
 ```
 
-`state` is `awake`, `asleep`, or `unconfigured`. `last_frame_ms_ago` is `null` if no frame has been received since boot.
+`state` is `awake` or `asleep` (it reports the screen's current state only). `configured` is the separate flag that reports whether `viewport` and `scrypted` are both set. `last_frame_ms_ago` is `null` if no frame has been received since boot.
 
 ### POST /state
 
@@ -426,10 +426,10 @@ Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its
 - Provisioning: flash the same firmware to every device. On first boot the screen shows its IP; register it from Scrypted via `POST /config`.
 - Viewport names must be unique across the LAN — mDNS hostnames are derived from `viewport` and two devices configured with the same name will collide.
 - NVS wipe: plug USB and run `idf.py erase-flash` followed by `idf.py flash`. The device boots clean and shows the info screen until `/config` is POSTed.
-- No DHCP lease: keep retrying; do not reboot. Screen shows "no network" if unconfigured.
+- No DHCP lease: keep retrying; do not reboot. The info screen shows "ip no network" until a lease arrives.
 - Ethernet disconnect: reconnect automatically. If Scrypted is unreachable, displays go stale — nothing the device can do about it.
 - Watchdog: the ESP-IDF task watchdog reboots the device if a task hangs. Soft state is rebuilt from NVS on every boot.
-- Status LED (on-board): solid = configured & online, slow blink = unconfigured (waiting for `/config`), fast blink = no network. The screen tells the same story but the LED is visible when the screen is asleep.
+- No usable on-board status LED on the Waveshare ESP32-P4-ETH. The info screen tells the boot story instead — short-tap to wake, long-press to overlay it.
 
 ## Build
 
@@ -476,7 +476,7 @@ Every endpoint is idempotent; every failure leaves the device in a sane state.
 - JPEG decode fails → `decode_errors++`, return 400 or 500, keep previous frame on screen, wake/sleep state unchanged.
 - Outbound `/state` POST fails → `state_post_failures++`, continue. Local state change still happened. No retry queue; Scrypted catches up via its own timeout, the next event, or the next `/frame` returning 409.
 - Ethernet disconnects → driver reconnects automatically. No reboot loop. `GET /state` keeps serving over loopback for diagnostics.
-- Display init fails → log loudly, keep serving the rest of the API with `state="unconfigured"`. The protocol is still usable for re-registration.
+- Display init fails → log loudly, keep serving the rest of the API. The protocol is still usable for re-registration.
 - Task hangs → ESP-IDF watchdog reboots. NVS rebuilds soft state on the next boot.
 
 ### Coding standards

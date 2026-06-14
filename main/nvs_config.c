@@ -70,7 +70,7 @@ esp_err_t nvs_config_load(void)
                      ? "landscape" : "portrait",
                  st->brightness);
     } else {
-        ESP_LOGI(TAG, "partial config in NVS — staying unconfigured");
+        ESP_LOGI(TAG, "partial config in NVS — viewport or scrypted URL still missing");
     }
 
 done:

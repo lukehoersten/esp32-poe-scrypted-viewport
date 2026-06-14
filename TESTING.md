@@ -159,14 +159,14 @@ dns-sd -B _scrypted-viewport._tcp local.        # macOS
 avahi-browse -r _scrypted-viewport._tcp         # Linux
 ```
 
-Expected `/state` body on a fresh device (unconfigured):
+Expected `/state` body on a fresh device (no `/config` posted yet):
 
 ```json
 {
   "name": null,
   "version": "0.1.0",
   "configured": false,
-  "state": "unconfigured",
+  "state": "asleep",
   "uptime_ms": 12345,
   "last_frame_ms_ago": null,
   "frames_received": 0,
@@ -183,7 +183,7 @@ Expected mDNS browse output should show a `_scrypted-viewport._tcp` instance wit
 
 **Status**: ✅ verified 2026-06-14 alongside M1.
 
-- `GET http://10.0.13.83/state` returned the full spec JSON: `name=null, configured=false, state=unconfigured, resolution=480x800, ip=10.0.13.83, free_psram=31730048, ...`.
+- `GET http://10.0.13.83/state` returned the full spec JSON: `name=null, configured=false, state=asleep, resolution=480x800, ip=10.0.13.83, free_psram=31730048, ...`.
 - `dns-sd -B _scrypted-viewport._tcp local.` on macOS surfaced one instance named `viewport`.
 
 Bare-board behavior (no panel, no ethernet) was also verified — the device boots cleanly and prints a summary like `boot complete — subsystems [EMHdJ-B]  ip=(no link)` (lowercase `d` = display down because no panel attached; `-` for touch because it shares the panel I²C bus).
@@ -466,14 +466,7 @@ done
 curl http://<device-ip>/state | jq .state   # expect "awake"
 ```
 
-Unconfigured device rejects `POST /state` with 409:
-
-```bash
-# (After fresh boot / NVS erase, no /config yet)
-curl -i -X POST -H "Content-Type: application/json" \
-  -d '{"state":"wake"}' http://<device-ip>/state
-# expect: 409 Conflict "device unconfigured"
-```
+`POST /state` always works regardless of whether `/config` has been posted — `state` is just the screen's awake/asleep, decoupled from the `configured` flag. Outbound POST-to-Scrypted is the part gated on a scrypted URL being present.
 
 Bad input:
 
@@ -552,7 +545,7 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 - `curl -X POST -d '{"state":"sleep"}' /state` — receiver should print **nothing** (Scrypted already knows it initiated).
 - Same for `/state {wake}` and `/frame` (asleep → 409, no callback either).
 
-**No POST when unconfigured**
+**No POST when no scrypted URL is set**
 
 - Before `/config` provides a Scrypted URL, tapping the screen does nothing outbound (no Scrypted URL to call). No queue entries dropped to disk.
 
@@ -566,7 +559,7 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 
 **Visual checks (panel-attached)**
 
-- Fresh flash → screen shows the info screen (~15 lines of `label  value` pairs, white on black, auto-scaled). When unconfigured it reports `name unset`, `config no`, `state unconfigured`.
+- Fresh flash → screen shows the info screen (~15 lines of `label  value` pairs, white on black, auto-scaled). With no `/config` posted it reports `name unset`, `config no`, `state asleep`, `scrypt none`.
 - `POST /config` with viewport + scrypted → device transitions to ASLEEP, backlight off.
 - `POST /state {state:wake}` (or tap) → backlight on, `Loading...` centered until the first `/frame` lands.
 - `POST /frame` while AWAKE → loading screen replaced by the JPEG.
