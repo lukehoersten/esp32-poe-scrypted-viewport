@@ -22,12 +22,12 @@ Status legend:
 | --- | --- | --- | --- |
 | M1 | Board Bring-Up — Ethernet + DHCP | ✅ | ✅ |
 | M2 | HTTP + mDNS (`GET /state`) | ✅ | ✅ |
-| M3 | Display Bring-Up (Hosyond panel) | ✅ | 🟡 |
+| M3 | Display Bring-Up (Hosyond panel) | ✅ | ✅ |
 | M4 | Config Persistence (NVS, partial updates) | ✅ | 🟡 |
 | M5 | JPEG Frame Push (`POST /frame`) | ✅ | 🟡 |
 | M6 | State + Idle Timer (`POST /state`, 409 guard) | ✅ | 🟡 |
-| M7 | Touch + Outbound `/state` POST | ✅ | 🟡 |
-| M8 | Local Screens + BOOT button | ✅ | 🟡 |
+| M7 | Touch + Outbound `/state` POST | ✅ | ✅ |
+| M8 | Local Screens + touch long-press | ✅ | ✅ |
 | M9 | Live Stream (`POST /stream`) | ⬜ | ⬜ |
 
 ---
@@ -45,11 +45,11 @@ Before flashing anything, confirm or acquire:
 | Ethernet cable + DHCP-serving switch | trivial | LAN already in place |
 | (optional) PoE injector | nice-to-have | for M1/M2 a USB-only power path is fine |
 
-Hardware unknowns that gate work:
+Hardware unknowns — resolved:
 
-1. **DSI FPC pin count on the Waveshare board.** Research found 2-lane MIPI-DSI confirmed; pin count not verified. Open the schematic PDF and count.
-2. **I²C jumper destinations.** `display.c` defaults `PIN_I2C_SDA=7`, `PIN_I2C_SCL=8` — matches Waveshare's BSP convention for their bundled panel kit but not specifically verified for this board. Confirm against schematic; adjust `display.c` if wrong.
-3. **BOOT button GPIO.** ESP32-P4's strap pin (GPIO 35) is owned by RMII TXD1 at runtime, so the on-board user/BOOT button must be on a different GPIO. `button.c` currently uses `PIN_BOOT_BUTTON = 0` as a placeholder. Confirm from schematic; if wrong, the button silently never fires but the rest of M8 still works.
+1. **DSI FPC pin count on the Waveshare board.** ✅ 22-pin DSI on board; bridge to the panel's 15-pin Pi FPC via a 15→22 adapter cable.
+2. **I²C jumper destinations.** ✅ `PIN_I2C_SDA=7`, `PIN_I2C_SCL=8` confirmed by ATTINY ack at 0x45 + FT5426 ack at 0x38.
+3. **BOOT button GPIO.** ✅ No usable GPIO — ESP32-P4 GPIO 35 strap pin is owned by EMAC TXD1 at runtime; no separate user button is wired on the Waveshare ESP32-P4-ETH. Both BOOT behaviours moved onto touch long-press (≥1.5 s → identity overlay) and very-long-press (≥5 s → factory reset).
 4. **Flash size silkscreen.** `sdkconfig.defaults` declares 16 MB. If your SKU shipped with 32 MB the build still works but you waste half the flash.
 
 ---
@@ -69,9 +69,9 @@ idf.py -p /dev/cu.usbmodem* flash monitor
 
 Check serial for `net_eth: got ip` then `curl http://<ip>/state | jq .` and `dns-sd -B _scrypted-viewport._tcp local.`. If both pass, flip M1 + M2 to ✅. Stop here if you hit any issue — debug Ethernet before adding more variables.
 
-### Stage 2 — display panel (M3)
+### Stage 2 — display panel (M3) ✅
 
-Confirm the schematic-driven unknowns above, wire the four I²C/power jumpers, plug the DSI cable, reflash, and look for `panel MCU id 0xC3` in serial. Color bars on screen → M3 ✅.
+Look for `panel MCU id 0xc3 — Pi v1.1 architecture ack'd`, `TC358762 bridge configured`, and `DSI up: 800x480 26 MHz, 1-lane 600 Mbps, non-burst` in the serial log. Identity screen visible on tap-wake.
 
 ### Stage 3 — protocol (M4 + M5 + M6)
 
@@ -243,7 +243,7 @@ I (xxx) viewport: display up — test pattern on screen
 - Image but vertical/horizontal sync issues → adjust the `PANEL_*SYNC_*` timings in `display.c`; Pi 7" canonical values are the defaults.
 - Touch ack at `0x38` but no taps → polling task not running, or panel reset state wrong.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4. Driver ported from Linux `panel-raspberrypi-touchscreen.c`. Pin map confirmed against Waveshare ESP32-P4-ETH wiki + ESPHome device page (GPIO 7/8 I²C, 22-pin DSI). Awaiting hardware bring-up.
+**Status**: ✅ verified 2026-06-14 on Waveshare ESP32-P4-ETH + Hosyond 5" panel. ATTINY v1.1 firmware (ID 0xC3) acks; TC358762 bridge configured via 16 DSI Generic Long Writes; DSI 1-lane @ 600 Mbps non-burst; DPI 26 MHz RGB888; identity screen renders correctly. Bring-up notes captured in commit 6c1a26b.
 
 ---
 
@@ -556,7 +556,7 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 
 - After factory reset, tapping the screen does nothing (no Scrypted URL to call). No queue entries dropped to disk.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4. Hardware verification needs the FT5426 touch jumpered + reachable on I2C 0x38.
+**Status**: ✅ verified 2026-06-14. FT5426 acks at 0x38; short tap toggles awake/sleep, ≥1.5s hold opens the identity overlay, ≥5s hold triggers factory reset. Outbound `/state` POST gated on configured flag (untested without Scrypted).
 
 ---
 
@@ -598,7 +598,7 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 - BOOT overlay during ASLEEP: backlight comes on for the overlay, then `restore_for_state` paints black. The state machine's `display_sleep()` is NOT re-issued — that's an open follow-up if the screen stays lit after expiry.
 - Font fallback: any character outside the supported set (digits, period, colon, dash, slash, `L`, lowercase a–z, space) renders as blank. The identity screen, loading screen, and IPv4 strings are all covered.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4 (binary ~870 KB). Hardware verification awaits panel + BOOT-pin confirmation.
+**Status**: ✅ verified 2026-06-14. Identity screen renders all four lines correctly; loading screen shown on wake when configured; identity overlay returns to prior state when its 15 s timer expires. BOOT button removed — its short-press and long-hold behaviours now live on touch (see M7).
 
 ---
 
