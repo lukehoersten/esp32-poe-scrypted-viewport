@@ -101,13 +101,8 @@ enum {
 #define TC_PPI_STARTPPI           0x0104
 #define TC_DSI_STARTDSI           0x0204
 
-// Shadow of esp_lcd_dsi_bus_t. The IDF private struct is
-//   { int bus_id; mipi_dsi_hal_context_t hal; esp_pm_lock_handle_t pm_lock; }
-// (esp-idf/components/esp_lcd/dsi/mipi_dsi_priv.h). We only need bus_id +
-// hal to reach the LL/HAL APIs, so the trailing pm_lock is fine to ignore.
-// If the IDF layout shifts in a future release this is the place that
-// breaks first — guarded by ESP-IDF version is overkill until it actually
-// breaks.
+// Mirror of esp_lcd_dsi_bus_t (esp-idf/components/esp_lcd/dsi/mipi_dsi_priv.h)
+// — needed to reach the HAL/LL APIs for the TC358762 bridge init.
 typedef struct {
     int                    bus_id;
     mipi_dsi_hal_context_t hal;
@@ -424,33 +419,14 @@ esp_err_t display_wake(void)
     return err;
 }
 
-// RGB565 → RGB888 in B,G,R byte order. The ESP32-P4 DSI engine + TC358762
-// bridge pipeline expects BGR on the wire for the panel's RGB channels —
-// writing R first paints pure blue as solid red on the panel (verified
-// with the M5 self-test: decoded buffer holds 0x001F, panel showed red).
-// Symmetric pixels (white text on black) don't expose this; saturated
-// channel inputs do.
+// RGB565 → 24-bit pixel in B,G,R memory order — what the DSI engine +
+// TC358762 + Pi panel pipeline expects (the "RGB888" label refers to the
+// MIPI wire bit order, not byte position in PSRAM).
 static inline void rgb565_to_rgb888(uint16_t px, uint8_t *out)
 {
     out[0] = (uint8_t)(( px        & 0x1F) * 255 / 31);  // B
     out[1] = (uint8_t)(((px >>  5) & 0x3F) * 255 / 63);  // G
     out[2] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);  // R
-}
-
-esp_err_t display_fill(uint16_t rgb565)
-{
-    if (!s_up || !s_rot_buf) return ESP_ERR_INVALID_STATE;
-    uint8_t rgb[3];
-    rgb565_to_rgb888(rgb565, rgb);
-    size_t n = PANEL_H_ACTIVE * PANEL_V_ACTIVE;
-    for (size_t i = 0; i < n; ++i) {
-        s_rot_buf[i * 3 + 0] = rgb[0];
-        s_rot_buf[i * 3 + 1] = rgb[1];
-        s_rot_buf[i * 3 + 2] = rgb[2];
-    }
-    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
-                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
-                                     s_rot_buf);
 }
 
 esp_err_t display_present_rgb565(const uint16_t *src,
@@ -462,8 +438,6 @@ esp_err_t display_present_rgb565(const uint16_t *src,
     viewport_state_lock();
     viewport_orientation_t orient = viewport_state_get()->orientation;
     viewport_state_unlock();
-
-    if (!s_rot_buf) return ESP_ERR_INVALID_STATE;
 
     if (orient == VIEWPORT_ORIENTATION_LANDSCAPE) {
         if (src_w != PANEL_H_ACTIVE || src_h != PANEL_V_ACTIVE)
@@ -483,27 +457,6 @@ esp_err_t display_present_rgb565(const uint16_t *src,
                 size_t dst_idx = ((size_t)x * dst_stride + dst_col) * 3;
                 rgb565_to_rgb888(srow[x], &s_rot_buf[dst_idx]);
             }
-        }
-    }
-    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
-                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
-                                     s_rot_buf);
-}
-
-esp_err_t display_test_pattern(void)
-{
-    if (!s_up || !s_rot_buf) return ESP_ERR_INVALID_STATE;
-    static const uint16_t bars[8] = {
-        0xFFFF, 0xFFE0, 0x07FF, 0x07E0,
-        0xF81F, 0xF800, 0x001F, 0x0000,
-    };
-    const int bar_w = PANEL_H_ACTIVE / 8;
-    for (int y = 0; y < PANEL_V_ACTIVE; ++y) {
-        for (int x = 0; x < PANEL_H_ACTIVE; ++x) {
-            int b = x / bar_w;
-            if (b > 7) b = 7;
-            size_t idx = ((size_t)y * PANEL_H_ACTIVE + x) * 3;
-            rgb565_to_rgb888(bars[b], &s_rot_buf[idx]);
         }
     }
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,

@@ -104,16 +104,3 @@ done:
     return err;
 }
 
-esp_err_t nvs_config_reset(void)
-{
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
-    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
-    if (err != ESP_OK) return err;
-
-    nvs_erase_all(h);
-    err = nvs_commit(h);
-    nvs_close(h);
-    ESP_LOGI(TAG, "NVS config cleared");
-    return err;
-}

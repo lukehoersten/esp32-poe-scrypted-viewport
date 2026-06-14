@@ -150,11 +150,6 @@ esp_err_t net_eth_wait_for_ip(uint32_t timeout_ms)
     return (bits & BIT_GOT_IP) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
-bool net_eth_is_up(void)
-{
-    return (xEventGroupGetBits(s_event_group) & BIT_GOT_IP) != 0;
-}
-
 const char *net_eth_get_ip_str(void)
 {
     return s_ip_str;

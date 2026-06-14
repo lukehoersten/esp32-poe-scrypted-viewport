@@ -24,16 +24,6 @@ static const char *TAG = "http_api";
 #define MAX_BODY_BYTES   2048
 #define MIN_IDLE_TIMEOUT 5000
 
-static const char *state_name(viewport_run_state_t s)
-{
-    return (s == VIEWPORT_STATE_AWAKE) ? "awake" : "asleep";
-}
-
-static const char *orientation_name(viewport_orientation_t o)
-{
-    return (o == VIEWPORT_ORIENTATION_LANDSCAPE) ? "landscape" : "portrait";
-}
-
 // ============================================================================
 // GET /state
 // ============================================================================
@@ -54,7 +44,8 @@ static esp_err_t state_get_handler(httpd_req_t *req)
                              : cJSON_CreateNull());
     cJSON_AddStringToObject(root, "version", VIEWPORT_VERSION);
     cJSON_AddBoolToObject  (root, "configured", st->configured);
-    cJSON_AddStringToObject(root, "state", state_name(st->state));
+    cJSON_AddStringToObject(root, "state",
+        (st->state == VIEWPORT_STATE_AWAKE) ? "awake" : "asleep");
     cJSON_AddNumberToObject(root, "uptime_ms", (double)up_ms);
     cJSON_AddItemToObject  (root, "last_frame_ms_ago",
         last_age_ms < 0 ? cJSON_CreateNull()
@@ -97,7 +88,8 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         st->scrypted_url[0]  ? cJSON_CreateString(st->scrypted_url)
                              : cJSON_CreateNull());
     cJSON_AddNumberToObject(root, "idle_timeout_ms", (double)st->idle_timeout_ms);
-    cJSON_AddStringToObject(root, "orientation", orientation_name(st->orientation));
+    cJSON_AddStringToObject(root, "orientation",
+        (st->orientation == VIEWPORT_ORIENTATION_LANDSCAPE) ? "landscape" : "portrait");
     cJSON_AddNumberToObject(root, "brightness", (double)st->brightness);
 
     viewport_state_unlock();
@@ -254,10 +246,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
 
     if (brightness_changed && display_is_up()) {
-        viewport_state_lock();
-        uint8_t b = viewport_state_get()->brightness;
-        viewport_state_unlock();
-        display_set_brightness(b);
+        display_set_brightness(bright);
     }
     if (name_or_orient_changed) {
         mdns_service_refresh();
@@ -317,15 +306,6 @@ static esp_err_t respond_status(httpd_req_t *req, const char *status, const char
     return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
 }
 
-static void expected_dims(uint16_t *w, uint16_t *h)
-{
-    viewport_state_lock();
-    bool portrait = (viewport_state_get()->orientation == VIEWPORT_ORIENTATION_PORTRAIT);
-    viewport_state_unlock();
-    if (portrait) { *w = 480; *h = 800; }
-    else          { *w = 800; *h = 480; }
-}
-
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
     // Content-Type must be image/jpeg.
@@ -383,7 +363,7 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     }
 
     uint16_t want_w, want_h;
-    expected_dims(&want_w, &want_h);
+    viewport_state_effective_dims(&want_w, &want_h);
     if (w != want_w || h != want_h) {
         viewport_state_lock();
         viewport_state_get()->decode_errors++;
@@ -439,11 +419,7 @@ esp_err_t http_api_start(void)
     cfg.server_port      = 80;
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;
-    // Default 4 KiB is tight: /config alone has ~2.4 KiB of stack locals
-    // (2 KiB body buffer + 256 B scrypted URL + 64 B name + cJSON frames)
-    // and POST /frame pushes a JPEG header onto the stack too. 8 KiB gives
-    // both handlers comfortable headroom without doubling RAM usage.
-    cfg.stack_size       = 8192;
+    cfg.stack_size       = 8192;  // POST /config alone has ~2.4 KiB of stack locals
 
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start");

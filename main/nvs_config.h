@@ -11,6 +11,3 @@ esp_err_t nvs_config_load(void);
 // Persist the current viewport_state to NVS atomically. The caller is expected
 // to have already mutated viewport_state under viewport_state_lock().
 esp_err_t nvs_config_save(void);
-
-// Clear all persisted config. Caller is responsible for rebooting.
-esp_err_t nvs_config_reset(void);

@@ -13,8 +13,6 @@ void viewport_state_init(void)
 {
     memset(&s_state, 0, sizeof(s_state));
     s_state.configured      = false;
-    // State is always AWAKE or ASLEEP. UNCONFIGURED is reported via the
-    // `configured` flag, not as a state value. Boot is always asleep.
     s_state.state           = VIEWPORT_STATE_ASLEEP;
     s_state.brightness      = 80;
     s_state.idle_timeout_ms = 60000;
@@ -45,4 +43,13 @@ const char *viewport_state_resolution_str(void)
     return (s_state.orientation == VIEWPORT_ORIENTATION_PORTRAIT)
                ? "480x800"
                : "800x480";
+}
+
+void viewport_state_effective_dims(uint16_t *w, uint16_t *h)
+{
+    viewport_state_lock();
+    viewport_orientation_t o = s_state.orientation;
+    viewport_state_unlock();
+    if (o == VIEWPORT_ORIENTATION_PORTRAIT) { *w = 480; *h = 800; }
+    else                                    { *w = 800; *h = 480; }
 }

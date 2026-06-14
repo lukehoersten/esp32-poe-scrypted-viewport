@@ -84,16 +84,6 @@ static void clear(uint16_t color)
     for (int i = 0; i < MAX_BUF_PX; ++i) s_fb[i] = color;
 }
 
-// Get current effective dimensions (rotated dims for portrait).
-static void effective_dims(uint16_t *w, uint16_t *h)
-{
-    viewport_state_lock();
-    viewport_orientation_t o = viewport_state_get()->orientation;
-    viewport_state_unlock();
-    if (o == VIEWPORT_ORIENTATION_PORTRAIT) { *w = 480; *h = 800; }
-    else                                    { *w = 800; *h = 480; }
-}
-
 // Draw a single 8x8 glyph at (ox, oy) into the effective-dim buffer with
 // integer scale. Pixels outside the buffer are clipped.
 static void draw_char(uint16_t fb_w, uint16_t fb_h, int ox, int oy,
@@ -199,26 +189,6 @@ void local_screens_overlay_dismiss(void)
     if (display_is_up()) display_sleep();
 }
 
-// Format `n` as a compact value with K / M suffix for thousands / millions.
-// Output max 8 chars, e.g. "168k", "30M", "1234".
-static void fmt_bytes(char *out, size_t cap, uint32_t n)
-{
-    if (n >= 1000000) snprintf(out, cap, "%um", (unsigned)(n / 1000000));
-    else if (n >= 1000) snprintf(out, cap, "%uk", (unsigned)(n / 1000));
-    else snprintf(out, cap, "%u", (unsigned)n);
-}
-
-// Format an uptime in milliseconds as "h:mm:ss" or "m:ss".
-static void fmt_uptime(char *out, size_t cap, uint64_t ms)
-{
-    uint64_t s = ms / 1000;
-    unsigned hh = (unsigned)(s / 3600);
-    unsigned mm = (unsigned)((s % 3600) / 60);
-    unsigned ss = (unsigned)(s % 60);
-    if (hh > 0) snprintf(out, cap, "%u:%02u:%02u", hh, mm, ss);
-    else        snprintf(out, cap, "%u:%02u",         mm, ss);
-}
-
 esp_err_t local_screens_show_info(void)
 {
     if (!s_fb) return ESP_ERR_INVALID_STATE;
@@ -293,9 +263,25 @@ esp_err_t local_screens_show_info(void)
     else              snprintf(idle_str, sizeof(idle_str), "%us",
                                (unsigned)(idle_ms / 1000));
 
-    char up_str[16];   fmt_uptime(up_str, sizeof(up_str), uptime_ms);
-    char heap_str[12]; fmt_bytes(heap_str,  sizeof(heap_str),  free_heap);
-    char psram_str[12]; fmt_bytes(psram_str, sizeof(psram_str), free_psram);
+    // Compact "h:mm:ss" / "m:ss" uptime
+    char up_str[20];
+    uint64_t up_s = uptime_ms / 1000;
+    unsigned hh = (unsigned)(up_s / 3600),
+             mm = (unsigned)((up_s % 3600) / 60),
+             ss = (unsigned)(up_s % 60);
+    if (hh) snprintf(up_str, sizeof(up_str), "%u:%02u:%02u", hh, mm, ss);
+    else    snprintf(up_str, sizeof(up_str), "%u:%02u",         mm, ss);
+
+    // Compact byte counts with k / M suffix
+    char heap_str[12], psram_str[12];
+    #define FMT_BYTES(buf, n) do { \
+        if      ((n) >= 1000000) snprintf((buf), sizeof(buf), "%uM", (unsigned)((n)/1000000)); \
+        else if ((n) >= 1000)    snprintf((buf), sizeof(buf), "%uk", (unsigned)((n)/1000));    \
+        else                     snprintf((buf), sizeof(buf), "%u",  (unsigned)(n));           \
+    } while (0)
+    FMT_BYTES(heap_str,  free_heap);
+    FMT_BYTES(psram_str, free_psram);
+    #undef FMT_BYTES
 
     const char *state_str = (state == VIEWPORT_STATE_AWAKE) ? "awake" : "asleep";
 
@@ -327,7 +313,7 @@ esp_err_t local_screens_show_info(void)
     // Auto-scale: largest scale where the longest line fits within 90% of
     // width and all lines + spacing fit within 90% of height.
     uint16_t w, h;
-    effective_dims(&w, &h);
+    viewport_state_effective_dims(&w, &h);
 
     size_t longest = 0;
     for (int i = 0; i < n_lines; ++i) {
@@ -363,7 +349,7 @@ esp_err_t local_screens_show_loading(void)
     if (!s_fb) return ESP_ERR_INVALID_STATE;
 
     uint16_t w, h;
-    effective_dims(&w, &h);
+    viewport_state_effective_dims(&w, &h);
     int scale = (w < 800) ? 4 : 5;
     int line_h = 8 * scale;
     int y = (h - line_h) / 2;

@@ -27,14 +27,6 @@ esp_err_t display_set_brightness(uint8_t brightness_0_100);
 esp_err_t display_sleep(void);
 esp_err_t display_wake(void);
 
-// Paint a solid RGB565 color to the entire framebuffer + flush.
-// Used by M3 for the test pattern and by local_screens for the IP and
-// loading screens (M8).
-esp_err_t display_fill(uint16_t rgb565);
-
-// Show a deterministic test pattern (vertical color bars). M3 acceptance.
-esp_err_t display_test_pattern(void);
-
 // Blit an RGB565 source image to the panel, applying the current
 // orientation. Source dimensions must match the effective resolution:
 //   portrait  -> src is 480x800 (rotated 90° CW into the 800x480 panel)

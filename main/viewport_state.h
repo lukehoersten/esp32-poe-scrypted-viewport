@@ -46,3 +46,8 @@ void viewport_state_unlock(void);
 // on the current orientation. Caller-owned static storage; safe to read
 // without the lock (atomic snapshot).
 const char *viewport_state_resolution_str(void);
+
+// Effective width/height for the current orientation: portrait = 480x800
+// (rotated software-side from the panel's 800x480), landscape = 800x480.
+// Acquires the state lock internally.
+void viewport_state_effective_dims(uint16_t *w, uint16_t *h);

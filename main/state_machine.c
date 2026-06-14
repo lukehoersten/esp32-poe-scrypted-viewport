@@ -12,19 +12,13 @@ static const char *TAG = "state";
 
 static esp_timer_handle_t s_idle_timer;
 
-static void arm_idle_timer_unlocked(void)
+// ms = idle_timeout_ms snapshotted under the caller's state lock.
+// ms == 0 disables the timer (caller's idle_timeout_ms feature).
+static void arm_idle_timer(uint32_t ms)
 {
-    viewport_state_lock();
-    uint32_t ms = viewport_state_get()->idle_timeout_ms;
-    viewport_state_unlock();
+    esp_timer_stop(s_idle_timer);
     if (ms == 0) return;
-    esp_timer_stop(s_idle_timer);
     esp_timer_start_once(s_idle_timer, (uint64_t)ms * 1000ULL);
-}
-
-static void disarm_idle_timer(void)
-{
-    esp_timer_stop(s_idle_timer);
 }
 
 static void idle_timer_fired(void *arg)
@@ -56,6 +50,7 @@ esp_err_t state_machine_set(viewport_run_state_t target)
     }
     st->state = target;
     bool configured = st->configured;
+    uint32_t idle_ms = st->idle_timeout_ms;
     viewport_state_unlock();
 
     if (target == VIEWPORT_STATE_AWAKE) {
@@ -67,10 +62,10 @@ esp_err_t state_machine_set(viewport_run_state_t target)
             if (configured) local_screens_show_loading();
             else            local_screens_show_info();
         }
-        arm_idle_timer_unlocked();
+        arm_idle_timer(idle_ms);
         ESP_LOGI(TAG, "AWAKE (%s)", configured ? "configured" : "no scrypted URL");
     } else {
-        disarm_idle_timer();
+        arm_idle_timer(0);
         if (display_is_up()) display_sleep();
         ESP_LOGI(TAG, "ASLEEP");
     }
@@ -80,9 +75,11 @@ esp_err_t state_machine_set(viewport_run_state_t target)
 void state_machine_frame_painted(void)
 {
     viewport_state_lock();
-    bool awake = (viewport_state_get()->state == VIEWPORT_STATE_AWAKE);
+    viewport_state_t *st = viewport_state_get();
+    bool awake = (st->state == VIEWPORT_STATE_AWAKE);
+    uint32_t idle_ms = st->idle_timeout_ms;
     viewport_state_unlock();
-    if (awake) arm_idle_timer_unlocked();
+    if (awake) arm_idle_timer(idle_ms);
 }
 
 void state_machine_set_local(viewport_run_state_t target)
