@@ -335,7 +335,7 @@ Both use a small embedded bitmap font. No LVGL, no general text engine.
 
 The Scrypted side is **code, not configuration** — Scrypted has no built-in concept of a network framebuffer. The code is small and lives inside Scrypted:
 
-- **v1**: a Scrypted Script (in the Scripts plugin) — listens for camera events, calls `takePicture()`, POSTs the JPEG to `/frame`. Exposes a `POST /state` handler at the plugin's endpoint root (e.g. `http://scrypted.local:11080/endpoint/scrypted-viewport/state`) via the EndpointManager. ~50 lines of TypeScript, no package install.
+- **v1** (in this repo at [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts), install instructions in [`scrypted/README.md`](scrypted/README.md)): a Scrypted Script (in the Scripts plugin) — listens for camera events, calls `takePicture()`, POSTs the JPEG to `/frame`. Exposes a `POST /state` handler at the plugin's endpoint root (e.g. `http://scrypted.local:11080/endpoint/scrypted-viewport/state`) via the EndpointManager. ~250 lines of TypeScript, no package install.
 - **Next milestone after v1 (`/stream`)**: add `POST /stream` with `multipart/x-mixed-replace` chunked body for live frame rates. Scrypted side becomes a small custom plugin using FFmpeg via `MediaManager` to pipe MJPEG. `/frame` stays for snapshots and debug.
 
 Either way, no Scrypted core changes and no external service.
