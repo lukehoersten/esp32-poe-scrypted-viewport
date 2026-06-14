@@ -424,13 +424,17 @@ esp_err_t display_wake(void)
     return err;
 }
 
-// RGB565 → RGB888 in R,G,B byte order. TC358762's LCDCTRL = RGB888 path
-// expects channel-order matching the DSI 24bpp packing.
+// RGB565 → RGB888 in B,G,R byte order. The ESP32-P4 DSI engine + TC358762
+// bridge pipeline expects BGR on the wire for the panel's RGB channels —
+// writing R first paints pure blue as solid red on the panel (verified
+// with the M5 self-test: decoded buffer holds 0x001F, panel showed red).
+// Symmetric pixels (white text on black) don't expose this; saturated
+// channel inputs do.
 static inline void rgb565_to_rgb888(uint16_t px, uint8_t *out)
 {
-    out[0] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);  // R
+    out[0] = (uint8_t)(( px        & 0x1F) * 255 / 31);  // B
     out[1] = (uint8_t)(((px >>  5) & 0x3F) * 255 / 63);  // G
-    out[2] = (uint8_t)(( px        & 0x1F) * 255 / 31);  // B
+    out[2] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);  // R
 }
 
 esp_err_t display_fill(uint16_t rgb565)
