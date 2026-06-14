@@ -211,6 +211,8 @@ esp_err_t display_init(void)
 
 bool display_is_up(void) { return s_up; }
 
+i2c_master_bus_handle_t display_i2c_bus(void) { return s_i2c_bus; }
+
 esp_err_t display_set_brightness(uint8_t pct)
 {
     if (pct > 100) pct = 100;

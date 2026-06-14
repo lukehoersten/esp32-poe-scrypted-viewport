@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "driver/i2c_master.h"
 
 // Initialize the panel-side MCU over I2C, then bring up the DSI link in
 // video (DPI) mode. Safe to call when the panel is not attached — returns
@@ -11,6 +12,11 @@
 esp_err_t display_init(void);
 
 bool      display_is_up(void);
+
+// The Hosyond's I2C bus carries both the panel-MCU (0x45) and the touch
+// IC (0x38). Display owns the bus; touch shares it via this getter.
+// Returns NULL before display_init() succeeds.
+i2c_master_bus_handle_t display_i2c_bus(void);
 
 // 0–100, gamma-corrected to 0–255 on the panel-MCU PWM register.
 // brightness=0 is fully off (backlight enable line de-asserted).

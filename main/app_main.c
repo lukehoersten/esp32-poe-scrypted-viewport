@@ -4,7 +4,9 @@
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
+#include "state_client.h"
 #include "state_machine.h"
+#include "touch.h"
 #include "viewport_state.h"
 
 #include "esp_event.h"
@@ -32,6 +34,7 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(state_machine_init());
+    ESP_ERROR_CHECK(state_client_init());
     ESP_ERROR_CHECK(mdns_service_start());
     ESP_ERROR_CHECK(http_api_start());
 
@@ -62,6 +65,12 @@ void app_main(void)
         ESP_LOGW(TAG, "jpeg decoder init failed — /frame will be unavailable");
     }
 
-    // TODO M7: Capacitive touch -> outbound /state POST to <scrypted>/state
+    // Touch shares the panel I2C bus; only meaningful if display came up.
+    if (display_is_up()) {
+        if (touch_init() != ESP_OK) {
+            ESP_LOGW(TAG, "touch init failed — taps won't work");
+        }
+    }
+
     // TODO M8: Local screens (IP, loading) + BOOT button
 }

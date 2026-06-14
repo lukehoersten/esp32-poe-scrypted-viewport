@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 
 #include "display.h"
+#include "state_client.h"
 
 static const char *TAG = "state";
 
@@ -28,8 +29,7 @@ static void disarm_idle_timer(void)
 static void idle_timer_fired(void *arg)
 {
     ESP_LOGI(TAG, "idle timer expired — sleeping");
-    state_machine_set(VIEWPORT_STATE_ASLEEP);
-    // TODO M7: state_client_post(VIEWPORT_STATE_ASLEEP);  // tell Scrypted
+    state_machine_set_local(VIEWPORT_STATE_ASLEEP);
 }
 
 esp_err_t state_machine_init(void)
@@ -78,6 +78,16 @@ void state_machine_frame_painted(void)
     bool awake = (viewport_state_get()->state == VIEWPORT_STATE_AWAKE);
     viewport_state_unlock();
     if (awake) arm_idle_timer_unlocked();
+}
+
+void state_machine_set_local(viewport_run_state_t target)
+{
+    // For idempotent no-op (already in target), state_machine_set returns OK
+    // without changing state; we still call state_client to keep Scrypted in
+    // sync if it's drifted. State POSTs are idempotent on both ends.
+    esp_err_t err = state_machine_set(target);
+    if (err != ESP_OK) return;  // unconfigured / invalid
+    state_client_post(target);
 }
 
 viewport_run_state_t state_machine_current(void)

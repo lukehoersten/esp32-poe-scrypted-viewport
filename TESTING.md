@@ -385,32 +385,71 @@ curl -i -X POST -d 'not json' \
 
 ## M7 — Touch + Outbound `/state` POST
 
-**Acceptance**: tap toggles wake/sleep locally; device POSTs `{viewport,state}` to `<scrypted>/state`.
+**Acceptance**: tap toggles wake/sleep locally; idle timer firing posts sleep; device POSTs `{viewport,state}` to `<scrypted>/state` for every local transition.
 
-**How to verify**
-
-Stand up a test HTTP receiver:
+**Test receiver** (run on the host you'll point `scrypted` at):
 
 ```bash
-# In a separate terminal on Scrypted host:
-python3 -m http.server 11080  # or a small flask app that logs body
+# Single-file flask receiver that echoes every POST:
+pip install flask
+cat > /tmp/recv.py <<'EOF'
+from flask import Flask, request
+app = Flask(__name__)
+@app.post("/state")
+def state():
+    print("RX", request.get_json())
+    return "", 204
+app.run(host="0.0.0.0", port=11080)
+EOF
+python3 /tmp/recv.py
 ```
 
-Configure the device to point at it:
+Configure the device:
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"viewport":"mudroom","scrypted":"http://<host>:11080"}' \
+  -d '{"viewport":"mudroom","scrypted":"http://<host>:11080","idle_timeout_ms":10000}' \
   http://<device-ip>/config
 ```
 
-Then:
-- Tap while asleep → device wakes, receiver logs `POST /state {"viewport":"mudroom","state":"wake"}`.
-- Tap while awake → device sleeps, receiver logs `POST /state {"viewport":"mudroom","state":"sleep"}`.
-- Wait `idle_timeout_ms` with no `/frame` → receiver logs same sleep POST.
-- Kill receiver, tap → `/state` `state_post_failures` increments.
+**Tap dispatch**
 
-**Status**: ⬜ pending.
+- Tap while asleep → device wakes; receiver prints `RX {'viewport': 'mudroom', 'state': 'wake'}`.
+- Tap while awake → device sleeps; receiver prints same with `state: 'sleep'`.
+- Idle timer expires (10s here) → receiver prints `state: 'sleep'`.
+
+Each successful POST also logs on serial:
+
+```
+I (xxx) state_client: POST http://<host>:11080/state {state:wake} -> 204
+```
+
+**Failure path**
+
+- Stop the receiver, then tap. Serial:
+
+  ```
+  W (xxx) state_client: POST http://<host>:11080/state failed: err=ESP_OK status=-1
+  ```
+
+  Then `GET /state` shows `state_post_failures` incremented.
+
+- Local state change still happens (backlight toggles). The POST is best-effort, not a precondition.
+
+**Depth-1 queue with replace-on-full**
+
+Tap rapidly (faster than the receiver can ack) and confirm the receiver only sees the most recent state transition between in-flight POSTs. Intermediate flips are coalesced. With a 1s receiver delay, only the final state of each ~1s window should hit the receiver.
+
+**No POST when Scrypted-initiated**
+
+- `curl -X POST -d '{"state":"sleep"}' /state` — receiver should print **nothing** (Scrypted already knows it initiated).
+- Same for `/state {wake}` and `/frame` (asleep → 409, no callback either).
+
+**No POST when unconfigured**
+
+- After factory reset, tapping the screen does nothing (no Scrypted URL to call). No queue entries dropped to disk.
+
+**Status**: 🟡 builds clean against ESP-IDF 5.4. Hardware verification needs the FT5426 touch jumpered + reachable on I2C 0x38.
 
 ---
 
