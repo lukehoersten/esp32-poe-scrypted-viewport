@@ -19,6 +19,21 @@ Scrypted owns rendering, overlays, camera selection and interaction logic.
 
 Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound state-change POSTs.
 
+## Related docs
+
+- [`TESTING.md`](TESTING.md) — **the self-contained verification reference.** Status snapshot for every milestone, hardware prerequisites + open unknowns, bench-order playbook, per-milestone `curl` recipes, integration test suite. Start here before flashing anything.
+- [`scrypted/README.md`](scrypted/README.md) — Scrypted-side script install + per-viewport binding UI (Path B with camera picker and mDNS auto-resolve).
+
+## Status
+
+| Layer | Where we are | What's pending |
+| --- | --- | --- |
+| Firmware (`main/`) | M1–M8 implemented; binary ~870 KB; builds clean against ESP-IDF 5.4 for `esp32p4`. | M9 (`POST /stream`) not started. **Zero milestones verified on hardware yet.** |
+| Scrypted side (`scrypted/`) | v1 Script — DeviceProvider with per-viewport child devices, camera picker, mDNS auto-resolve. | v2 plugin (packaged + FFmpeg streaming to `/stream`) not started. Script unverified end-to-end. |
+| Hardware | Ethernet pin map confirmed (Waveshare wiki + ESPHome). Hosyond panel architecture confirmed (Pi 7"-style, TC358762 bridge + ATTINY MCU at I²C `0x45`). Jumper wiring documented. | Schematic confirmation needed for DSI FPC pin count, I²C GPIO mapping, BOOT button GPIO, flash size. All gated by [`TESTING.md`'s Hardware prerequisites](TESTING.md#hardware-prerequisites). |
+
+See [`TESTING.md`](TESTING.md) for the full milestone-by-milestone status and the bench-order playbook.
+
 ## Hardware
 
 ### Controller
@@ -420,6 +435,67 @@ idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
 ```
 
+## Firmware implementation notes
+
+### Source map (`main/`)
+
+| File | What it does |
+| --- | --- |
+| `app_main.c` | Boot sequence: NVS → state → Ethernet → mDNS → HTTP → state machine → state-client worker → display → JPEG decoder → touch → BOOT button. |
+| `viewport_state.{h,c}` | Shared runtime state behind a FreeRTOS mutex; every module reads/writes through `viewport_state_lock`. |
+| `nvs_config.{h,c}` | Persist viewport, scrypted URL, idle timeout, orientation, brightness to NVS. Load on boot; flip state UNCONFIGURED → ASLEEP when both name + URL are present. |
+| `net_eth.{h,c}` | Internal EMAC + IP101GRI PHY init, DHCP wait, IP getter. Pin map verified against Waveshare wiki + ESPHome's working config. |
+| `mdns_service.{h,c}` | `mdns_init()` + `_scrypted-viewport._tcp.local` advertisement. `mdns_service_refresh()` reapplies hostname + TXT after `/config` writes change them. |
+| `http_api.{h,c}` | `esp_http_server` on :80. All five endpoints (`GET /state`, `GET /config`, `POST /config`, `POST /state`, `POST /frame`) with partial-update + validation + status codes from the spec. |
+| `display.{h,c}` | Pi 7"-style panel: I²C bring-up of the on-panel MCU at `0x45` (power-on register dance), ESP32-P4 MIPI-DSI in DPI video mode at canonical Pi 7" timings, gamma-corrected backlight PWM, orientation-aware blit (memcpy landscape / 90° CW rotate portrait). |
+| `jpeg_decoder.{h,c}` | ESP32-P4 hardware JPEG engine with a 1 MB PSRAM scratch buffer and a `try_lock(0)` for concurrent `/frame` → 503. |
+| `state_machine.{h,c}` | Central wake/sleep transitions (mutex-protected, idempotent). Owns the `esp_timer` idle one-shot. `state_machine_set_local()` is the device-initiated variant — drives the transition *and* fires the outbound `/state` POST. |
+| `state_client.{h,c}` | Worker task + `xQueueOverwrite()` depth-1 queue for outbound POSTs to `<scrypted>/state`. 1 s timeout, fire-and-forget, `state_post_failures` counter. |
+| `touch.{h,c}` | FT5426 polling at 30 ms over the shared I²C bus. Tap = down→up within 500 ms, 150 ms debounce. |
+| `local_screens.{h,c}` | 8×8 bitmap font (sparse 95-char table populated for the IP and Loading strings), centered text rendering at scale 3×/4× into a PSRAM scratch FB, routed through `display_present_rgb565()` so orientation is automatic. |
+| `button.{h,c}` | BOOT button polling. Short press → 15 s IP-screen overlay. ≥ 5 s hold → `nvs_config_reset()` + `esp_restart()`. |
+
+### Memory strategy
+
+The Waveshare board ships with 32 MB PSRAM. Everything large lives there: JPEG input scratch (1 MB), decoder output (768 KB RGB565 native), `esp_lcd_dpi` framebuffer (also PSRAM-backed), local-screens scratch (768 KB). Internal SRAM is reserved for FreeRTOS task stacks and small allocations — `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` keeps allocations ≤ 16 KB in SRAM by default.
+
+### Display strategy
+
+JPEG → RGB565 framebuffer → DSI panel, single buffer. No double buffering, no LVGL, no general text engine. The only locally-drawn UI is the IP screen and the Loading screen (both via the 8×8 bitmap font in `local_screens.c`). Brightness PWM is gamma-corrected — `duty = (level/100)^2.2 * 255` — so 0–100 maps to perceptual brightness instead of linear duty cycle.
+
+### Error handling
+
+Every endpoint is idempotent; every failure leaves the device in a sane state.
+
+- JPEG decode fails → `decode_errors++`, return 400 or 500, keep previous frame on screen, wake/sleep state unchanged.
+- Outbound `/state` POST fails → `state_post_failures++`, continue. Local state change still happened. No retry queue; Scrypted catches up via its own timeout, the next event, or the next `/frame` returning 409.
+- Ethernet disconnects → driver reconnects automatically. No reboot loop. `GET /state` keeps serving over loopback for diagnostics.
+- Display init fails → log loudly, keep serving the rest of the API with `state="unconfigured"`. The protocol is still usable for re-registration.
+- Task hangs → ESP-IDF watchdog reboots. NVS rebuilds soft state on the next boot.
+
+### Coding standards
+
+- C with ESP-IDF APIs. No C++.
+- No dynamic allocation in hot paths after startup. Allocate at init, reuse.
+- PSRAM is opt-in: `heap_caps_malloc(MALLOC_CAP_SPIRAM)` for buffers > 16 KB.
+- Constants centralized at the top of each module (pin map, timeouts, panel timings, register addresses).
+- No clever abstractions. No display framework beyond `esp_lcd`.
+- Per-module mutex on shared state; one in-flight worker for outbound HTTP and JPEG decode.
+
+## What's next
+
+In rough priority order. Each entry links the relevant section so you can pick up cold.
+
+1. **Hardware bring-up of M1 + M2** — flash the board and confirm DHCP + `GET /state` over Ethernet. No panel needed; ~10 minutes once the board is reachable. See [`TESTING.md` Stage 1](TESTING.md#stage-1--board-comes-alive-m1--m2).
+2. **Schematic confirmation** — open the Waveshare ESP32-P4-ETH schematic PDF and confirm: DSI FPC pin count, I²C GPIO mapping (`PIN_I2C_SDA=7`, `PIN_I2C_SCL=8` in `display.c` are placeholders), BOOT button GPIO (`PIN_BOOT_BUTTON=0` in `button.c` is a guess), flash chip size silkscreen. See [`TESTING.md` Hardware prerequisites](TESTING.md#hardware-prerequisites).
+3. **Source the DSI adapter cable** — 15-pin Pi-FPC → Waveshare-side DSI. Order matches what step 2 reveals.
+4. **Stage-by-stage bench verification (M3 → M8)** — work through [`TESTING.md` Recommended bench order](TESTING.md#recommended-bench-order) with the panel attached and jumpers wired. Each stage flips its milestones to ✅.
+5. **End-to-end with Scrypted** — paste [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts) into Scrypted's Scripts plugin, add a viewport device, trigger a bound camera, watch the panel light up. See [`scrypted/README.md`](scrypted/README.md).
+6. **Integration suite** — once every milestone is ✅, run the suite at the bottom of [`TESTING.md`](TESTING.md#integration--system-tests-post-m9) (races, failure modes, longevity soak, multi-viewport, negative protocol matrix).
+7. **M9 — `POST /stream`** — multipart MJPEG over chunked POST on the device. ~150 LOC. Unblocks live-rate frame delivery; `/frame` stays for snapshots and debug.
+8. **v2 Scrypted plugin** — packaged plugin (not a Script) using FFmpeg via `MediaManager` to pipe MJPEG into `/stream`. Replaces v1's `takePicture`-loop with a continuous stream. Higher fps, same protocol surface, same per-viewport device UX from Path B.
+9. **Post-v2 polish** — HTTP OTA from Scrypted, on-board status LED wiring, ESP-IDF task watchdog enable, M9 acceptance check (≥ 10 fps end-to-end).
+
 ## Philosophy
 
 Scrypted Viewport is a thin network framebuffer appliance.
@@ -434,3 +510,6 @@ ESP:
 - touch
 
 Everything else belongs in Scrypted.
+
+> If it changes **what** should be shown, it belongs in Scrypted.
+> If it changes **how** pixels reach the screen, it belongs in the device.

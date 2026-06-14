@@ -1,12 +1,97 @@
 # Testing & Verification
 
-This file tracks which milestones have been verified on hardware and how. Per-milestone entries below each list:
+This file is the self-contained reference for verifying the firmware on real hardware. It has three layers:
 
-- **Acceptance** — what "done" means (mirrors the impl guide).
-- **How to verify** — exact commands or actions.
-- **Status** — ⬜ not verified / 🟡 partial / ✅ verified, with a one-line note (date, board rev, anything weird).
+1. **Status snapshot** — at-a-glance state of every milestone.
+2. **Hardware prerequisites** — what to confirm or order before flashing anything.
+3. **Recommended bench order** — the sequence to flip 🟡 → ✅, stage by stage.
+4. **Per-milestone entries** (M1–M9) — acceptance criteria + exact commands/actions + status.
+5. **Integration & system tests** — to run after every per-milestone test passes.
 
-Hardware-required milestones can't be verified by a clean build alone — a checked-in build success counts as 🟡 (compiles, not yet run).
+Status legend:
+
+- ⬜ not verified — code not yet exercised at all.
+- 🟡 partial — compiles cleanly, builds against ESP-IDF 5.4 for `esp32p4`, but not yet run on a board.
+- ✅ verified — confirmed on hardware. Annotate with the date and board rev.
+
+---
+
+## Status snapshot
+
+| # | Milestone | Code | HW |
+| --- | --- | --- | --- |
+| M1 | Board Bring-Up — Ethernet + DHCP | ✅ | 🟡 |
+| M2 | HTTP + mDNS (`GET /state`) | ✅ | 🟡 |
+| M3 | Display Bring-Up (Hosyond panel) | ✅ | 🟡 |
+| M4 | Config Persistence (NVS, partial updates) | ✅ | 🟡 |
+| M5 | JPEG Frame Push (`POST /frame`) | ✅ | 🟡 |
+| M6 | State + Idle Timer (`POST /state`, 409 guard) | ✅ | 🟡 |
+| M7 | Touch + Outbound `/state` POST | ✅ | 🟡 |
+| M8 | Local Screens + BOOT button | ✅ | 🟡 |
+| M9 | Live Stream (`POST /stream`) | ⬜ | ⬜ |
+
+---
+
+## Hardware prerequisites
+
+Before flashing anything, confirm or acquire:
+
+| Item | Status as of this writing | How to resolve |
+| --- | --- | --- |
+| Waveshare ESP32-P4-ETH board | shipped | check silkscreen for flash size (16 vs 32 MB) — adjust `sdkconfig.defaults` if 32 |
+| Hosyond 5" 800×480 panel | shipped | n/a |
+| 15-pin Pi-FPC → Waveshare-side DSI adapter cable | **unknown — order before M3** | check Waveshare board DSI connector pin count, buy matching adapter |
+| 4× jumper wires (5V / GND / SDA / SCL) | trivial | bench supply |
+| Ethernet cable + DHCP-serving switch | trivial | LAN already in place |
+| (optional) PoE injector | nice-to-have | for M1/M2 a USB-only power path is fine |
+
+Hardware unknowns that gate work:
+
+1. **DSI FPC pin count on the Waveshare board.** Research found 2-lane MIPI-DSI confirmed; pin count not verified. Open the schematic PDF and count.
+2. **I²C jumper destinations.** `display.c` defaults `PIN_I2C_SDA=7`, `PIN_I2C_SCL=8` — matches Waveshare's BSP convention for their bundled panel kit but not specifically verified for this board. Confirm against schematic; adjust `display.c` if wrong.
+3. **BOOT button GPIO.** ESP32-P4's strap pin (GPIO 35) is owned by RMII TXD1 at runtime, so the on-board user/BOOT button must be on a different GPIO. `button.c` currently uses `PIN_BOOT_BUTTON = 0` as a placeholder. Confirm from schematic; if wrong, the button silently never fires but the rest of M8 still works.
+4. **Flash size silkscreen.** `sdkconfig.defaults` declares 16 MB. If your SKU shipped with 32 MB the build still works but you waste half the flash.
+
+---
+
+## Recommended bench order
+
+Work through these stages in order. Each stage builds on the previous one's verified state.
+
+### Stage 1 — board comes alive (M1 + M2)
+
+No display, no panel, no jumpers. Just board on Ethernet over USB.
+
+```bash
+source ~/Dev/code/git/esp32/env.sh
+idf.py -p /dev/cu.usbmodem* flash monitor
+```
+
+Check serial for `net_eth: got ip` then `curl http://<ip>/state | jq .` and `dns-sd -B _scrypted-viewport._tcp local.`. If both pass, flip M1 + M2 to ✅. Stop here if you hit any issue — debug Ethernet before adding more variables.
+
+### Stage 2 — display panel (M3)
+
+Confirm the schematic-driven unknowns above, wire the four I²C/power jumpers, plug the DSI cable, reflash, and look for `panel MCU id 0xC3` in serial. Color bars on screen → M3 ✅.
+
+### Stage 3 — protocol (M4 + M5 + M6)
+
+No new wiring. POST `/config`, send a JPEG, exercise wake/sleep, watch the idle timer fire. Run through the per-milestone curls below.
+
+### Stage 4 — touch (M7)
+
+Tap the screen. Confirm the FT5426 acks on I²C in the boot log. Stand up the flask receiver, configure the device to point at it, and watch outbound `/state` POSTs arrive.
+
+### Stage 5 — local screens + BOOT (M8)
+
+Visual: fresh boot shows IP screen; wake shows loading screen; tap-press of the BOOT button overlays IP. If BOOT GPIO is wrong, the screens still work — only the button feature stays cold.
+
+### Stage 6 — end-to-end with Scrypted
+
+Paste `scrypted/scrypted-viewport.ts` into Scrypted's Scripts plugin, add a viewport device with the binding (camera picker dropdown), trigger the bound camera, watch the panel light up.
+
+### Stage 7 — integration
+
+Run the suite at the bottom of this file (races, failures, longevity, etc.).
 
 ---
 
