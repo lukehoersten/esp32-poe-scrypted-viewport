@@ -24,7 +24,7 @@ Status legend:
 | M2 | HTTP + mDNS (`GET /state`) | ✅ | ✅ |
 | M3 | Display Bring-Up (Hosyond panel) | ✅ | ✅ |
 | M4 | Config Persistence (NVS, partial updates) | ✅ | ✅ |
-| M5 | JPEG Frame Push (`POST /frame`) | ✅ | 🟡 |
+| M5 | JPEG Frame Push (`POST /frame`) | ✅ | ✅ |
 | M6 | State + Idle Timer (`POST /state`, 409 guard) | ✅ | ✅ |
 | M7 | Touch + Outbound `/state` POST | ✅ | ✅ |
 | M8 | Local Screens + touch long-press | ✅ | ✅ |
@@ -371,7 +371,7 @@ After every error: `decode_errors` in `GET /state` should increment.
 
 **Known gap (M6 closes this)**: M5 paints regardless of wake/sleep state. The `/frame` → `409` when asleep rule is added with `POST /state` in M6. Until then, a configured device boots ASLEEP per spec but `/frame` still paints because the state guard isn't wired yet.
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4. Awaiting hardware verification (the test pattern from M3 confirms paint works; M5 adds the JPEG path).
+**Status**: ✅ verified 2026-06-14. Hardware JPEG decode + paint works end-to-end. Fixing it surfaced two stacked channel-swap bugs (commit 11ad249): the IDF JPEG decoder's `_RGB` element-order emits the RGB565 word in big-endian byte order (we now use `_BGR` for LE), and the ESP32-P4 DSI + TC358762 + Pi panel pipeline wants `[B, G, R]` in memory (we now pack the RGB888 framebuffer accordingly). Symmetric pixels like the white-on-black info screen masked both bugs; saturated solid colours exposed them.
 
 ---
 
