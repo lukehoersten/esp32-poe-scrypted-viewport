@@ -15,7 +15,7 @@ esp_err_t local_screens_init(void);
 //   <current IP>                ("no network" if no DHCP lease)
 //   <state>                     ("awake" / "asleep" / "unconfigured")
 // Font scale is auto-picked to fit the longest line within 90% of width.
-// Shown on first boot, after factory reset, and as a 15s BOOT-button overlay.
+// Shown on first boot, after factory reset, and as a 15s touch-long-press overlay.
 esp_err_t local_screens_show_ip(void);
 
 // Render the loading screen — centered "Loading…" — shown on every wake
@@ -23,8 +23,7 @@ esp_err_t local_screens_show_ip(void);
 esp_err_t local_screens_show_loading(void);
 
 // Show the identity ("who am I") screen for `duration_ms`, then drop the
-// backlight off. Used by the BOOT button short-press (any state) and by
-// the touch handler when the device is unconfigured.
+// backlight off. Triggered by a ≥1.5s touch long-press in any state.
 esp_err_t local_screens_overlay(uint32_t duration_ms);
 
 // True while the identity overlay is currently shown (timer armed).

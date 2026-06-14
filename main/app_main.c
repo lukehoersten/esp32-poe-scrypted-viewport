@@ -1,4 +1,3 @@
-#include "button.h"
 #include "display.h"
 #include "http_api.h"
 #include "jpeg_decoder.h"
@@ -47,7 +46,7 @@ void app_main(void)
     // don't get a DHCP lease. mDNS + HTTP advertise / bind anyway and will
     // start serving the moment the link comes up.
     // ------------------------------------------------------------------
-    char flags[8] = { '-','-','-','-','-','-','-', 0 };  // E M H D J T B
+    char flags[7] = { '-','-','-','-','-','-', 0 };  // E M H D J T
     esp_err_t eth_err = net_eth_init();
     mark(eth_err, 'E', &flags[0]);
 
@@ -73,10 +72,10 @@ void app_main(void)
     // config is even slightly off; keeping that off the main task means
     // a misconfigured panel can't take down networking + /state. The
     // task also brings up the JPEG decoder and touch (touch shares the
-    // panel I²C bus).
+    // panel I²C bus and also handles long-press → identity overlay and
+    // very-long-press → factory reset, since the board's BOOT button is
+    // wired to a strap pin (GPIO35) that the EMAC owns at runtime).
     // ------------------------------------------------------------------
-    mark(button_init(), 'B', &flags[6]);
-
     ESP_LOGI(TAG, "boot complete — net subsystems [%s] ip=%s; "
                   "display init deferred to dsp_init task",
              flags, got_ip ? net_eth_get_ip_str() : "(no link)");
@@ -92,16 +91,6 @@ static void display_setup_task(void *arg)
 
     if (dsp_err == ESP_OK) {
         local_screens_init();
-        // Show solid-color test sequence for ~6 s so we can characterize the
-        // garble: solid red, then solid green, then solid blue, each for 2s.
-        // If the panel paints a single uniform color (or close to it) for
-        // each, the issue is the text rendering only. If even solid colors
-        // are garbled, it's a stride / pixel-format bug deeper down.
-        display_wake();
-        display_fill(0xF800); vTaskDelay(pdMS_TO_TICKS(2000));   // red
-        display_fill(0x07E0); vTaskDelay(pdMS_TO_TICKS(2000));   // green
-        display_fill(0x001F); vTaskDelay(pdMS_TO_TICKS(2000));   // blue
-        display_sleep();
     }
 
     mark(jpeg_decoder_init(), 'J', &flags[1]);
