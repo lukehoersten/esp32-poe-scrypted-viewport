@@ -1,3 +1,4 @@
+#include "display.h"
 #include "http_api.h"
 #include "mdns_service.h"
 #include "net_eth.h"
@@ -29,7 +30,15 @@ void app_main(void)
     ESP_ERROR_CHECK(mdns_service_start());
     ESP_ERROR_CHECK(http_api_start());
 
-    // TODO M3: MIPI-DSI panel init (800x480 IPS, default portrait 480x800)
+    // Display is best-effort during bring-up: a missing/miswired panel must
+    // not kill networking + /state. M3 acceptance: show a test pattern.
+    if (display_init() == ESP_OK) {
+        display_test_pattern();
+        ESP_LOGI(TAG, "display up — test pattern on screen");
+    } else {
+        ESP_LOGW(TAG, "display init failed — continuing without panel");
+    }
+
     // TODO M4: /config persistence (NVS) + GET /config + POST /config
     // TODO M5: /frame JPEG decode -> framebuffer
     // TODO M6: POST /state + idle timer
