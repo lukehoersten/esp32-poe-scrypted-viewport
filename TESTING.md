@@ -20,8 +20,8 @@ Status legend:
 
 | # | Milestone | Code | HW |
 | --- | --- | --- | --- |
-| M1 | Board Bring-Up — Ethernet + DHCP | ✅ | 🟡 |
-| M2 | HTTP + mDNS (`GET /state`) | ✅ | 🟡 |
+| M1 | Board Bring-Up — Ethernet + DHCP | ✅ | ✅ |
+| M2 | HTTP + mDNS (`GET /state`) | ✅ | ✅ |
 | M3 | Display Bring-Up (Hosyond panel) | ✅ | 🟡 |
 | M4 | Config Persistence (NVS, partial updates) | ✅ | 🟡 |
 | M5 | JPEG Frame Push (`POST /frame`) | ✅ | 🟡 |
@@ -122,9 +122,10 @@ Cross-check from another host:
 ping 192.168.x.x
 ```
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4 (commit e2ac22e). Not yet flashed to hardware — awaiting first board run.
-
-> Combined hardware verification of M1+M2 is fine — they both run from the same flash session.
+**Status**: ✅ verified 2026-06-14 on Waveshare ESP32-P4-ETH (Amazon B0FN7JQ2V8, 32 MB PSRAM, 32 MB flash silkscreen, IDF v5.4.1). DHCP lease landed at 10.0.13.83. Three fixes were needed during bring-up — see commit 220ee4c:
+> 1. **RXD0 / RXD1 GPIO swap**: ESP32-P4 EMAC iomux fixes RXD0=29, RXD1=30. The original pin map had them transposed.
+> 2. **mDNS hostname order**: `mdns_service_add()` returns INVALID_ARG if hostname isn't set yet. Now init → hostname → service_add → TXT.
+> 3. **`app_main` best-effort everywhere**: any one missing subsystem (no LAN, no panel) used to abort the boot. Now each is independent; final log line summarizes which letters of `EMHDJTB` came up.
 
 ---
 
@@ -170,7 +171,12 @@ Expected `/state` body on a fresh device (unconfigured):
 
 Expected mDNS browse output should show a `_scrypted-viewport._tcp` instance with TXT records `version=`, `resolution=`, `orientation=`, `name=` (empty for `name`).
 
-**Status**: 🟡 builds clean against ESP-IDF 5.4 with espressif/mdns managed component. Awaiting first board run.
+**Status**: ✅ verified 2026-06-14 alongside M1.
+
+- `GET http://10.0.13.83/state` returned the full spec JSON: `name=null, configured=false, state=unconfigured, resolution=480x800, ip=10.0.13.83, free_psram=31730048, ...`.
+- `dns-sd -B _scrypted-viewport._tcp local.` on macOS surfaced one instance named `viewport`.
+
+Bare-board behavior (no panel, no ethernet) was also verified — the device boots cleanly and prints a summary like `boot complete — subsystems [EMHdJ-B]  ip=(no link)` (lowercase `d` = display down because no panel attached; `-` for touch because it shares the panel I²C bus).
 
 ---
 

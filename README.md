@@ -30,7 +30,7 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 
 | Layer | Where we are | What's pending |
 | --- | --- | --- |
-| Firmware (`main/`) | M1–M8 implemented; binary ~870 KB; builds clean against ESP-IDF 5.4 for `esp32p4`. | M9 (`POST /stream`) not started. **Zero milestones verified on hardware yet.** |
+| Firmware (`main/`) | M1–M8 implemented; binary ~870 KB; builds clean against ESP-IDF 5.4 for `esp32p4`. **M1 + M2 ✅ verified on hardware** (2026-06-14, Ethernet + `GET /state` + mDNS browse). | M9 (`POST /stream`) not started. M3–M8 still 🟡 (panel not yet attached). |
 | Scrypted side (`scrypted/`) | v1 Script — DeviceProvider with per-viewport child devices, camera picker, mDNS auto-resolve. | v2 plugin (packaged + FFmpeg streaming to `/stream`) not started. Script unverified end-to-end. |
 | Hardware | Ethernet pin map confirmed (Waveshare wiki + ESPHome). Hosyond panel architecture confirmed (Pi 7"-style, TC358762 bridge + ATTINY MCU at I²C `0x45`). Jumper wiring documented. | Schematic confirmation needed for DSI FPC pin count, I²C GPIO mapping, BOOT button GPIO, flash size. All gated by [`TESTING.md`'s Hardware prerequisites](TESTING.md#hardware-prerequisites). |
 
