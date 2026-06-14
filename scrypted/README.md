@@ -43,7 +43,7 @@ Changing any setting triggers an immediate re-register and re-subscribes the cam
 
 ## Removing a viewport
 
-Open the viewport device's page → **Settings** menu → **Delete Device**. The script stops any active stream, unsubscribes from the camera, and forgets the binding. The physical device keeps its NVS-stored config until it gets a fresh `/config` from somewhere — or hit **BOOT for 5 s** on the panel to factory-reset.
+Open the viewport device's page → **Settings** menu → **Delete Device**. The script stops any active stream, unsubscribes from the camera, and forgets the binding. The physical device keeps its NVS-stored config until it gets a fresh `/config` from somewhere — to fully wipe it, plug USB and run `idf.py erase-flash` then reflash.
 
 ## Global tuning
 
@@ -100,7 +100,7 @@ When mDNS doesn't resolve, the script silently falls back to the operator-entere
 
 After installing the script and adding one viewport binding:
 
-1. **Fresh viewport** boots → IP screen on panel.
+1. **Fresh viewport** boots → info screen on panel.
 2. Script's `getDevice()` runs on script start → `POST /config` lands → viewport → `state: asleep`, backlight off.
 3. **Tap the viewport** → device POSTs `{viewport, state: "wake"}` → script logs `recv "<name>" -> wake` → snapshots start flowing for `idle_timeout_ms`.
 4. **Tap again** → device POSTs `{state: "sleep"}` → script stops streaming.
