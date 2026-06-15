@@ -614,9 +614,17 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // panel is already in the right rotation. The firmware never
         // touches pixels — the hardware JPEG decoder writes BGR888
         // straight into a DMA buffer that gets handed to the DSI engine.
+        // Filter order matters here. Earlier we did
+        //   scale=480:800,transpose=1
+        // which intermittently produced a JPEG with a SOF marker
+        // reporting 480x800 — the firmware then rejected it with
+        // "expected 800x480, got 480x800". Rotating *first* and then
+        // scaling to an EXPLICIT panelWxpanelH (with setsar to clear
+        // any leftover aspect-ratio metadata) makes the final encoded
+        // dimensions deterministic regardless of source resolution.
         const vf = v.orientation === "portrait"
-            ? `scale=${panelH}:${panelW}:flags=lanczos,transpose=1`   // 90° CW → panelW x panelH
-            : `scale=${panelW}:${panelH}:flags=lanczos`;
+            ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
+            : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
         const fps = Math.max(1, Math.round(1000 / v.frameIntervalMs));
 
         // Pull the camera's video stream, convert to ffmpeg input args, and
