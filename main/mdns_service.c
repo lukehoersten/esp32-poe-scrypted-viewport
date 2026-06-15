@@ -17,6 +17,8 @@ static const uint16_t PORT   = 80;
 // Pull hostname + TXT values from viewport_state under one lock acquisition,
 // then push them at the mDNS service. mdns_service_add() rejects with
 // INVALID_ARG if the hostname isn't set, so order matters on first apply.
+// viewport_name is always populated (MAC-derived default) so the hostname
+// is always `viewport-<name>`.
 static esp_err_t apply_state(bool include_hostname)
 {
     char hostname[80];
@@ -25,11 +27,8 @@ static esp_err_t apply_state(bool include_hostname)
 
     viewport_state_lock();
     viewport_state_t *st = viewport_state_get();
-    snprintf(hostname, sizeof(hostname), "viewport%s%s",
-             st->viewport_name[0] ? "-" : "",
-             st->viewport_name[0] ? st->viewport_name : "");
-    snprintf(name, sizeof(name), "%s",
-             st->viewport_name[0] ? st->viewport_name : "");
+    snprintf(hostname, sizeof(hostname), "viewport-%s", st->viewport_name);
+    snprintf(name,     sizeof(name),     "%s",         st->viewport_name);
     resolution  = viewport_state_resolution_str();
     orientation = (st->orientation == VIEWPORT_ORIENTATION_PORTRAIT)
                       ? "portrait" : "landscape";
@@ -53,9 +52,7 @@ esp_err_t mdns_service_start(void)
     char hostname[80];
     viewport_state_lock();
     viewport_state_t *st = viewport_state_get();
-    snprintf(hostname, sizeof(hostname), "viewport%s%s",
-             st->viewport_name[0] ? "-" : "",
-             st->viewport_name[0] ? st->viewport_name : "");
+    snprintf(hostname, sizeof(hostname), "viewport-%s", st->viewport_name);
     viewport_state_unlock();
 
     ESP_RETURN_ON_ERROR(mdns_init(),                       TAG, "mdns_init");

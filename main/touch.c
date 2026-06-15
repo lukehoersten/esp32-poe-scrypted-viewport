@@ -54,13 +54,6 @@ static void on_long_press(void)
     if (display_is_up()) local_screens_overlay(OVERLAY_MS);
 }
 
-// If we see N consecutive bogus polls (TD_STATUS > 5, i.e. the FT5426 is
-// returning 0xff), pulse PC_RST_TP_N to try to bring it back. PoE-only
-// cold boots leave the touch IC in a wedged state for ~seconds before it
-// recovers; this lets us keep nudging it without blocking init.
-#define WEDGE_THRESHOLD   (3000 / POLL_PERIOD_MS)   // ~3 s of bad polls
-#define WEDGE_BACKOFF_MS  2000
-
 static void touch_task(void *arg)
 {
     bool     was_down       = false;
@@ -68,35 +61,16 @@ static void touch_task(void *arg)
     bool     long_fired     = false;
     uint64_t last_tap_us    = 0;
     uint8_t  buf[7];
-    unsigned wedged_cycles  = 0;
-    uint64_t last_reset_us  = 0;
-    bool     announced_up   = false;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
 
         if (ft_read(FT_REG_DEV_MODE, buf, sizeof(buf)) != ESP_OK) continue;
-        uint64_t now_us = (uint64_t)esp_timer_get_time();
         uint8_t touches = buf[FT_REG_TD_STATUS] & 0x0F;
-        // FT5x06 supports max 5 simultaneous points. A reading above that
-        // is bogus (typically the bus is parking 0xff because the IC isn't
-        // responding) — drop the cycle and bump the wedge counter.
-        if (touches > 5) {
-            if (++wedged_cycles >= WEDGE_THRESHOLD &&
-                now_us - last_reset_us > (uint64_t)WEDGE_BACKOFF_MS * 1000ULL) {
-                ESP_LOGW(TAG, "touch wedged — pulsing reset");
-                display_touch_reset_pulse();
-                last_reset_us  = now_us;
-                wedged_cycles  = 0;
-            }
-            continue;
-        }
-        if (wedged_cycles > 0 || !announced_up) {
-            ESP_LOGI(TAG, "touch online (TD_STATUS=%u)", touches);
-            wedged_cycles = 0;
-            announced_up  = true;
-        }
-        uint64_t now    = now_us;
+        // FT5x06 supports max 5 simultaneous points; anything above that
+        // is a bogus reading (chip parking 0xff during a transient).
+        if (touches > 5) continue;
+        uint64_t now = (uint64_t)esp_timer_get_time();
 
         if (touches > 0) {
             if (!was_down) {
@@ -141,23 +115,11 @@ esp_err_t touch_init(void)
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &cfg, &s_dev),
                        TAG, "i2c add FT5426");
 
-    // Force DEV_MODE=0x00 (Working Mode) — chip might have powered up in
-    // System Info mode (0x40) or Factory Test mode (0x40) which would
-    // explain steady 0x00 TD_STATUS but no touch detection. Cheap to
-    // attempt; ignore result since some firmware revisions reject it
-    // pre-reset and the polling loop handles the alternative anyway.
-    {
-        uint8_t set_working[2] = { FT_REG_DEV_MODE, 0x00 };
-        i2c_master_transmit(s_dev, set_working, sizeof(set_working), 50);
-    }
-
-    // Pulse the touch reset line and don't read dev_mode at init time:
-    // on PoE-only boots the FT5426 hasn't finished its internal firmware
-    // load when touch_init runs, and any read returns 0xff. The polling
-    // loop already drops cycles where TD_STATUS > 5, so a wedged chip is
-    // harmless; once its firmware finishes (often after a few hundred ms
-    // of being prodded by polling reads), real touches start landing.
-    display_touch_reset_pulse();
+    // No dev_mode read here: the FT5426 starts reporting contacts only
+    // after the LCD has streamed with the backlight on at least once
+    // (handled by the wake-on-boot flash in app_main). Any read before
+    // that returns 0xff, which the polling loop's >5 sanity filter
+    // already drops.
     ESP_LOGI(TAG, "FT5426 polling started "
                   "(tap=toggle wake/sleep, %dms hold=info overlay)",
              LONG_PRESS_MS);

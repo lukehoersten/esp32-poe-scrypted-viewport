@@ -58,20 +58,18 @@ esp_err_t nvs_config_load(void)
 
     err = ESP_OK;
 
-    // A device is "configured" only once both name and Scrypted URL are set.
-    if (st->viewport_name[0] && st->scrypted_url[0]) {
-        st->configured = true;
-        st->state      = VIEWPORT_STATE_ASLEEP;  // configured devices boot asleep
-        ESP_LOGI(TAG, "loaded config: viewport=%s scrypted=%s "
-                      "idle_ms=%u orient=%s bright=%u",
-                 st->viewport_name, st->scrypted_url,
-                 (unsigned)st->idle_timeout_ms,
-                 st->orientation == VIEWPORT_ORIENTATION_LANDSCAPE
-                     ? "landscape" : "portrait",
-                 st->brightness);
-    } else {
-        ESP_LOGI(TAG, "partial config in NVS — viewport or scrypted URL still missing");
-    }
+    // "Configured" = a scrypted URL has been registered. viewport_name
+    // always has a value (MAC-derived default seeded in viewport_state_init).
+    st->configured = (st->scrypted_url[0] != '\0');
+    ESP_LOGI(TAG, "loaded config: viewport=%s scrypted=%s "
+                  "idle_ms=%u orient=%s bright=%u (%s)",
+             st->viewport_name,
+             st->scrypted_url[0] ? st->scrypted_url : "(none)",
+             (unsigned)st->idle_timeout_ms,
+             st->orientation == VIEWPORT_ORIENTATION_LANDSCAPE
+                 ? "landscape" : "portrait",
+             st->brightness,
+             st->configured ? "configured" : "no scrypted URL");
 
 done:
     viewport_state_unlock();

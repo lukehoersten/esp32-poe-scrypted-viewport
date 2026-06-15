@@ -39,9 +39,8 @@ static esp_err_t state_get_handler(httpd_req_t *req)
                               : (int64_t)((now_us - (uint64_t)st->last_frame_us) / 1000);
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "name",
-        st->viewport_name[0] ? cJSON_CreateString(st->viewport_name)
-                             : cJSON_CreateNull());
+    cJSON_AddStringToObject(root, "name", st->viewport_name);
+    cJSON_AddStringToObject(root, "mac",  st->mac_str);
     cJSON_AddStringToObject(root, "version", VIEWPORT_VERSION);
     cJSON_AddBoolToObject  (root, "configured", st->configured);
     cJSON_AddStringToObject(root, "state",
@@ -81,9 +80,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     viewport_state_t *st = viewport_state_get();
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "viewport",
-        st->viewport_name[0] ? cJSON_CreateString(st->viewport_name)
-                             : cJSON_CreateNull());
+    cJSON_AddStringToObject(root, "viewport", st->viewport_name);
     cJSON_AddItemToObject(root, "scrypted",
         st->scrypted_url[0]  ? cJSON_CreateString(st->scrypted_url)
                              : cJSON_CreateNull());
@@ -233,8 +230,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         st->brightness = bright;
     }
 
-    // A configured device has both a viewport name and a scrypted URL.
-    st->configured = (st->viewport_name[0] && st->scrypted_url[0]);
+    // "Configured" means a scrypted URL has been registered — that's
+    // what gates outbound POSTs and the loading-vs-info screen content
+    // choice. The viewport_name always has a value (MAC-derived default
+    // until POST /config overrides), so it doesn't factor in here.
+    st->configured = (st->scrypted_url[0] != '\0');
 
     viewport_state_unlock();
 

@@ -27,11 +27,6 @@ esp_err_t display_set_brightness(uint8_t brightness_0_100);
 esp_err_t display_sleep(void);
 esp_err_t display_wake(void);
 
-// Pulse the touch IC's reset line (PC_RST_TP_N) via the panel MCU. Used
-// by touch_init() when the FT5426 boots into a wedged state and refuses
-// to leave dev_mode=0xff.
-esp_err_t display_touch_reset_pulse(void);
-
 // Blit an RGB565 source image to the panel, applying the current
 // orientation. Source dimensions must match the effective resolution:
 //   portrait  -> src is 480x800 (rotated 90° CW into the 800x480 panel)

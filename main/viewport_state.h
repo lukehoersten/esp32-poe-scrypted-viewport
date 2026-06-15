@@ -20,7 +20,8 @@ typedef enum {
 // Read-mostly snapshot of device state used by /state. Counters are
 // updated under a mutex by the modules that own them.
 typedef struct {
-    char     viewport_name[64];         // empty before /config
+    char     mac_str[18];               // "aa:bb:cc:dd:ee:ff" — populated at init
+    char     viewport_name[64];         // MAC-derived default; can be overridden via /config
     char     scrypted_url[256];         // empty before /config
     bool     configured;
     viewport_run_state_t state;

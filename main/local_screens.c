@@ -199,6 +199,7 @@ esp_err_t local_screens_show_info(void)
     // is on a 3 KiB stack and can't carry ~1.6 KiB of locals here. Single
     // caller protected by display ownership, so static is fine.
     static char vp_name[64];
+    static char mac_str[18];
     static char scrypt[256];
     static char lines[INFO_MAX_LINES][INFO_LINE_BYTES];
     bool configured;
@@ -212,8 +213,10 @@ esp_err_t local_screens_show_info(void)
     viewport_state_lock();
     viewport_state_t *st = viewport_state_get();
     strncpy(vp_name, st->viewport_name, sizeof(vp_name));
+    strncpy(mac_str, st->mac_str,       sizeof(mac_str));
     strncpy(scrypt,  st->scrypted_url,  sizeof(scrypt));
     vp_name[sizeof(vp_name) - 1] = '\0';
+    mac_str[sizeof(mac_str) - 1] = '\0';
     scrypt[sizeof(scrypt)   - 1] = '\0';
     configured = st->configured;
     state      = st->state;
@@ -237,8 +240,7 @@ esp_err_t local_screens_show_info(void)
     // 8-char label is prefixed. Long names get visibly truncated; ok for
     // an info dump on a 480-wide screen.
     char host[32];
-    if (vp_name[0]) snprintf(host, sizeof(host), "viewport-%.15s.local", vp_name);
-    else            snprintf(host, sizeof(host), "viewport.local");
+    snprintf(host, sizeof(host), "viewport-%.15s.local", vp_name);
 
     char scrypt_short[32];
     if (!scrypt[0]) {
@@ -292,7 +294,8 @@ esp_err_t local_screens_show_info(void)
             snprintf(lines[n_lines++], INFO_LINE_BYTES, fmt, ##__VA_ARGS__); \
     } while (0)
 
-    ADD("name    %s",  vp_name[0] ? vp_name : "unset");
+    ADD("name    %s",  vp_name);
+    ADD("mac     %s",  mac_str);
     ADD("host    %s",  host);
     ADD("ip      %s",  (ip && ip[0]) ? ip : "no network");
     ADD("state   %s",  state_str);
