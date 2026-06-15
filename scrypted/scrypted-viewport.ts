@@ -186,6 +186,20 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 type: "number",
                 value: this.frameIntervalMs,
             } as any,
+            {
+                group: "Actions",
+                key: "action_wake",
+                title: "Wake now",
+                description: "POST /state {wake} to the device — turns the panel on and starts streaming the bound camera. Bypasses camera-event triggers.",
+                type: "button",
+            } as any,
+            {
+                group: "Actions",
+                key: "action_sleep",
+                title: "Sleep now",
+                description: "POST /state {sleep} and stop the active stream.",
+                type: "button",
+            } as any,
         ];
 
         // Live device snapshot: GET /state + /config in parallel with a
@@ -226,6 +240,24 @@ class Viewport extends ScryptedDeviceBase implements Settings {
 
     async putSetting(key: string, value: SettingValue) {
         if (key.startsWith("_")) return;                 // ignore read-only status fields
+        if (key === "action_wake" || key === "action_sleep") {
+            // Manual override from the Scrypted UI. Wake also starts a
+            // stream so the user sees the camera immediately; Sleep
+            // tears down the live ffmpeg and POSTs sleep.
+            if (!this.host) return;
+            if (key === "action_wake") {
+                if (!this.provider.streams.has(this.name) &&
+                    !this.provider.streamStarting.has(this.nativeId!)) {
+                    this.provider.streamStarting.add(this.nativeId!);
+                    this.provider.startStream(this)
+                        .catch(e => this.console.error("manual wake failed", e))
+                        .finally(() => this.provider.streamStarting.delete(this.nativeId!));
+                }
+            } else {
+                this.provider.stopStream(this.name, /*sendSleep=*/ true);
+            }
+            return;
+        }
         if (key === "triggers") {
             // multi-select arrives as array; serialise to JSON for storage
             this.storage.setItem("triggers", JSON.stringify(Array.isArray(value) ? value : []));
@@ -245,7 +277,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister>(); // nativeId -> camera event listener
-    private streams = new Map<string, {                           // viewport name -> stream control
+    streams = new Map<string, {                                   // viewport name -> stream control (accessed by Viewport.putSetting for manual wake/sleep)
         timeout:   NodeJS.Timeout;
         abort:     AbortController;       // also tears down the ffmpeg child via its listener
         interval?: NodeJS.Timeout;        // legacy snapshot-poll mode
@@ -519,7 +551,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // previous one and saturates the firmware's httpd. If a stream is
     // already live we just leave it running — the per-stream timeout
     // anchored to the event still fires correctly.
-    private streamStarting = new Set<string>();
+    streamStarting = new Set<string>();
 
     private handleCameraEvent(v: Viewport, details: any, data: any) {
         const iface = details.eventInterface;
@@ -544,7 +576,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             .finally(() => this.streamStarting.delete(v.nativeId!));
     }
 
-    private async startStream(v: Viewport) {
+    async startStream(v: Viewport) {
         // Race rule: cancel pending operations on every callback before
         // beginning a fresh stream.
         this.stopStream(v.name, /*sendSleep=*/ false);
@@ -734,7 +766,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.streams.set(v.name, { timeout, abort });
     }
 
-    private stopStream(name: string, sendSleep = true) {
+    stopStream(name: string, sendSleep = true) {
         const s = this.streams.get(name);
         if (!s) return;
         s.abort.abort();   // aborts the in-flight ffmpeg child via its listener
