@@ -797,9 +797,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             if (window > 0 && (sentFrames > 0 || droppedFrames > 0)) {
                 const sentRate   = sentFrames / window;
                 const targetRate = 1000 / v.frameIntervalMs;
-                if (sentRate < targetRate * 0.75) {
-                    const dropRate = droppedFrames / window;
-                    this.console.log(`"${v.name}": delivered ~${sentRate.toFixed(1)} fps vs target ${targetRate.toFixed(1)} fps over the last ${window.toFixed(1)}s (dropped ~${dropRate.toFixed(1)} fps — in-flight HTTP POST hadn't returned when ffmpeg emitted the next frame; raise frame_interval_ms slightly to flatten this)`);
+                const dropRate   = droppedFrames / window;
+                // Two distinct symptoms to call out:
+                //  - drops > 25% of target → backpressure: HTTP POST or
+                //    panel is the bottleneck, advice is to raise interval.
+                //  - delivered < 60% AND drops are negligible → ffmpeg's
+                //    fps filter / camera substream simply isn't producing
+                //    the requested rate. Raising interval won't help;
+                //    surface a different message.
+                if (dropRate > targetRate * 0.25) {
+                    this.console.log(`"${v.name}": backpressure — delivered ~${sentRate.toFixed(1)} fps vs target ${targetRate.toFixed(1)} fps, dropped ~${dropRate.toFixed(1)} fps over ${window.toFixed(1)}s (POST stack can't keep up; raise frame_interval_ms slightly to flatten this)`);
+                } else if (sentRate < targetRate * 0.6 && sentRate > 0) {
+                    this.console.log(`"${v.name}": source-limited — delivered ~${sentRate.toFixed(1)} fps vs target ${targetRate.toFixed(1)} fps over ${window.toFixed(1)}s (camera substream / ffmpeg fps filter producing below requested rate; raising frame_interval_ms won't help)`);
                 }
                 droppedFrames = 0;
                 sentFrames    = 0;
