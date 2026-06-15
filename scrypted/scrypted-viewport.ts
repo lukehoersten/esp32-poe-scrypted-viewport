@@ -785,11 +785,19 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // Periodic skip-rate log so the operator sees the effective fps
         // and can decide whether to bump frame_interval_ms up or down.
+        // Only log if drops exceed 25% of the configured rate — below
+        // that it's just ffmpeg's fps filter emitting timestamp-clumped
+        // pairs that our single-flight guard correctly drops without
+        // any actual playback impact.
         const skipLogger = setInterval(() => {
             const now = Date.now();
-            if (droppedFrames > 0) {
-                const window = (now - lastLogUs) / 1000;
-                this.console.log(`"${v.name}": dropping ~${(droppedFrames / window).toFixed(1)} fps over the last ${window.toFixed(1)}s (in-flight HTTP POST hadn't returned when ffmpeg emitted the next frame; raise frame_interval_ms slightly to flatten this)`);
+            const window = (now - lastLogUs) / 1000;
+            if (droppedFrames > 0 && window > 0) {
+                const dropRate = droppedFrames / window;
+                const targetRate = 1000 / v.frameIntervalMs;
+                if (dropRate > targetRate * 0.25) {
+                    this.console.log(`"${v.name}": dropping ~${dropRate.toFixed(1)} fps over the last ${window.toFixed(1)}s (in-flight HTTP POST hadn't returned when ffmpeg emitted the next frame; raise frame_interval_ms slightly to flatten this)`);
+                }
                 droppedFrames = 0;
                 lastLogUs     = now;
             }
