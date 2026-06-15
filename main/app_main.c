@@ -102,5 +102,15 @@ static void display_setup_task(void *arg)
     }
 
     ESP_LOGI(TAG, "display subsystems [%s] up", flags);
+
+    // Wake the display on boot. Empirically the FT5426 touch IC only
+    // reports contacts when the LCD is actively streaming with the
+    // backlight on — booting straight into ASLEEP leaves taps silently
+    // unread. The idle timer (idle_timeout_ms) puts the device back to
+    // sleep on its own if nothing happens.
+    if (dsp_err == ESP_OK) {
+        state_machine_set(VIEWPORT_STATE_AWAKE);
+    }
+
     vTaskDelete(NULL);
 }
