@@ -429,6 +429,14 @@ static inline void rgb565_to_rgb888(uint16_t px, uint8_t *out)
     out[2] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);  // R
 }
 
+esp_err_t display_present_bgr888(const void *bgr888)
+{
+    if (!s_up) return ESP_ERR_INVALID_STATE;
+    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
+                                     bgr888);
+}
+
 esp_err_t display_present_rgb565(const uint16_t *src,
                                  uint16_t        src_w,
                                  uint16_t        src_h)

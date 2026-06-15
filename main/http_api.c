@@ -53,6 +53,12 @@ static esp_err_t state_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "decode_errors", (double)st->decode_errors);
     cJSON_AddNumberToObject(root, "state_post_failures", (double)st->state_post_failures);
     cJSON_AddStringToObject(root, "resolution", viewport_state_resolution_str());
+    // Panel-native dimensions are stable per-board (Scrypted uses them as
+    // the ffmpeg scale target; orientation drives whether to transpose
+    // before scaling). Separate from "resolution" which is the effective
+    // dimensions after the orientation rotation.
+    cJSON_AddNumberToObject(root, "panel_width",  (double)VIEWPORT_PANEL_WIDTH);
+    cJSON_AddNumberToObject(root, "panel_height", (double)VIEWPORT_PANEL_HEIGHT);
     cJSON_AddStringToObject(root, "ip", net_eth_get_ip_str());
     cJSON_AddNumberToObject(root, "free_heap",
         (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -362,19 +368,22 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return respond_status(req, "400 Bad Request", "JPEG decode failed");
     }
 
-    uint16_t want_w, want_h;
-    viewport_state_effective_dims(&want_w, &want_h);
-    if (w != want_w || h != want_h) {
+    // /frame always expects the panel-native 800x480 BGR888 layout —
+    // Scrypted does the rotation + scale, the firmware just decodes and
+    // paints. Orientation lives in viewport_state for /state reporting
+    // and the Scrypted-side ffmpeg pipeline only.
+    if (w != VIEWPORT_PANEL_WIDTH || h != VIEWPORT_PANEL_HEIGHT) {
         viewport_state_lock();
         viewport_state_get()->decode_errors++;
         viewport_state_unlock();
         jpeg_decoder_unlock();
         char msg[80];
-        snprintf(msg, sizeof(msg), "expected %ux%u, got %ux%u", want_w, want_h, w, h);
+        snprintf(msg, sizeof(msg), "expected %ux%u, got %ux%u",
+                 VIEWPORT_PANEL_WIDTH, VIEWPORT_PANEL_HEIGHT, w, h);
         return respond_status(req, "400 Bad Request", msg);
     }
 
-    esp_err_t paint_err = display_present_rgb565((const uint16_t *)rgb, w, h);
+    esp_err_t paint_err = display_present_bgr888(rgb);
     if (paint_err != ESP_OK) {
         jpeg_decoder_unlock();
         return respond_status(req, "500 Internal Server Error", "display paint failed");

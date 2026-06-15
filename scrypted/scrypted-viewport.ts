@@ -509,8 +509,36 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         const cam: any = systemManager.getDeviceById(v.cameraId);
         if (!cam) return;
-        const w   = v.orientation === "portrait" ? 480 : 800;
-        const h   = v.orientation === "portrait" ? 800 : 480;
+
+        // Fetch the panel's native dimensions from the firmware and
+        // cache them on the viewport's storage. Falls back to 800x480
+        // if /state is unreachable (e.g. mid-reboot). Panel dims never
+        // change for a given device so this only really needs to run
+        // once per discovery; refreshing on every wake costs ~5 ms and
+        // self-heals if the firmware is replaced.
+        const pw = parseInt(v.storage.getItem("panel_w") || "0", 10);
+        const ph = parseInt(v.storage.getItem("panel_h") || "0", 10);
+        let panelW = pw || 800;
+        let panelH = ph || 480;
+        try {
+            const st = await fetch(`http://${v.host}/state`, { signal: AbortSignal.timeout(1500) }).then(r => r.json());
+            if (st?.panel_width && st?.panel_height) {
+                panelW = Number(st.panel_width);
+                panelH = Number(st.panel_height);
+                v.storage.setItem("panel_w", String(panelW));
+                v.storage.setItem("panel_h", String(panelH));
+            }
+        } catch { /* keep cached values */ }
+
+        // Always send panel-native dimensions (panelW x panelH). For a
+        // portrait viewport we scale to the logical (panelH x panelW)
+        // target then transpose 90° CW so the buffer that arrives at the
+        // panel is already in the right rotation. The firmware never
+        // touches pixels — the hardware JPEG decoder writes BGR888
+        // straight into a DMA buffer that gets handed to the DSI engine.
+        const vf = v.orientation === "portrait"
+            ? `scale=${panelH}:${panelW}:flags=lanczos,transpose=1`   // 90° CW → panelW x panelH
+            : `scale=${panelW}:${panelH}:flags=lanczos`;
         const fps = Math.max(1, Math.round(1000 / v.frameIntervalMs));
 
         // Pull the camera's video stream, convert to ffmpeg input args, and
@@ -548,7 +576,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
             ...(ffmpegInput.inputArguments || []),
             "-an", "-sn",
-            "-vf", `scale=${w}:${h}:flags=lanczos,fps=${fps}`,
+            "-vf", `${vf},fps=${fps}`,
             "-c:v", "mjpeg", "-q:v", "2",
             "-f", "image2pipe", "-flush_packets", "1",
             "pipe:1",
