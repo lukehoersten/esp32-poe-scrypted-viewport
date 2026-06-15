@@ -29,6 +29,14 @@ CONFIG_LWIP_IPV4=y
 CONFIG_LWIP_IPV6=y
 CONFIG_MDNS_MAX_INTERFACES=1
 
+# TCP receive-window tuning attempted (WND/SND_BUF=32k, RECVMBOX=16,
+# SACK on). Measured net-negative on the /frame path: ttfb regressed
+# from ~350µs to ~1.2ms, body unchanged, and periodic 250+ms stalls
+# appeared. Reason: Scrypted's per-frame fetch() opens a fresh TCP
+# socket each time, so the larger window just slows slow-start.
+# Reverted; revisit once we switch to HTTP keep-alive on the Scrypted
+# side. Keeping the lwIP defaults.
+
 # HTTP server
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512

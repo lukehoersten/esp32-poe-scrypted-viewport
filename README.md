@@ -510,10 +510,10 @@ Network body is now ~85% of every frame; everything else is at or near hardware 
 
 ### Current backlog, in rough priority order
 
-1. **Network body shrink** — *the only remaining big lever*. The firmware is reading ~215 KB JPEGs at ~45 Mbit/s effective on a 100 Mbit Ethernet link — that's about 45% of theoretical. Two routes:
-   - **TCP tuning in `sdkconfig`**: bump `CONFIG_LWIP_TCP_WND_DEFAULT` and `CONFIG_LWIP_TCP_RCVMBOX_SIZE`, plus enable `CONFIG_LWIP_TCP_RTO_MIN` adjustments. With BDP at LAN-1 ms × 100 Mbit ≈ 12.5 KB, the default 5.7 KB window is half what we need; doubling it should add 30–50% throughput.
+1. **Network body shrink** — *the only remaining big lever*. The firmware reads ~215 KB JPEGs at ~45 Mbit/s effective on a 100 Mbit Ethernet link (~45% of theoretical). Routes ranked by what we've actually tried:
+   - **HTTP keep-alive on the Scrypted side** (untried, recommended next). Currently Scrypted's `fetch` opens a fresh TCP socket per frame; the ~1 ms of slow-start at each connect is more impactful than the receive-window setting.
    - **Per-viewport JPEG quality** (`-q:v` on the ffmpeg side): -q:v 5 halves file size at modest visual cost. `body` halves with it.
-   Combined, total → ~22 ms → **~45 fps ceiling**.
+   - ~~TCP window tuning (`CONFIG_LWIP_TCP_WND_DEFAULT` etc.)~~ — *tried and reverted*. Bumping WND/SND_BUF to 32 KB regressed `ttfb` from ~350 µs to ~1.2 ms and added periodic 250 ms stalls. The per-frame fresh-socket pattern makes larger windows actually slow things down via slow-start. Revisit only after keep-alive lands.
 2. **OTA firmware updates** — *low effort, gateway to fleet ops*. Partition table already has `ota_0` / `ota_1`. Add `esp_https_ota` (or a one-shot `POST /firmware` using `esp_ota_*`) so reflashing doesn't require USB. Critical once you have more than one viewport in production.
 3. **Task watchdog + crash counters** — *low effort*. Enable the ESP-IDF task watchdog, surface its bite count in `/state` alongside the existing `decode_errors` / `state_post_failures`. Good hygiene.
 4. **Multi-camera per viewport** — *medium effort*. Let one viewport listen to events from N cameras, picking which one to stream based on which fired. Useful for "show whichever doorbell rang" or zone monitoring.
