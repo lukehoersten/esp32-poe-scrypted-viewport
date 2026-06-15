@@ -240,10 +240,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister>(); // nativeId -> camera event listener
     private streams = new Map<string, {                           // viewport name -> stream control
-        timeout: NodeJS.Timeout;
-        abort:   AbortController;
-        proc?:   any;            // ffmpeg child process (live-stream mode)
-        interval?: NodeJS.Timeout; // legacy snapshot-poll mode
+        timeout:   NodeJS.Timeout;
+        abort:     AbortController;       // also tears down the ffmpeg child via its listener
+        interval?: NodeJS.Timeout;        // legacy snapshot-poll mode
     }>();
     private scryptedBase = "";
 
@@ -571,16 +570,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             "ffmpeg";
 
         const abort = new AbortController();
-        const proc = spawn(ffmpegPath, [
-            "-hide_banner", "-loglevel", "error",
-            "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
-            ...(ffmpegInput.inputArguments || []),
-            "-an", "-sn",
-            "-vf", `${vf},fps=${fps}`,
-            "-c:v", "mjpeg", "-q:v", "2",
-            "-f", "image2pipe", "-flush_packets", "1",
-            "pipe:1",
-        ]);
 
         // Single-flight: only one POST /frame in flight at a time. The
         // firmware's JPEG decoder mutex returns 503 otherwise; we just
@@ -590,50 +579,86 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         let lastLogUs = Date.now();
         let workBuf: Buffer = Buffer.alloc(0);
 
-        proc.stdout.on("data", (chunk: Buffer) => {
-            if (abort.signal.aborted) return;
-            workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
-            // Frame each complete JPEG (SOI = 0xFF 0xD8 ... EOI = 0xFF 0xD9).
-            // ffmpeg with image2pipe + mjpeg writes back-to-back complete
-            // JPEGs so we just split on EOI.
-            while (true) {
-                const eoi = workBuf.indexOf(Buffer.from([0xff, 0xd9]));
-                if (eoi < 0) break;
-                const frame = workBuf.subarray(0, eoi + 2);
-                workBuf = workBuf.subarray(eoi + 2);
-                if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
+        // Auto-restart accounting: cameras occasionally end their RTSP
+        // stream mid-event (network blip, source rotation, etc.) and
+        // ffmpeg exits clean. If the stream-timeout hasn't fired yet
+        // we respawn so the panel doesn't freeze on a stale frame.
+        // Capped at 5 restarts per 60s — past that we give up and
+        // wait for the next camera event.
+        let currentProc: any = null;
+        let restartCount  = 0;
+        let restartWindow = Date.now();
 
-                if (inFlight) { droppedFrames++; continue; }
-                inFlight = true;
-                this.pushStreamFrame(v, frame, abort)
-                    .catch(e => {
-                        if (abort.signal.aborted) return;
-                        const err = (e as Error);
-                        const cause = (err as any)?.cause?.code || "";
-                        this.console.warn(`pushStreamFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
-                    })
-                    .finally(() => { inFlight = false; });
-            }
-        });
-
-        proc.stderr.on("data", (chunk: Buffer) => {
-            // SIGTERM teardown flushes a half-written packet and ffmpeg
-            // emits "Immediate exit requested" / "Error muxing a packet"
-            // to stderr. Skip the noise once we're aborting.
+        const spawnFfmpeg = () => {
             if (abort.signal.aborted) return;
-            const text = chunk.toString("utf8").trim();
-            if (!text) return;
-            if (text.includes("Immediate exit requested")) return;
-            this.console.warn(`ffmpeg "${v.name}": ${text}`);
-        });
-        proc.on("error", (e: any) => {
-            if (!abort.signal.aborted) this.console.warn(`ffmpeg "${v.name}" spawn error:`, e.message);
-        });
-        proc.on("close", (code: number) => {
-            if (!abort.signal.aborted) this.console.log(`ffmpeg "${v.name}" exited (code=${code})`);
-        });
+            workBuf = Buffer.alloc(0);   // reset framer state on each respawn
+            const p = spawn(ffmpegPath, [
+                "-hide_banner", "-loglevel", "error",
+                "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
+                ...(ffmpegInput.inputArguments || []),
+                "-an", "-sn",
+                "-vf", `${vf},fps=${fps}`,
+                "-c:v", "mjpeg", "-q:v", "2",
+                "-f", "image2pipe", "-flush_packets", "1",
+                "pipe:1",
+            ]);
+            currentProc = p;
+
+            p.stdout.on("data", (chunk: Buffer) => {
+                if (abort.signal.aborted) return;
+                workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
+                while (true) {
+                    const eoi = workBuf.indexOf(Buffer.from([0xff, 0xd9]));
+                    if (eoi < 0) break;
+                    const frame = workBuf.subarray(0, eoi + 2);
+                    workBuf = workBuf.subarray(eoi + 2);
+                    if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
+
+                    if (inFlight) { droppedFrames++; continue; }
+                    inFlight = true;
+                    this.pushStreamFrame(v, frame, abort)
+                        .catch(e => {
+                            if (abort.signal.aborted) return;
+                            const err = (e as Error);
+                            const cause = (err as any)?.cause?.code || "";
+                            this.console.warn(`pushStreamFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
+                        })
+                        .finally(() => { inFlight = false; });
+                }
+            });
+
+            p.stderr.on("data", (chunk: Buffer) => {
+                if (abort.signal.aborted) return;
+                const text = chunk.toString("utf8").trim();
+                if (!text) return;
+                if (text.includes("Immediate exit requested")) return;
+                this.console.warn(`ffmpeg "${v.name}": ${text}`);
+            });
+            p.on("error", (e: any) => {
+                if (!abort.signal.aborted) this.console.warn(`ffmpeg "${v.name}" spawn error:`, e.message);
+            });
+            p.on("close", (code: number) => {
+                if (abort.signal.aborted) return;
+                const now = Date.now();
+                if (now - restartWindow > 60_000) {  // rolling 60s window
+                    restartCount  = 0;
+                    restartWindow = now;
+                }
+                if (restartCount >= 5) {
+                    this.console.warn(`ffmpeg "${v.name}" exited (code=${code}) and has restarted ≥5x in the last 60s — giving up; next camera event will retry`);
+                    this.stopStream(v.name);
+                    return;
+                }
+                restartCount++;
+                this.console.log(`ffmpeg "${v.name}" exited (code=${code}) — respawning (#${restartCount}/5 within window)`);
+                setTimeout(spawnFfmpeg, 250);
+            });
+        };
+
+        spawnFfmpeg();
+
         abort.signal.addEventListener("abort", () => {
-            try { proc.kill("SIGTERM"); } catch {}
+            try { currentProc?.kill("SIGTERM"); } catch {}
         });
 
         // Periodic skip-rate log so the operator sees the effective fps
@@ -655,16 +680,19 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.stopStream(v.name);
         }, timeoutMs);
 
-        this.streams.set(v.name, { timeout, abort, proc });
+        // The latest spawned ffmpeg child is held in the spawnFfmpeg
+        // closure (currentProc); the abort signal listener kills it on
+        // shutdown. We don't store the proc in the streams entry
+        // because it can change across auto-restarts.
+        this.streams.set(v.name, { timeout, abort });
     }
 
     private stopStream(name: string, sendSleep = true) {
         const s = this.streams.get(name);
         if (!s) return;
-        s.abort.abort();
+        s.abort.abort();   // aborts the in-flight ffmpeg child via its listener
         if (s.interval) clearInterval(s.interval);
         clearTimeout(s.timeout);
-        if (s.proc) { try { s.proc.kill("SIGTERM"); } catch {} }
         this.streams.delete(name);
         if (sendSleep) {
             const v = this.findByName(name);
