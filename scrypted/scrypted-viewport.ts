@@ -17,7 +17,7 @@
 // 3. Paste this entire file. Save.
 // 4. Open the new "Scrypted Viewport" device. Click "+ Add Device" on
 //    its page to create a viewport binding:
-//       Viewport name    e.g. "mudroom"  (becomes the routing key + mDNS name)
+//       Viewport name    e.g. "mudroom"  (friendly routing key)
 //       IP or hostname   e.g. "192.168.1.42"
 //       Camera           pick from the dropdown of Camera devices
 //       Orientation      portrait (480×800) or landscape (800×480)
@@ -30,7 +30,8 @@
 // ---------------------------------------------------------------
 // - Snapshot-rate (~1 fps) via Camera.takePicture(). Live-rate MJPEG over
 //   POST /stream is v2.
-// - Manual IP per viewport (no mDNS-SD discovery). Use a DHCP reservation.
+// - Manual IP per viewport (see README for how to find it via mDNS from
+//   your shell). DHCP reservation recommended so the IP stays stable.
 // - Camera must respect picture.width/height OR be paired with a snapshot
 //   plugin that resizes. Otherwise /frame returns 400.
 
@@ -328,14 +329,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             {
                 key: "name",
                 title: "Viewport name",
-                description: 'Routing key sent back in callbacks + basis for the device\'s mDNS hostname (viewport-<name>.local). Lowercase, no spaces. Example: "mudroom".',
+                description: 'Friendly routing key sent back in callbacks. Lowercase, no spaces. Example: "mudroom".',
                 placeholder: "mudroom",
             },
             {
                 key: "host",
-                title: "IP or hostname (optional)",
-                description: "Leave blank to auto-resolve via mDNS (viewport-<name>.local). Set manually if mDNS doesn't reach this network.",
-                placeholder: "auto-resolve via mDNS",
+                title: "IP or hostname",
+                description: "Where the firmware lives on the LAN — either an IP or `viewport-<mac>.local` (the device prints its own MAC on the info screen). The script POSTs to this string directly; no auto-resolution.",
+                placeholder: "192.168.1.42",
             },
             {
                 key: "cameraId",
@@ -382,7 +383,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.childIds = [...this.childIds, nativeId];
         this.console.log(`created viewport "${name}" (${nativeId})`);
 
-        // Kick off the first register cycle (mDNS resolve + POST /config).
+        // Kick off the first register cycle (POST /config to the device).
         // Fire-and-forget — the new device shows up immediately either way.
         const child = await this.getDevice(nativeId);
         if (child) this.registerViewport(child).catch(() => {});
