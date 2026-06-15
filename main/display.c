@@ -218,6 +218,22 @@ static esp_err_t touch_release_reset(void)
         PC_LED_EN | PC_RST_TP_N | PC_RST_LCD_N | PC_RST_BRIDGE_N);
 }
 
+// Hard-reset the touch IC: drop PC_RST_TP_N for ~20 ms, then release.
+// touch_init() calls this if its dev_mode read keeps returning 0xff —
+// usually unwedges a stuck FT5426 without needing a power cycle.
+esp_err_t display_touch_reset_pulse(void)
+{
+    if (!s_panel_mcu) return ESP_ERR_INVALID_STATE;
+    // Hold touch in reset (clear PC_RST_TP_N), keep everything else as-is.
+    esp_err_t err = mcu_write_u8(REG_PORTC,
+        PC_LED_EN | PC_RST_LCD_N | PC_RST_BRIDGE_N);
+    if (err != ESP_OK) return err;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    err = touch_release_reset();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return err;
+}
+
 // ============================================================================
 // TC358762 bridge configuration (DSI Generic Long Write packets)
 // Sequence mirrors Linux drivers/gpu/drm/bridge/tc358762.c tc358762_init().

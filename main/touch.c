@@ -67,6 +67,10 @@ static void touch_task(void *arg)
 
         if (ft_read(FT_REG_DEV_MODE, buf, sizeof(buf)) != ESP_OK) continue;
         uint8_t touches = buf[FT_REG_TD_STATUS] & 0x0F;
+        // FT5x06 supports max 5 simultaneous points. A reading above that
+        // is bogus (typically the bus is parking 0xff because the IC isn't
+        // responding) — drop the cycle to avoid faking a phantom press.
+        if (touches > 5) continue;
         uint64_t now    = (uint64_t)esp_timer_get_time();
 
         if (touches > 0) {
@@ -112,11 +116,32 @@ esp_err_t touch_init(void)
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &cfg, &s_dev),
                        TAG, "i2c add FT5426");
 
-    uint8_t dev_mode = 0;
-    esp_err_t err = ft_read(FT_REG_DEV_MODE, &dev_mode, 1);
+    // FT5426 sometimes returns 0xff on the first read after its reset is
+    // released (especially on cold boot before its internal firmware has
+    // finished booting). 0xff causes the polling loop to misread 15
+    // touches forever. Two-stage recovery: short wait + retry, then a
+    // hard reset pulse via the panel MCU if that still doesn't help.
+    uint8_t dev_mode = 0xff;
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        for (int i = 0; i < 10; ++i) {
+            err = ft_read(FT_REG_DEV_MODE, &dev_mode, 1);
+            if (err == ESP_OK && dev_mode != 0xff) break;
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        if (err == ESP_OK && dev_mode != 0xff) break;
+        if (attempt == 0) {
+            ESP_LOGW(TAG, "FT5426 stuck at 0xff — pulsing PC_RST_TP_N");
+            display_touch_reset_pulse();
+        }
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "FT5426 @0x38 unreachable (%s)", esp_err_to_name(err));
         return err;
+    }
+    if (dev_mode == 0xff) {
+        ESP_LOGW(TAG, "FT5426 still stuck after hard reset — touch will "
+                      "not register; tap/long-press disabled this boot");
     }
     ESP_LOGI(TAG, "FT5426 ack'd (dev_mode=0x%02x); "
                   "tap=toggle wake/sleep, %dms hold=info overlay",
