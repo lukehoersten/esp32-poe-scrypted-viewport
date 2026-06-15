@@ -55,12 +55,14 @@ esp_err_t state_machine_set(viewport_run_state_t target)
 
     if (target == VIEWPORT_STATE_AWAKE) {
         if (display_is_up()) {
-            display_wake();
-            // Content choice: a configured device shows "Loading…" until
+            // Paint the placeholder BEFORE turning the backlight on so the
+            // user never glimpses the stale /frame contents from the
+            // previous wake cycle. Configured devices show "Loading…" until
             // Scrypted pushes a /frame; a device with no scrypted URL
             // shows the info screen since there's no Scrypted to push.
             if (configured) local_screens_show_loading();
             else            local_screens_show_info();
+            display_wake();
         }
         arm_idle_timer(idle_ms);
         ESP_LOGI(TAG, "AWAKE (%s)", configured ? "configured" : "no scrypted URL");
