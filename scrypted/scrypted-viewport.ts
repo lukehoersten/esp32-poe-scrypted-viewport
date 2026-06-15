@@ -70,7 +70,7 @@ type SettingValue            = any;
 
 // Tuning constants. Frame interval is also exposed on the parent's
 // Settings page so it can be tweaked without editing the script.
-const DEFAULT_FRAME_INTERVAL_MS  = 1_000;
+const DEFAULT_FRAME_INTERVAL_MS  = 500;   // ~2 fps — snapshot-based; cameras typically can't sustain faster
 const REREGISTER_INTERVAL_MS     = 5 * 60_000;
 const HTTP_TIMEOUT_MS            = 1_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
