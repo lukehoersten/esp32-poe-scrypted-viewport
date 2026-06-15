@@ -3,6 +3,8 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "display.h"
 #include "local_screens.h"
@@ -55,13 +57,15 @@ esp_err_t state_machine_set(viewport_run_state_t target)
 
     if (target == VIEWPORT_STATE_AWAKE) {
         if (display_is_up()) {
-            // Paint the placeholder BEFORE turning the backlight on so the
-            // user never glimpses the stale /frame contents from the
-            // previous wake cycle. Configured devices show "Loading…" until
-            // Scrypted pushes a /frame; a device with no scrypted URL
-            // shows the info screen since there's no Scrypted to push.
+            // Paint the placeholder BEFORE turning the backlight on, then
+            // wait ~33 ms (two 60 Hz refresh cycles) so the DSI engine
+            // actually pushes the new framebuffer to the panel before the
+            // backlight comes up. Without the delay, esp_lcd_panel_draw_bitmap
+            // returns before the panel has been refreshed and the user sees
+            // a flash of the previous /frame's contents.
             if (configured) local_screens_show_loading();
             else            local_screens_show_info();
+            vTaskDelay(pdMS_TO_TICKS(33));
             display_wake();
         }
         arm_idle_timer(idle_ms);
