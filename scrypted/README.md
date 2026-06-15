@@ -34,22 +34,26 @@ Click **Create**. The script immediately POSTs `/config` to the device. Within a
 
 ## Editing a viewport
 
-Open the viewport device's page. It has its own Settings tab with the same four fields, plus two extras:
+Open the viewport device's page → **Settings**. The fields are grouped:
 
-- **Idle timeout (ms)** — sent to the device in `/config`. Both sides time independently. `0` disables the device-side idle timer; non-zero must be ≥ 5000. Default 60000.
+**Binding**
+- **IP or hostname** — where the firmware lives on the LAN.
+- **Camera** — which Scrypted camera drives the wake events + the snapshot source.
+- **Wake triggers** — multi-select of `doorbell`, `motion`, `person`. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap the panel to see the camera). Default: all three on.
+
+**Display**
+- **Orientation** — `portrait` (480×800) or `landscape` (800×480). Sent to the device in `/config`.
 - **Brightness (0–100)** — gamma-corrected on the panel. Default 80.
+- **Idle timeout (ms)** — how long the device stays awake after the last paint before it sleeps itself. `0` disables; non-zero must be ≥ 5000. Default 60000.
+- **Frame push interval (ms)** — how often a JPEG is POSTed during an active stream. 1000 = 1 fps; 100 = 10 fps. Clamped to ≥ 33 ms (~30 fps max). Default 1000.
 
-Changing any setting triggers an immediate re-register and re-subscribes the camera listener if the camera changed.
+**Status (live)** — read-only fields that fetch `/state` + `/config` from the device every time you open the Settings page: name, MAC, IP, awake/asleep, configured flag, uptime, frame counters, error counters, resolution, free heap, free PSRAM, firmware version, and the registered scrypted callback URL. If the device is offline you'll just see "device: offline / unreachable".
+
+Changing any binding setting triggers an immediate re-register + re-subscribes the camera listener if the camera changed.
 
 ## Removing a viewport
 
 Open the viewport device's page → **Settings** menu → **Delete Device**. The script stops any active stream, unsubscribes from the camera, and forgets the binding. The physical device keeps its NVS-stored config until it gets a fresh `/config` from somewhere — to fully wipe it, plug USB and run `idf.py erase-flash` then reflash.
-
-## Global tuning
-
-Open the parent "Scrypted Viewport" device's Settings page:
-
-- **Frame push interval (ms)** — how often a snapshot is pushed during an active stream. 1000 = 1 fps. Lower for faster updates at higher CPU cost.
 
 ## What the script does on each event
 
@@ -85,16 +89,20 @@ That pulls in `@scrypted/sdk` and `@types/node` so the TS server can resolve eve
 - Camera must respect `picture.width` / `picture.height` in `PictureOptions` or be paired with a snapshot plugin that resizes. If the camera returns the wrong size, the device rejects `/frame` with 400 and you'll see warning logs. Workaround: configure the camera plugin's snapshot size, or wait for v2 (FFmpeg-side resize).
 - No retry on transport errors. Best-effort matches the device's own semantics; the next event or callback re-syncs.
 
-## How mDNS auto-resolve works
+## Finding a viewport's IP / hostname
 
-Every time the script registers a viewport (on plugin start, every 5 minutes, on settings change, after a fresh `+ Add Device`), it tries `dns.lookup('viewport-<name>.local')` first. If the OS returns an IP, that IP overwrites the `host` field in the viewport's storage. Subsequent `POST /config` and `POST /frame` use the resolved IP.
+The script does NOT auto-resolve mDNS — it just POSTs to the host string you enter. The host field accepts either an IP or a hostname (the OS resolver handles `.local` lookups inside the Scrypted container).
 
-If the OS resolver doesn't know about `.local`:
-- **macOS**: works out of the box (Bonjour).
-- **Linux**: install `libnss-mdns` and ensure `mdns` is in `/etc/nsswitch.conf`'s `hosts:` line.
-- **Docker**: use `--network host` (Scrypted's recommended setup). Bridge networking breaks `.local` resolution.
+On a fresh device the mDNS hostname is `viewport-<mac>.local` (the MAC with colons stripped). You can read the MAC straight off the device's info screen at boot, or discover it from your shell:
 
-When mDNS doesn't resolve, the script silently falls back to the operator-entered `host`. You can disable mDNS per viewport via the **Auto-resolve via mDNS** toggle on its Settings page.
+| OS | Browse all viewports on the LAN | Resolve a hostname → IP |
+|---|---|---|
+| macOS | `dns-sd -B _scrypted-viewport._tcp local.` | `dns-sd -G v4 viewport-<mac>.local` |
+| Linux (with `avahi`) | `avahi-browse -tr _scrypted-viewport._tcp` | `avahi-resolve -n viewport-<mac>.local` |
+
+Once you've POSTed `/config` with a friendlier name (e.g. `mudroom`) via the kitchen viewport's settings, the device re-advertises as `viewport-mudroom.local` and you can use that instead. The MAC-derived hostname stays available as a fallback.
+
+If Scrypted runs in a Docker container without host networking, `.local` resolution won't reach the LAN — enter a static IP and add a DHCP reservation so it stays stable.
 
 ## End-to-end smoke test
 

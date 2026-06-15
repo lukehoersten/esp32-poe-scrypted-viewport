@@ -53,7 +53,6 @@ declare const log:                any;
 declare const device:             any;
 declare const require:            any;
 
-const dns = require("dns").promises;
 
 // Loose type aliases — purely cosmetic for the rest of the script's
 // signatures, since the runtime values are `any`.
@@ -75,22 +74,6 @@ const REREGISTER_INTERVAL_MS     = 5 * 60_000;
 const HTTP_TIMEOUT_MS            = 1_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
 const DEFAULT_BRIGHTNESS         = 80;
-const MDNS_LOOKUP_TIMEOUT_MS     = 1_500;
-
-// Resolve `viewport-<name>.local` via the OS resolver (Bonjour on macOS,
-// nss-mdns on Linux, host networking on Docker). Returns null on failure or
-// timeout — caller falls back to the operator-entered host.
-async function lookupMdns(hostname: string): Promise<string | null> {
-    try {
-        const lookup = dns.lookup(hostname, { family: 4 });
-        const timeout = new Promise<null>(r => setTimeout(() => r(null), MDNS_LOOKUP_TIMEOUT_MS));
-        const result = await Promise.race([lookup, timeout]);
-        if (!result) return null;
-        return (result as { address: string }).address || null;
-    } catch {
-        return null;
-    }
-}
 
 // ============================================================================
 // Child: one viewport binding
@@ -115,60 +98,126 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const v = this.storage.getItem("brightness");
         return v ? Math.max(0, Math.min(100, parseInt(v, 10) || 0)) : DEFAULT_BRIGHTNESS;
     }
-    get mdnsAuto(): boolean {
-        return this.storage.getItem("mdns_auto") !== "false";  // default true
+    get frameIntervalMs(): number {
+        const v = this.storage.getItem("frame_interval_ms");
+        const parsed = v ? parseInt(v, 10) : NaN;
+        return Number.isFinite(parsed) ? Math.max(33, parsed) : DEFAULT_FRAME_INTERVAL_MS;
+    }
+    // Which camera-event types wake this viewport. Empty = tap-only,
+    // never woken by Scrypted. Default = all three (doorbell + motion +
+    // person detection).
+    get triggers(): Set<string> {
+        const v = this.storage.getItem("triggers");
+        if (v === null) return new Set(["doorbell", "motion", "person"]);
+        try { return new Set(JSON.parse(v)); } catch { return new Set(); }
     }
 
     async getSettings(): Promise<Setting[]> {
-        return [
+        const settings: Setting[] = [
             {
+                group: "Binding",
                 key: "host",
                 title: "IP or hostname",
-                description: "Viewport's address on the LAN. Auto-resolved via mDNS when the toggle below is on; otherwise set manually.",
+                description: "Viewport's address on the LAN. Set this manually — find it via your DHCP table, or `dns-sd -G v4 viewport-<mac>.local` on macOS, or `avahi-resolve -n viewport-<mac>.local` on Linux. The info screen on the device itself shows its MAC + IP.",
                 placeholder: "192.168.1.42",
                 value: this.host,
-            },
+            } as any,
             {
-                key: "mdns_auto",
-                title: "Auto-resolve via mDNS",
-                description: "Look up viewport-<name>.local via the OS resolver on every register and overwrite the host field with the discovered IP. Disable for cross-VLAN setups or hosts where mDNS resolution doesn't work.",
-                type: "boolean",
-                value: this.mdnsAuto,
-            },
-            {
+                group: "Binding",
                 key: "cameraId",
                 title: "Camera",
                 description: "Camera whose events drive this viewport's wake/sleep, and whose snapshots get streamed.",
                 type: "device",
                 deviceFilter: `interfaces.includes('${ScryptedInterface.Camera}')`,
                 value: this.cameraId,
-            },
+            } as any,
             {
+                group: "Binding",
+                key: "triggers",
+                title: "Wake triggers",
+                description: "Which camera-event types automatically wake the viewport. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap to see the camera).",
+                choices: ["doorbell", "motion", "person"],
+                multiple: true,
+                value: Array.from(this.triggers),
+            } as any,
+            {
+                group: "Display",
                 key: "orientation",
                 title: "Orientation",
                 description: "Panel orientation. Frames are sent at this effective resolution.",
                 choices: ["portrait", "landscape"],
                 value: this.orientation,
-            },
+            } as any,
             {
-                key: "idle_timeout_ms",
-                title: "Idle timeout (ms)",
-                description: "Sent to the device via /config; both sides time independently. 0 disables the device-side idle timer; non-zero must be ≥ 5000.",
-                type: "number",
-                value: this.idleTimeoutMs,
-            },
-            {
+                group: "Display",
                 key: "brightness",
                 title: "Brightness (0–100)",
                 description: "Sent to the device via /config. Gamma-corrected on the panel.",
                 type: "number",
                 value: this.brightness,
-            },
+            } as any,
+            {
+                group: "Display",
+                key: "idle_timeout_ms",
+                title: "Idle timeout (ms)",
+                description: "How long the device stays awake after the last paint before it sleeps itself. 0 disables; non-zero must be ≥ 5000.",
+                type: "number",
+                value: this.idleTimeoutMs,
+            } as any,
+            {
+                group: "Display",
+                key: "frame_interval_ms",
+                title: "Frame push interval (ms)",
+                description: `How often a JPEG snapshot is POSTed during an active stream. Lower = smoother but more network + CPU; clamped to ≥ 33 ms (~30 fps max). Default ${DEFAULT_FRAME_INTERVAL_MS}.`,
+                type: "number",
+                value: this.frameIntervalMs,
+            } as any,
         ];
+
+        // Live device snapshot: GET /state + /config in parallel with a
+        // short timeout, then render as a read-only "Status" section. If
+        // the device is offline we still surface the binding fields so the
+        // operator can change them — the status fields just say "offline".
+        if (this.host) {
+            try {
+                const ctrl = AbortSignal.timeout(1500);
+                const [stateRes, configRes] = await Promise.all([
+                    fetch(`http://${this.host}/state`,  { signal: ctrl }).then(r => r.json()),
+                    fetch(`http://${this.host}/config`, { signal: ctrl }).then(r => r.json()),
+                ]);
+                settings.push(
+                    { group: "Status (live)", key: "_st_name",   title: "name",                value: stateRes.name,                                                 readonly: true } as any,
+                    { group: "Status (live)", key: "_st_mac",    title: "mac",                 value: stateRes.mac,                                                  readonly: true } as any,
+                    { group: "Status (live)", key: "_st_ip",     title: "ip",                  value: stateRes.ip,                                                   readonly: true } as any,
+                    { group: "Status (live)", key: "_st_state",  title: "state",               value: stateRes.state,                                                readonly: true } as any,
+                    { group: "Status (live)", key: "_st_cfg",    title: "configured",          value: String(stateRes.configured),                                   readonly: true } as any,
+                    { group: "Status (live)", key: "_st_uptime", title: "uptime (ms)",         value: String(stateRes.uptime_ms),                                    readonly: true } as any,
+                    { group: "Status (live)", key: "_st_last",   title: "last frame (ms ago)", value: String(stateRes.last_frame_ms_ago ?? "(none)"),                readonly: true } as any,
+                    { group: "Status (live)", key: "_st_fr",     title: "frames received",     value: String(stateRes.frames_received),                              readonly: true } as any,
+                    { group: "Status (live)", key: "_st_err",    title: "decode errors",       value: String(stateRes.decode_errors),                                readonly: true } as any,
+                    { group: "Status (live)", key: "_st_post",   title: "state post failures", value: String(stateRes.state_post_failures),                          readonly: true } as any,
+                    { group: "Status (live)", key: "_st_res",    title: "resolution",          value: stateRes.resolution,                                           readonly: true } as any,
+                    { group: "Status (live)", key: "_st_heap",   title: "free heap (bytes)",   value: String(stateRes.free_heap),                                    readonly: true } as any,
+                    { group: "Status (live)", key: "_st_psram",  title: "free PSRAM (bytes)",  value: String(stateRes.free_psram),                                   readonly: true } as any,
+                    { group: "Status (live)", key: "_st_ver",    title: "firmware",            value: stateRes.version,                                              readonly: true } as any,
+                    { group: "Status (live)", key: "_cfg_scrypt",title: "config: scrypted URL",value: configRes.scrypted ?? "(not set)",                             readonly: true } as any,
+                );
+            } catch (e) {
+                settings.push({ group: "Status (live)", key: "_st_err", title: "device", value: `offline / unreachable (${(e as Error).message})`, readonly: true } as any);
+            }
+        }
+
+        return settings;
     }
 
     async putSetting(key: string, value: SettingValue) {
-        this.storage.setItem(key, String(value ?? ""));
+        if (key.startsWith("_")) return;                 // ignore read-only status fields
+        if (key === "triggers") {
+            // multi-select arrives as array; serialise to JSON for storage
+            this.storage.setItem("triggers", JSON.stringify(Array.isArray(value) ? value : []));
+        } else {
+            this.storage.setItem(key, String(value ?? ""));
+        }
         await this.provider.onBindingChanged(this);
     }
 }
@@ -206,11 +255,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.storage.setItem("childIds", JSON.stringify(ids));
     }
 
-    private get frameIntervalMs(): number {
-        const v = this.storage.getItem("frame_interval_ms");
-        return v ? Math.max(100, parseInt(v, 10) || DEFAULT_FRAME_INTERVAL_MS)
-                 : DEFAULT_FRAME_INTERVAL_MS;
-    }
 
     private async start() {
         // endpointManager.getInsecurePublicLocalEndpoint() takes a nativeId
@@ -388,14 +432,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
-    private async refreshHostFromMdns(v: Viewport): Promise<void> {
-        if (!v.mdnsAuto || !v.name) return;
-        const ip = await lookupMdns(`viewport-${v.name}.local`);
-        if (!ip || ip === v.host) return;
-        this.console.log(`mDNS: "${v.name}" host "${v.host || "(empty)"}" -> "${ip}"`);
-        v.storage.setItem("host", ip);
-    }
-
     private async registerViewport(v: Viewport) {
         // Guard against transient empty names. Scrypted occasionally hands
         // us a Viewport whose `.name` hasn't resolved yet (race between
@@ -407,9 +443,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.warn(`register skipped — empty name on ${v.nativeId}; will retry on next event`);
             return;
         }
-        await this.refreshHostFromMdns(v);
         if (!v.host) {
-            this.console.warn(`register "${name}" skipped — no host (set one manually or check mDNS)`);
+            this.console.warn(`register "${name}" skipped — no host. Set the viewport's "IP or hostname" field; see the README for how to find it via mDNS from your shell.`);
             return;
         }
         try {
@@ -435,10 +470,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private handleCameraEvent(v: Viewport, details: any, data: any) {
         const iface = details.eventInterface;
+        const allowed = v.triggers;
         let trigger = false;
-        if (iface === ScryptedInterface.BinarySensor && data === true) trigger = true;
-        if (iface === ScryptedInterface.MotionSensor && data === true) trigger = true;
-        if (iface === ScryptedInterface.ObjectDetector) {
+        if (allowed.has("doorbell") && iface === ScryptedInterface.BinarySensor && data === true) trigger = true;
+        if (allowed.has("motion")   && iface === ScryptedInterface.MotionSensor && data === true) trigger = true;
+        if (allowed.has("person")   && iface === ScryptedInterface.ObjectDetector) {
             const detections = data?.detections ?? [];
             if (detections.some((d: any) => d?.className === "person")) trigger = true;
         }
@@ -461,7 +497,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.pushFrame(v, abort).catch(e => {
                 if (!abort.signal.aborted) this.console.warn(`pushFrame "${v.name}":`, (e as Error).message);
             });
-        }, this.frameIntervalMs);
+        }, v.frameIntervalMs);
 
         const timeoutMs = v.idleTimeoutMs > 0 ? v.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
         const timeout = setTimeout(() => {
@@ -555,24 +591,31 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     // ------------------------------------------------------------------------
-    // Parent Settings — global tuning only
+    // Parent Settings — informational only; per-viewport tuning lives on each
+    // child's own Settings page.
     // ------------------------------------------------------------------------
 
     async getSettings(): Promise<Setting[]> {
+        const count = this.viewports.size;
         return [
             {
-                key: "frame_interval_ms",
-                title: "Frame push interval (ms)",
-                description: "How often a snapshot is pushed to each viewport during an active stream. 1000 = 1 fps.",
-                type: "number",
-                value: this.frameIntervalMs,
-            },
+                key: "viewport_count",
+                title: "Registered viewports",
+                description: "Number of child viewport bindings under this parent. Each one's host / camera / brightness / orientation / fps lives on its own Settings page.",
+                value: String(count),
+                readonly: true,
+            } as any,
+            {
+                key: "callback_base",
+                title: "Callback base URL",
+                description: "Endpoint the firmware POSTs back to for tap-initiated wake/sleep.",
+                value: this.scryptedBase || "(not yet resolved)",
+                readonly: true,
+            } as any,
         ];
     }
 
-    async putSetting(key: string, value: SettingValue) {
-        this.storage.setItem(key, String(value ?? ""));
-    }
+    async putSetting(_key: string, _value: SettingValue) {}
 
     // ------------------------------------------------------------------------
     // Tiny HTTP helper
