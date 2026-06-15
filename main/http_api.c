@@ -338,19 +338,23 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
             "device asleep — POST /state {\"state\":\"wake\"} first");
     }
 
+    int64_t t_entry = esp_timer_get_time();
+
     // Single in-flight frame. Concurrent posts get 503 (spec).
     if (!jpeg_decoder_try_lock(0)) {
         return respond_status(req, "503 Service Unavailable", "frame in flight");
     }
 
-    int64_t t0 = esp_timer_get_time();
+    int64_t t_lock = esp_timer_get_time();
 
     esp_err_t result = ESP_OK;
     uint8_t *in = jpeg_decoder_input_buffer();
     size_t got = 0;
+    int64_t t_first_byte = 0;
     while (got < req->content_len) {
         int n = httpd_req_recv(req, (char *)(in + got), req->content_len - got);
         if (n <= 0) { result = ESP_FAIL; break; }
+        if (got == 0) t_first_byte = esp_timer_get_time();
         got += n;
     }
 
@@ -390,6 +394,7 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     esp_err_t paint_err = display_present_bgr888(rgb);
     int64_t t_paint = esp_timer_get_time();
+    int64_t t_post  = 0;
     if (paint_err != ESP_OK) {
         jpeg_decoder_unlock();
         return respond_status(req, "500 Internal Server Error", "display paint failed");
@@ -404,17 +409,27 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     jpeg_decoder_unlock();
 
+    // Track the bookkeeping tail too so we can see if anything between
+    // draw_bitmap-returns and the response-send adds up.
+    t_post = esp_timer_get_time();
+
     // Timing log every 10 frames so the user can see where each /frame's
-    // wall-clock budget is going (network → JPEG decode → DSI hand-off).
+    // wall-clock budget is going. Sub-breakdown of the previously-fat
+    // "recv" bucket: lock acquire + first-byte (TCP setup / TTFB) +
+    // body (actual data wire-time). Post-paint bookkeeping is the
+    // bookkeeping after draw_bitmap returns (state counters + unlock).
     if (fr % 10 == 0) {
         ESP_LOGI(TAG,
-            "frame %llu: recv=%lldus dec=%lldus paint=%lldus total=%lldms "
-            "(jpeg=%uKB)",
+            "frame %llu: lock=%lldus ttfb=%lldus body=%lldus "
+            "dec=%lldus paint=%lldus post=%lldus total=%lldms (jpeg=%uKB)",
             (unsigned long long)fr,
-            (long long)(t_recv   - t0),
-            (long long)(t_decode - t_recv),
-            (long long)(t_paint  - t_decode),
-            (long long)((t_paint - t0) / 1000),
+            (long long)(t_lock       - t_entry),
+            (long long)(t_first_byte - t_lock),
+            (long long)(t_recv       - t_first_byte),
+            (long long)(t_decode     - t_recv),
+            (long long)(t_paint      - t_decode),
+            (long long)(t_post       - t_paint),
+            (long long)((t_post - t_entry) / 1000),
             (unsigned)(got / 1024));
     }
 

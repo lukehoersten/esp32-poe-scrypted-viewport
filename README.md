@@ -490,17 +490,35 @@ Every endpoint is idempotent; every failure leaves the device in a sane state.
 
 ## What's next
 
-M1 – M8 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg is live and sustained at ~5 fps with high-quality JPEGs.
+M1 – M8 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg + the zero-copy `JPEG → BGR888 → DSI` hot path is live and sustains **~6.5 fps painted at the 100 ms target tick**, gated by per-frame work below.
 
-Current backlog, in rough priority order:
+### Measured per-frame budget (target ≥ 22 fps requires shrinking these)
 
-1. **Firmware fps optimisation via DMA-2D** — high impact. The 5-fps ceiling is `display_present_rgb565`: software RGB565→BGR888 conversion + portrait rotation on the CPU is ~1.15 MB of PSRAM-bound copy per frame. The ESP32-P4 DMA-2D engine can do both pixel-format conversion *and* rotation in hardware. Reconfigure the DPI panel for RGB565 input + `flags.use_dma2d = true`, hand the JPEG decoder's RGB565 output straight to the panel driver, let hardware do the rotation. Should ~double painted fps.
-2. **OTA firmware updates** — low effort, gateway to fleet ops. Partition table already has `ota_0` / `ota_1`. Add `esp_https_ota` (or a one-shot `POST /firmware` using `esp_ota_*`) so reflashing doesn't require USB. Critical once you have more than one viewport in production.
-3. **Task watchdog + crash counters** — low effort. Enable the ESP-IDF task watchdog, surface its bite count in `/state` alongside the existing `decode_errors` / `state_post_failures`. Good hygiene.
-4. **Multi-camera per viewport** — medium effort. Let one viewport listen to events from N cameras, picking which one to stream based on which fired. Useful for "show whichever doorbell rang" or zone monitoring.
-5. **MJPEG-over-WebSocket** instead of `POST /frame` per JPEG — medium effort, marginal win. Would shave per-frame HTTP overhead, but the firmware decode-paint mutex is the ceiling so the math doesn't change much in practice. Skip unless we find a use case the per-frame path can't cover.
-6. **Boot info-screen flash polish** — low effort. Keep the brief wake-on-boot (the FT5426 needs it to start reporting touches) but smoothen the ~600 ms flash so it doesn't visibly flicker on power-up.
-7. **Production sealing** — eventual. Configurable LAN scope (cross-VLAN, mDNS-via-Unicast), Scrypted-side mutual auth, replay protection for `/state` callbacks.
+The firmware logs a `frame N: lock=… ttfb=… body=… dec=… paint=… post=… total=…ms` line every 10 frames. Steady-state on the bench (Waveshare ESP32-P4-ETH + Hosyond 5" panel, ~210 KB JPEGs at `-q:v 2`):
+
+| Phase | Time | What it is |
+|---|---|---|
+| `lock` | ~tens of µs | `jpeg_decoder_try_lock` (mutex acquire) |
+| `ttfb` | ~1–2 ms | Time-to-first-byte after lock — TCP/HTTP handshake overhead |
+| `body` | ~38 ms | Wire time for the rest of the JPEG body (~210 KB at ~42 Mbit/s effective) |
+| `dec` | ~6 ms | Hardware JPEG decode → BGR888 (way faster than the textbook 50–80 ms guess) |
+| `paint` | ~24 ms | `esp_lcd_panel_draw_bitmap` + ~1.5 DSI refresh cycles at 60 Hz |
+| `post` | < 1 ms | State counter bookkeeping + unlock |
+| **total** | **~70 ms** | **Theoretical ceiling ~14 fps if Scrypted ticks faster than the 100 ms default** |
+
+So the firmware ceiling at full quality is ~14 fps, but Scrypted's `frame_interval_ms = 100` only fires 10 ticks/sec, leaving ~30 ms idle between frames → effective ~6.5 fps. Lower the per-viewport interval to ~75 ms to chase the ceiling.
+
+### Current backlog, in rough priority order
+
+1. **Double-buffer the panel (`num_fbs = 2`)** — *high impact*. Today `paint` is 24 ms because the synchronous `esp_lcd_panel_draw_bitmap` waits for a full DSI refresh cycle. With a second framebuffer the DSI engine streams from FB-A while the next frame fills FB-B; paint becomes a pointer swap (~1–2 ms). Total drops to ~46 ms, ceiling jumps to ~22 fps at full quality. Watch out for the TC358762 bridge's `non-burst with sync pulses` constraint — `flags.use_dma2d` and `num_fbs` interact non-obviously with the bridge wake sequence, so this needs careful re-bring-up.
+2. **HTTP persistent connection** — *medium impact, low effort*. Would shave the ~1–2 ms `ttfb` per frame by keeping the TCP connection open across frames (currently Scrypted's `fetch` opens fresh each POST). Real win is consistency, not absolute speed; useful once #1 lands.
+3. **OTA firmware updates** — *low effort, gateway to fleet ops*. Partition table already has `ota_0` / `ota_1`. Add `esp_https_ota` (or a one-shot `POST /firmware` using `esp_ota_*`) so reflashing doesn't require USB. Critical once you have more than one viewport in production.
+4. **Task watchdog + crash counters** — *low effort*. Enable the ESP-IDF task watchdog, surface its bite count in `/state` alongside the existing `decode_errors` / `state_post_failures`. Good hygiene.
+5. **Multi-camera per viewport** — *medium effort*. Let one viewport listen to events from N cameras, picking which one to stream based on which fired. Useful for "show whichever doorbell rang" or zone monitoring.
+6. **Per-viewport JPEG quality knob** — *trivial*. Add a `jpeg_quality` setting that drives ffmpeg's `-q:v` arg. Trade fidelity for fps if anyone wants. Only matters once we want >22 fps from a single viewport.
+7. **MJPEG-over-WebSocket** instead of `POST /frame` per JPEG — *medium effort, marginal win*. Would shave per-frame HTTP overhead but the firmware decode-paint mutex is the new ceiling. Skip unless we find a use case the per-frame path can't cover.
+8. **Boot info-screen flash polish** — *low effort*. Keep the brief wake-on-boot (the FT5426 needs it to start reporting touches) but smoothen the ~600 ms flash so it doesn't visibly flicker on power-up.
+9. **Production sealing** — *eventual*. Configurable LAN scope (cross-VLAN, mDNS-via-Unicast), Scrypted-side mutual auth, replay protection for `/state` callbacks.
 
 ## Philosophy
 

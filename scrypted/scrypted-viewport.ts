@@ -690,16 +690,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.warn(`"${v.name}" /frame -> 400: ${reason}`);
         } else if (!res.ok) {
             this.console.warn(`"${v.name}" /frame -> ${res.status}`);
-        } else {
-            // Frame painted; reset Scrypted-side idle timer alongside the
-            // device's own (each successful paint extends both).
-            const s = this.streams.get(v.name);
-            if (s) {
-                clearTimeout(s.timeout);
-                s.timeout = setTimeout(() => this.stopStream(v.name),
-                    Math.max(5000, v.idleTimeoutMs));
-            }
         }
+        // Do NOT reset the idle timer on successful paint. The timer is
+        // anchored to the triggering CAMERA EVENT, not to "frames are
+        // flowing" — otherwise a continuously-streaming source means the
+        // stream never times out. Repeated events naturally cancel-and-
+        // restart the stream via startStream → stopStream(false), which
+        // covers the "still active" case.
     }
 
     private findByName(name: string): Viewport | undefined {
