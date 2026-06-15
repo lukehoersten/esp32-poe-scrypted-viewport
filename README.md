@@ -490,17 +490,17 @@ Every endpoint is idempotent; every failure leaves the device in a sane state.
 
 ## What's next
 
-In rough priority order. Each entry links the relevant section so you can pick up cold.
+M1 – M8 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg is live and sustained at ~5 fps with high-quality JPEGs.
 
-1. **Hardware bring-up of M1 + M2** — flash the board and confirm DHCP + `GET /state` over Ethernet. No panel needed; ~10 minutes once the board is reachable. See [`TESTING.md` Stage 1](TESTING.md#stage-1--board-comes-alive-m1--m2).
-2. **Schematic confirmation** — open the Waveshare ESP32-P4-ETH schematic PDF and confirm flash chip size silkscreen against `sdkconfig.defaults`. DSI FPC pin count, I²C GPIOs (`PIN_I2C_SDA=7`, `PIN_I2C_SCL=8`), and BOOT button availability are already resolved on hardware — see [`TESTING.md` Hardware prerequisites](TESTING.md#hardware-prerequisites).
-3. **Source the DSI adapter cable** — 15-pin Pi-FPC → Waveshare-side DSI. Order matches what step 2 reveals.
-4. **Stage-by-stage bench verification (M3 → M8)** — work through [`TESTING.md` Recommended bench order](TESTING.md#recommended-bench-order) with the panel attached and jumpers wired. Each stage flips its milestones to ✅.
-5. **End-to-end with Scrypted** — paste [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts) into Scrypted's Scripts plugin, add a viewport device, trigger a bound camera, watch the panel light up. See [`scrypted/README.md`](scrypted/README.md).
-6. **Integration suite** — once every milestone is ✅, run the suite at the bottom of [`TESTING.md`](TESTING.md#integration--system-tests-post-m9) (races, failure modes, longevity soak, multi-viewport, negative protocol matrix).
-7. **M9 — `POST /stream`** — multipart MJPEG over chunked POST on the device. ~150 LOC. Unblocks live-rate frame delivery; `/frame` stays for snapshots and debug.
-8. **v2 Scrypted plugin** — packaged plugin (not a Script) using FFmpeg via `MediaManager` to pipe MJPEG into `/stream`. Replaces v1's `takePicture`-loop with a continuous stream. Higher fps, same protocol surface, same per-viewport device UX from Path B.
-9. **Post-v2 polish** — HTTP OTA from Scrypted, on-board status LED wiring, ESP-IDF task watchdog enable, M9 acceptance check (≥ 10 fps end-to-end).
+Current backlog, in rough priority order:
+
+1. **Firmware fps optimisation via DMA-2D** — high impact. The 5-fps ceiling is `display_present_rgb565`: software RGB565→BGR888 conversion + portrait rotation on the CPU is ~1.15 MB of PSRAM-bound copy per frame. The ESP32-P4 DMA-2D engine can do both pixel-format conversion *and* rotation in hardware. Reconfigure the DPI panel for RGB565 input + `flags.use_dma2d = true`, hand the JPEG decoder's RGB565 output straight to the panel driver, let hardware do the rotation. Should ~double painted fps.
+2. **OTA firmware updates** — low effort, gateway to fleet ops. Partition table already has `ota_0` / `ota_1`. Add `esp_https_ota` (or a one-shot `POST /firmware` using `esp_ota_*`) so reflashing doesn't require USB. Critical once you have more than one viewport in production.
+3. **Task watchdog + crash counters** — low effort. Enable the ESP-IDF task watchdog, surface its bite count in `/state` alongside the existing `decode_errors` / `state_post_failures`. Good hygiene.
+4. **Multi-camera per viewport** — medium effort. Let one viewport listen to events from N cameras, picking which one to stream based on which fired. Useful for "show whichever doorbell rang" or zone monitoring.
+5. **MJPEG-over-WebSocket** instead of `POST /frame` per JPEG — medium effort, marginal win. Would shave per-frame HTTP overhead, but the firmware decode-paint mutex is the ceiling so the math doesn't change much in practice. Skip unless we find a use case the per-frame path can't cover.
+6. **Boot info-screen flash polish** — low effort. Keep the brief wake-on-boot (the FT5426 needs it to start reporting touches) but smoothen the ~600 ms flash so it doesn't visibly flicker on power-up.
+7. **Production sealing** — eventual. Configurable LAN scope (cross-VLAN, mDNS-via-Unicast), Scrypted-side mutual auth, replay protection for `/state` callbacks.
 
 ## Philosophy
 
