@@ -589,8 +589,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         });
 
         proc.stderr.on("data", (chunk: Buffer) => {
+            // SIGTERM teardown flushes a half-written packet and ffmpeg
+            // emits "Immediate exit requested" / "Error muxing a packet"
+            // to stderr. Skip the noise once we're aborting.
+            if (abort.signal.aborted) return;
             const text = chunk.toString("utf8").trim();
-            if (text) this.console.warn(`ffmpeg "${v.name}": ${text}`);
+            if (!text) return;
+            if (text.includes("Immediate exit requested")) return;
+            this.console.warn(`ffmpeg "${v.name}": ${text}`);
         });
         proc.on("error", (e: any) => {
             if (!abort.signal.aborted) this.console.warn(`ffmpeg "${v.name}" spawn error:`, e.message);
