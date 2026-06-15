@@ -343,6 +343,8 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return respond_status(req, "503 Service Unavailable", "frame in flight");
     }
 
+    int64_t t0 = esp_timer_get_time();
+
     esp_err_t result = ESP_OK;
     uint8_t *in = jpeg_decoder_input_buffer();
     size_t got = 0;
@@ -357,9 +359,12 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return respond_status(req, "400 Bad Request", "body read failed");
     }
 
+    int64_t t_recv = esp_timer_get_time();
+
     void   *rgb = NULL;
     uint16_t w = 0, h = 0;
     esp_err_t dec_err = jpeg_decoder_decode(got, &rgb, &w, &h);
+    int64_t t_decode = esp_timer_get_time();
     if (dec_err != ESP_OK) {
         viewport_state_lock();
         viewport_state_get()->decode_errors++;
@@ -384,6 +389,7 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     }
 
     esp_err_t paint_err = display_present_bgr888(rgb);
+    int64_t t_paint = esp_timer_get_time();
     if (paint_err != ESP_OK) {
         jpeg_decoder_unlock();
         return respond_status(req, "500 Internal Server Error", "display paint failed");
@@ -393,9 +399,24 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     viewport_state_t *st = viewport_state_get();
     st->frames_received++;
     st->last_frame_us = esp_timer_get_time();
+    uint64_t fr = st->frames_received;
     viewport_state_unlock();
 
     jpeg_decoder_unlock();
+
+    // Timing log every 10 frames so the user can see where each /frame's
+    // wall-clock budget is going (network → JPEG decode → DSI hand-off).
+    if (fr % 10 == 0) {
+        ESP_LOGI(TAG,
+            "frame %llu: recv=%lldus dec=%lldus paint=%lldus total=%lldms "
+            "(jpeg=%uKB)",
+            (unsigned long long)fr,
+            (long long)(t_recv   - t0),
+            (long long)(t_decode - t_recv),
+            (long long)(t_paint  - t_decode),
+            (long long)((t_paint - t0) / 1000),
+            (unsigned)(got / 1024));
+    }
 
     state_machine_frame_painted();  // reset idle timer
 
