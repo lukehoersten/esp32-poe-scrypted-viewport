@@ -770,9 +770,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
 
                     if (inFlight >= MAX_INFLIGHT) { droppedFrames++; continue; }
+                    const emitMs        = Date.now();
+                    const depthAtQueue  = inFlight;       // BEFORE the increment
                     inFlight++;
                     sentFrames++;
-                    this.pushStreamFrame(v, frame, abort)
+                    this.pushStreamFrame(v, frame, abort, emitMs, depthAtQueue)
                         .catch(e => {
                             if (abort.signal.aborted) return;
                             const err = (e as Error);
@@ -876,10 +878,35 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
-    // Scrypted-side per-fetch timing — mirrors the firmware's per-frame
-    // log. Counter advanced in the stdout demux loop; logged once every
-    // 10 fetches alongside the wall-clock duration of the fetch itself.
+    // Scrypted-side per-fetch timing. We log aggregated stats every
+    // 10 fetches instead of a single-sample line — single samples were
+    // hiding tail latency. Each fetch records four buckets:
+    //   emit→post : ms from ffmpeg-emitted-the-jpeg to fetch() called.
+    //               Nonzero means the inFlight queue gated us.
+    //   req       : fetch() called → Response headers arrive. Body
+    //               upload + server processing + status line round-trip.
+    //   body-read : Response received → response body drained. Should
+    //               be near-zero (firmware returns empty 204/200/409).
+    //   wall      : total of all three for sanity.
+    // Plus inflight-at-queue (0/1/2) so we can see whether pipelining
+    // is actually overlapping anything, and a stale-drop counter for
+    // X-Frame-Drop responses from the firmware.
     private fetchCount = new Map<string, number>();
+    private fetchSamples = new Map<string, {
+        emit: number[]; req: number[]; bread: number[]; wall: number[];
+        depths: { d0: number; d1: number; d2: number };
+        staleDrops: number;
+    }>();
+
+    private bucketsFor(nid: string) {
+        let s = this.fetchSamples.get(nid);
+        if (!s) {
+            s = { emit: [], req: [], bread: [], wall: [],
+                  depths: { d0: 0, d1: 0, d2: 0 }, staleDrops: 0 };
+            this.fetchSamples.set(nid, s);
+        }
+        return s;
+    }
 
     // Monotonic per-viewport sequence number paired with X-Frame-Seq
     // so the firmware can drop pipelined-out-of-order frames. Reset
@@ -888,11 +915,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // two stay in step.
     private frameSeq = new Map<string, number>();
 
-    private async pushStreamFrame(v: Viewport, jpeg: Buffer, abort: AbortController) {
+    private async pushStreamFrame(v: Viewport, jpeg: Buffer, abort: AbortController,
+                                  emitMs: number, depthAtQueue: number) {
         if (abort.signal.aborted) return;
         const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
         this.frameSeq.set(v.nativeId!, seq);
-        const t0 = Date.now();
+        const tFetchStart = Date.now();
         const res = await fetch(`http://${v.host}/frame`, {
             method: "POST",
             headers: { "Content-Type": "image/jpeg", "X-Frame-Seq": String(seq) },
@@ -904,19 +932,50 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             // socket A.
             dispatcher: this.dispatcherFor(v.host),
         } as any);
-        const wallMs = Date.now() - t0;
+        const tHeaders = Date.now();
+        const wasStale = res.headers.get("X-Frame-Drop") === "stale-seq";
+        // Drain body so the socket can be released back to the pool.
+        // Body is empty for 200/204/409; reading is essentially free
+        // but the await pins our body-read measurement.
+        await res.text().catch(() => "");
+        const tDone = Date.now();
+
+        const b = this.bucketsFor(v.nativeId!);
+        b.emit.push (tFetchStart - emitMs);
+        b.req.push  (tHeaders    - tFetchStart);
+        b.bread.push(tDone       - tHeaders);
+        b.wall.push (tDone       - emitMs);
+        if (depthAtQueue === 0) b.depths.d0++;
+        else if (depthAtQueue === 1) b.depths.d1++;
+        else b.depths.d2++;
+        if (wasStale) b.staleDrops++;
+
         const n = (this.fetchCount.get(v.nativeId!) || 0) + 1;
         this.fetchCount.set(v.nativeId!, n);
         if (n % 10 === 0) {
-            this.console.log(`fetch "${v.name}" #${n}: ${wallMs}ms wall (jpeg=${(jpeg.length / 1024).toFixed(0)}KB)`);
+            const p = (arr: number[], q: number) => {
+                if (!arr.length) return 0;
+                const sorted = arr.slice().sort((a, b) => a - b);
+                return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+            };
+            this.console.log(
+                `fetch "${v.name}" #${n} (jpeg=${(jpeg.length / 1024).toFixed(0)}KB) ` +
+                `wall p50=${p(b.wall, 0.5)}ms p95=${p(b.wall, 0.95)}ms | ` +
+                `emit→post p50=${p(b.emit, 0.5)}ms p95=${p(b.emit, 0.95)}ms | ` +
+                `req p50=${p(b.req, 0.5)}ms p95=${p(b.req, 0.95)}ms | ` +
+                `body-read p50=${p(b.bread, 0.5)}ms | ` +
+                `inflight d0=${b.depths.d0} d1=${b.depths.d1} d2=${b.depths.d2} | ` +
+                `stale-drops=${b.staleDrops}`);
+            this.fetchSamples.delete(v.nativeId!);   // reset window
         }
         if (res.status === 409) {
             this.console.log(`"${v.name}" returned 409 — device went to sleep, stopping stream`);
             this.stopStream(v.name, /*sendSleep=*/ false);
         } else if (res.status === 400) {
-            const reason = await res.text().catch(() => "");
-            this.console.warn(`"${v.name}" /frame -> 400: ${reason}`);
-        } else if (!res.ok) {
+            // Body already drained; we lost the reason text. Log status
+            // alone — repeat 400s in steady state should be rare.
+            this.console.warn(`"${v.name}" /frame -> 400`);
+        } else if (!res.ok && !wasStale) {
             this.console.warn(`"${v.name}" /frame -> ${res.status}`);
         }
         // Do NOT reset the idle timer on successful paint. The timer is
