@@ -283,6 +283,10 @@ static esp_err_t state_post_handler(httpd_req_t *req)
     viewport_run_state_t target;
     if (strcmp(j->valuestring, "wake") == 0) {
         target = VIEWPORT_STATE_AWAKE;
+        // Reset the pipelined-POST sequence comparator so the next
+        // stream's first frame isn't rejected as stale just because
+        // the previous stream's counter happened to be higher.
+        s_last_painted_seq = 0;
     } else if (strcmp(j->valuestring, "sleep") == 0) {
         target = VIEWPORT_STATE_ASLEEP;
     } else {
@@ -315,7 +319,18 @@ static esp_err_t respond_status(httpd_req_t *req, const char *status, const char
 // Tracks when the previous /frame response finished so we can log the
 // idle gap until the next request enters. Large idle = Scrypted/network
 // upstream is the bottleneck; small idle = we're saturating the link.
-static int64_t s_last_post_us;
+static int64_t  s_last_post_us;
+// Highest X-Frame-Seq value we've actually painted. With two /frame
+// POSTs pipelined over separate sockets the firmware's decoder mutex
+// is the serialisation point, but FreeRTOS semaphore acquisition is
+// not FIFO — under jitter task B can grab the lock for frame N+1
+// before task A grabs it for frame N. Without a sequence check, the
+// later-arriving older frame would paint over the newer one and the
+// panel would briefly travel backwards in time. Frames with seq <=
+// s_last_painted_seq are acknowledged 200 OK but not painted. Reset
+// to 0 on every device wake — Scrypted's counter starts fresh per
+// stream so we don't drag a stale comparison forward.
+static uint32_t s_last_painted_seq;
 
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
@@ -345,6 +360,16 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     int64_t t_entry = esp_timer_get_time();
 
+    // Read the optional X-Frame-Seq header used to keep pipelined
+    // POSTs in monotonic paint order. Missing or zero header = no
+    // ordering enforcement (treat every frame as newer than the
+    // previous one, same behaviour we had before pipelining).
+    uint32_t seq = 0;
+    char seq_str[16] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Frame-Seq", seq_str, sizeof(seq_str)) == ESP_OK) {
+        seq = (uint32_t)strtoul(seq_str, NULL, 10);
+    }
+
     // Single in-flight frame. Concurrent posts get 503 (spec).
     if (!jpeg_decoder_try_lock(0)) {
         return respond_status(req, "503 Service Unavailable", "frame in flight");
@@ -369,6 +394,22 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     }
 
     int64_t t_recv = esp_timer_get_time();
+
+    // Pipelined-POST stale-frame check. With the X-Frame-Seq header
+    // set, drop anything we've already advanced past — we hold the
+    // decoder lock, so re-checking here is race-free. Without the
+    // header (seq==0) every frame paints, preserving pre-pipelining
+    // behaviour.
+    if (seq != 0 && seq <= s_last_painted_seq) {
+        jpeg_decoder_unlock();
+        // 200 OK with an empty body keeps the keep-alive socket
+        // healthy and lets Scrypted's per-fetch wall-clock log
+        // stay accurate; we just won't count this toward
+        // frames_received.
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_hdr(req, "X-Frame-Drop", "stale-seq");
+        return httpd_resp_send(req, NULL, 0);
+    }
 
     // Decode straight into the panel's back framebuffer — no scratch
     // buffer, no later memcpy. The flip below is a cache writeback +
@@ -415,6 +456,8 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     st->last_frame_us = esp_timer_get_time();
     uint64_t fr = st->frames_received;
     viewport_state_unlock();
+
+    if (seq != 0) s_last_painted_seq = seq;
 
     jpeg_decoder_unlock();
 

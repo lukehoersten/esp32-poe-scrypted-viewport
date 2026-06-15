@@ -869,11 +869,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         if (s.interval) clearInterval(s.interval);
         clearTimeout(s.timeout);
         this.streams.delete(name);
-        if (sendSleep) {
-            const v = this.findByName(name);
-            if (v?.host) {
-                this.postJSON(`http://${v.host}/state`, { state: "sleep" }).catch(() => {});
-            }
+        const v = this.findByName(name);
+        if (v) this.frameSeq.delete(v.nativeId!);
+        if (sendSleep && v?.host) {
+            this.postJSON(`http://${v.host}/state`, { state: "sleep" }).catch(() => {});
         }
     }
 
@@ -882,12 +881,21 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // 10 fetches alongside the wall-clock duration of the fetch itself.
     private fetchCount = new Map<string, number>();
 
+    // Monotonic per-viewport sequence number paired with X-Frame-Seq
+    // so the firmware can drop pipelined-out-of-order frames. Reset
+    // on every stopStream so each stream session starts fresh; the
+    // firmware also resets its comparator on /state {wake}, so the
+    // two stay in step.
+    private frameSeq = new Map<string, number>();
+
     private async pushStreamFrame(v: Viewport, jpeg: Buffer, abort: AbortController) {
         if (abort.signal.aborted) return;
+        const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
+        this.frameSeq.set(v.nativeId!, seq);
         const t0 = Date.now();
         const res = await fetch(`http://${v.host}/frame`, {
             method: "POST",
-            headers: { "Content-Type": "image/jpeg" },
+            headers: { "Content-Type": "image/jpeg", "X-Frame-Seq": String(seq) },
             body: jpeg,
             signal: abort.signal,
             // @ts-ignore - undici dispatcher: keep-alive + 2 connections
