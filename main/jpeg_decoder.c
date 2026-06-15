@@ -14,8 +14,6 @@ static jpeg_decoder_handle_t s_engine;
 static SemaphoreHandle_t     s_mutex;
 static void   *s_in_buf;
 static size_t  s_in_cap;
-static void   *s_out_buf;
-static size_t  s_out_cap;
 
 esp_err_t jpeg_decoder_init(void)
 {
@@ -29,23 +27,18 @@ esp_err_t jpeg_decoder_init(void)
     ESP_RETURN_ON_ERROR(jpeg_new_decoder_engine(&cfg, &s_engine),
                        TAG, "jpeg_new_decoder_engine");
 
-    // DMA-aligned PSRAM scratch buffers. Allocate once, reuse.
+    // DMA-aligned PSRAM scratch buffer for the inbound JPEG body. The
+    // OUTPUT buffer is no longer owned here — callers pass in a target
+    // (the display back-buffer) so the decoder writes the BGR888 pixels
+    // straight into the panel framebuffer with no intermediate copy.
     jpeg_decode_memory_alloc_cfg_t in_cfg  = { .buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER };
-    jpeg_decode_memory_alloc_cfg_t out_cfg = { .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER };
-
     s_in_buf = jpeg_alloc_decoder_mem(JPEG_DECODER_MAX_INPUT_BYTES,  &in_cfg,  &s_in_cap);
     if (!s_in_buf) {
         ESP_LOGE(TAG, "jpeg input buf alloc failed");
         return ESP_ERR_NO_MEM;
     }
-    s_out_buf = jpeg_alloc_decoder_mem(JPEG_DECODER_MAX_OUTPUT_BYTES, &out_cfg, &s_out_cap);
-    if (!s_out_buf) {
-        ESP_LOGE(TAG, "jpeg output buf alloc failed");
-        return ESP_ERR_NO_MEM;
-    }
 
-    ESP_LOGI(TAG, "decoder ready (in=%u bytes, out=%u bytes)",
-             (unsigned)s_in_cap, (unsigned)s_out_cap);
+    ESP_LOGI(TAG, "decoder ready (in=%u bytes)", (unsigned)s_in_cap);
     return ESP_OK;
 }
 
@@ -61,19 +54,20 @@ void jpeg_decoder_unlock(void)
 
 void *jpeg_decoder_input_buffer(void) { return s_in_buf; }
 
-esp_err_t jpeg_decoder_decode(size_t   jpeg_len,
-                              void   **out_bgr888,
+esp_err_t jpeg_decoder_decode(size_t    jpeg_len,
+                              void     *out_buf,
+                              size_t    out_cap,
                               uint16_t *out_width,
                               uint16_t *out_height)
 {
     if (jpeg_len == 0 || jpeg_len > s_in_cap) return ESP_ERR_INVALID_SIZE;
+    if (!out_buf || out_cap == 0)             return ESP_ERR_INVALID_ARG;
 
-    // Hardware decode directly into a panel-native BGR888 buffer.
-    // _BGR rgb_order swaps the channel layout so memory ends up as
-    // [B, G, R] per pixel — exactly what the ESP32-P4 DSI engine +
-    // TC358762 + Pi panel pipeline wants. Total firmware-side cost in
-    // the hot /frame path: this hardware decode + one DMA hand-off to
-    // the panel. No CPU pixel work.
+    // Hardware decode directly into the caller's BGR888 buffer (the
+    // panel back-framebuffer in the /frame path). _BGR rgb_order swaps
+    // the channel layout so memory ends up as [B, G, R] per pixel —
+    // exactly what the ESP32-P4 DSI engine + TC358762 + Pi panel
+    // pipeline wants. Zero firmware-side pixel work.
     jpeg_decode_cfg_t dec_cfg = {
         .output_format = JPEG_DECODE_OUT_FORMAT_RGB888,
         .rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
@@ -89,14 +83,13 @@ esp_err_t jpeg_decoder_decode(size_t   jpeg_len,
 
     uint32_t out_size = 0;
     err = jpeg_decoder_process(s_engine, &dec_cfg,
-                               s_in_buf,  jpeg_len,
-                               s_out_buf, s_out_cap, &out_size);
+                               s_in_buf, jpeg_len,
+                               out_buf,  out_cap, &out_size);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "jpeg_decoder_process: %s", esp_err_to_name(err));
         return err;
     }
 
-    *out_bgr888 = s_out_buf;
     *out_width  = info.width;
     *out_height = info.height;
     return ESP_OK;

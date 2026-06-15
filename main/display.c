@@ -117,8 +117,18 @@ static esp_lcd_dsi_bus_handle_t s_dsi_bus;
 static esp_lcd_panel_handle_t   s_panel;
 static bool                     s_up;
 static uint8_t                  s_last_pwm;
-// RGB888 panel-sized scratch buffer (800*480*3 ≈ 1.15 MB in PSRAM).
+// BGR888 panel-sized scratch buffer used by local_screens' CPU
+// conversion + rotation path (~1.15 MB in PSRAM). Hot /frame path
+// instead writes the JPEG decoder output directly into the panel's
+// double-buffered framebuffer (see s_panel_fbs).
 static uint8_t                 *s_rot_buf;
+// The DPI driver owns the two framebuffers when num_fbs = 2. We grab
+// pointers to both after panel_init and alternate which one we hand to
+// the JPEG decoder + the panel for each /frame. draw_bitmap with a
+// pointer that's inside one of these turns into a cache writeback +
+// index swap (microseconds), eliminating the previous ~24 ms memcpy.
+static uint8_t                 *s_panel_fbs[2];
+static int                      s_back_fb;     // index of the fb the next paint will fill
 
 // ============================================================================
 // ATTINY88 I2C helpers
@@ -304,7 +314,10 @@ static esp_err_t dsi_bring_up(void)
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
         .in_color_format    = LCD_COLOR_FMT_RGB888,
         .out_color_format   = LCD_COLOR_FMT_RGB888,
-        .num_fbs            = 1,
+        // Double-buffer the panel: the DSI engine streams one fb while
+        // we fill the other. esp_lcd_panel_draw_bitmap(fb) becomes a
+        // cache writeback + index swap (~µs) instead of a ~24 ms memcpy.
+        .num_fbs            = 2,
         .video_timing = {
             .h_size            = PANEL_H_ACTIVE,
             .v_size            = PANEL_V_ACTIVE,
@@ -336,6 +349,16 @@ static esp_err_t dsi_bring_up(void)
     mipi_dsi_host_ll_dpi_enable_frame_ack(p->hal.host, false);
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel_init");
+
+    // Grab pointers to both framebuffers so we can hand them to the
+    // JPEG decoder as the direct decode destination — that triggers
+    // the IDF DPI driver's fast path in draw_bitmap (no memcpy).
+    void *fb0 = NULL, *fb1 = NULL;
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 2, &fb0, &fb1),
+                       TAG, "get_frame_buffer");
+    s_panel_fbs[0] = fb0;
+    s_panel_fbs[1] = fb1;
+    s_back_fb      = 1;   // fb0 is the one the driver shows first; we fill fb1 next
 
     // Continuous HS clock — TC358762's internal FLL needs a stable
     // reference, and we still allow LP data-lane blanking so command
@@ -435,6 +458,24 @@ esp_err_t display_present_bgr888(const void *bgr888)
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
                                      PANEL_H_ACTIVE, PANEL_V_ACTIVE,
                                      bgr888);
+}
+
+void *display_back_buffer(size_t *out_size)
+{
+    if (!s_up) return NULL;
+    if (out_size) *out_size = (size_t)PANEL_H_ACTIVE * PANEL_V_ACTIVE * 3;
+    return s_panel_fbs[s_back_fb];
+}
+
+esp_err_t display_flip_back_buffer(void)
+{
+    if (!s_up) return ESP_ERR_INVALID_STATE;
+    void *fb = s_panel_fbs[s_back_fb];
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                                              PANEL_H_ACTIVE, PANEL_V_ACTIVE,
+                                              fb);
+    if (err == ESP_OK) s_back_fb ^= 1;   // next /frame fills the other one
+    return err;
 }
 
 esp_err_t display_present_rgb565(const uint16_t *src,

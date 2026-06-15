@@ -43,4 +43,18 @@ esp_err_t display_present_rgb565(const uint16_t *src,
 // hand it straight to esp_lcd_panel_draw_bitmap. No CPU pixel work, no
 // format conversion, no rotation — Scrypted is responsible for sending
 // the buffer pre-rotated and pre-scaled to panel-native dimensions.
+// If the buffer happens to be one of the panel's own framebuffers
+// (see display_back_buffer / display_flip_back_buffer below), the IDF
+// driver skips the memcpy entirely; otherwise it copies via CPU.
 esp_err_t display_present_bgr888(const void *bgr888);
+
+// Double-buffer accessors for the zero-memcpy /frame path. The DPI
+// panel owns two BGR888 framebuffers; `display_back_buffer` hands back
+// the one that is NOT currently being streamed by the DSI engine so
+// callers (the JPEG decoder) can fill it in place. When the buffer is
+// ready, `display_flip_back_buffer` swaps it in — turns into a cache
+// writeback + index swap inside the IDF driver (no memcpy).
+//   `out_size` (if non-null) is set to the buffer's byte size, useful
+//   for passing to jpeg_decoder_process as its output capacity.
+void      *display_back_buffer(size_t *out_size);
+esp_err_t  display_flip_back_buffer(void);

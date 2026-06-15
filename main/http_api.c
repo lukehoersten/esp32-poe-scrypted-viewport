@@ -365,9 +365,13 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     int64_t t_recv = esp_timer_get_time();
 
-    void   *rgb = NULL;
+    // Decode straight into the panel's back framebuffer — no scratch
+    // buffer, no later memcpy. The flip below is a cache writeback +
+    // index swap inside the IDF DPI driver.
+    size_t back_size = 0;
+    void *back = display_back_buffer(&back_size);
     uint16_t w = 0, h = 0;
-    esp_err_t dec_err = jpeg_decoder_decode(got, &rgb, &w, &h);
+    esp_err_t dec_err = jpeg_decoder_decode(got, back, back_size, &w, &h);
     int64_t t_decode = esp_timer_get_time();
     if (dec_err != ESP_OK) {
         viewport_state_lock();
@@ -392,7 +396,7 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return respond_status(req, "400 Bad Request", msg);
     }
 
-    esp_err_t paint_err = display_present_bgr888(rgb);
+    esp_err_t paint_err = display_flip_back_buffer();
     int64_t t_paint = esp_timer_get_time();
     int64_t t_post  = 0;
     if (paint_err != ESP_OK) {
