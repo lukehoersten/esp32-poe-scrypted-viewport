@@ -190,15 +190,17 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 group: "Actions",
                 key: "action_wake",
                 title: "Wake now",
-                description: "POST /state {wake} to the device — turns the panel on and starts streaming the bound camera. Bypasses camera-event triggers.",
-                type: "button",
+                description: "Toggle on to POST /state {wake} and start streaming the bound camera. Resets automatically after firing.",
+                type: "boolean",
+                value: false,
             } as any,
             {
                 group: "Actions",
                 key: "action_sleep",
                 title: "Sleep now",
-                description: "POST /state {sleep} and stop the active stream.",
-                type: "button",
+                description: "Toggle on to POST /state {sleep} and stop the active stream. Resets automatically after firing.",
+                type: "boolean",
+                value: false,
             } as any,
         ];
 
@@ -244,6 +246,11 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             // Manual override from the Scrypted UI. Wake also starts a
             // stream so the user sees the camera immediately; Sleep
             // tears down the live ffmpeg and POSTs sleep.
+            // Boolean acts as a one-shot trigger — fire on truthy then
+            // re-render with the toggle cleared so it's ready to fire
+            // again next time.
+            const truthy = value === true || value === "true";
+            if (!truthy) return;
             if (!this.host) return;
             if (key === "action_wake") {
                 if (!this.provider.streams.has(this.name) &&
