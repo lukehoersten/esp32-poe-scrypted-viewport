@@ -79,7 +79,13 @@ type SettingValue            = any;
 // Settings page so it can be tweaked without editing the script.
 const DEFAULT_FRAME_INTERVAL_MS  = 500;   // ~2 fps — snapshot-based; cameras typically can't sustain faster
 const REREGISTER_INTERVAL_MS     = 5 * 60_000;
-const HTTP_TIMEOUT_MS            = 1_000;
+// 5s gives /state + /config posts enough headroom to slip in between
+// /frame POSTs when the device is mid-stream. The firmware's single
+// httpd task processes one connection at a time; under heavy /frame
+// load a /state {wake} can queue behind 1–3 in-flight /frames before
+// landing. 1s was tripping when a burst of camera events triggered
+// back-to-back startStream calls.
+const HTTP_TIMEOUT_MS            = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
 const DEFAULT_BRIGHTNESS         = 80;
 
@@ -493,6 +499,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // Camera event → stream
     // ------------------------------------------------------------------------
 
+    // Per-viewport "stream is actively starting" guard. handleCameraEvent
+    // can fire multiple times in the same second (MotionSensor often
+    // re-asserts every ~500 ms while motion is sustained); without this,
+    // each event launches its own startStream which races with the
+    // previous one and saturates the firmware's httpd. If a stream is
+    // already live we just leave it running — the per-stream timeout
+    // anchored to the event still fires correctly.
+    private streamStarting = new Set<string>();
+
     private handleCameraEvent(v: Viewport, details: any, data: any) {
         const iface = details.eventInterface;
         const allowed = v.triggers;
@@ -505,7 +520,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
         if (!trigger) return;
         this.console.log(`event ${iface} -> "${v.name}": wake`);
-        this.startStream(v).catch(e => this.console.error("startStream failed", e));
+        // If a stream is already in flight for this viewport, the event
+        // is just reinforcement — the existing ffmpeg child is already
+        // pushing frames. We do NOT relaunch (would race with previous).
+        if (this.streams.has(v.name)) return;
+        if (this.streamStarting.has(v.nativeId!)) return;
+        this.streamStarting.add(v.nativeId!);
+        this.startStream(v)
+            .catch(e => this.console.error("startStream failed", e))
+            .finally(() => this.streamStarting.delete(v.nativeId!));
     }
 
     private async startStream(v: Viewport) {
