@@ -685,6 +685,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // drop the spare frames silently — natural rate-limiter.
         let inFlight = false;
         let droppedFrames = 0;
+        let sentFrames    = 0;
         let lastLogUs = Date.now();
         let workBuf: Buffer = Buffer.alloc(0);
 
@@ -738,6 +739,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
                     if (inFlight) { droppedFrames++; continue; }
                     inFlight = true;
+                    sentFrames++;
                     this.pushStreamFrame(v, frame, abort)
                         .catch(e => {
                             if (abort.signal.aborted) return;
@@ -783,22 +785,24 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             try { currentProc?.kill("SIGTERM"); } catch {}
         });
 
-        // Periodic skip-rate log so the operator sees the effective fps
-        // and can decide whether to bump frame_interval_ms up or down.
-        // Only log if drops exceed 25% of the configured rate — below
-        // that it's just ffmpeg's fps filter emitting timestamp-clumped
-        // pairs that our single-flight guard correctly drops without
-        // any actual playback impact.
+        // Periodic skip-rate log. The metric that matters is *delivered*
+        // fps vs. requested rate, not raw drop count — at low intervals
+        // ffmpeg's fps filter emits timestamp-clumped pairs and our
+        // single-flight guard correctly skips the second, but the
+        // first still painted on time. Only warn if delivered fps falls
+        // below 75% of target.
         const skipLogger = setInterval(() => {
             const now = Date.now();
             const window = (now - lastLogUs) / 1000;
-            if (droppedFrames > 0 && window > 0) {
-                const dropRate = droppedFrames / window;
+            if (window > 0 && (sentFrames > 0 || droppedFrames > 0)) {
+                const sentRate   = sentFrames / window;
                 const targetRate = 1000 / v.frameIntervalMs;
-                if (dropRate > targetRate * 0.25) {
-                    this.console.log(`"${v.name}": dropping ~${dropRate.toFixed(1)} fps over the last ${window.toFixed(1)}s (in-flight HTTP POST hadn't returned when ffmpeg emitted the next frame; raise frame_interval_ms slightly to flatten this)`);
+                if (sentRate < targetRate * 0.75) {
+                    const dropRate = droppedFrames / window;
+                    this.console.log(`"${v.name}": delivered ~${sentRate.toFixed(1)} fps vs target ${targetRate.toFixed(1)} fps over the last ${window.toFixed(1)}s (dropped ~${dropRate.toFixed(1)} fps — in-flight HTTP POST hadn't returned when ffmpeg emitted the next frame; raise frame_interval_ms slightly to flatten this)`);
                 }
                 droppedFrames = 0;
+                sentFrames    = 0;
                 lastLogUs     = now;
             }
         }, 10_000);
