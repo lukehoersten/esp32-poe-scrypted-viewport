@@ -426,11 +426,24 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.bindingDebounce.delete(nid);
             this.detachListener(nid);
             // Any active stream for this viewport is now stale (camera
-            // may have changed). Stop cleanly; next event/wake will
-            // start fresh.
+            // or orientation may have changed). Stop cleanly; if it
+            // was live we relaunch immediately under the new settings
+            // so the user sees the change without waiting for the next
+            // camera event.
+            const wasStreaming = this.streams.has(v.name);
             this.stopStream(v.name, /*sendSleep=*/ false);
             this.attachListener(v);
-            this.registerViewport(v).catch(() => {});
+            this.registerViewport(v)
+                .then(() => {
+                    if (wasStreaming) {
+                        if (this.streamStarting.has(nid)) return;
+                        this.streamStarting.add(nid);
+                        this.startStream(v)
+                            .catch(e => this.console.error("restart after setting change failed", e))
+                            .finally(() => this.streamStarting.delete(nid));
+                    }
+                })
+                .catch(() => {});
         }, 300));
     };
 
