@@ -626,6 +626,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
             : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
         const fps = Math.max(1, Math.round(1000 / v.frameIntervalMs));
+        // Diagnostic — confirms which filter chain the *currently loaded*
+        // script is actually using. If you don't see this line in the
+        // plugin log, the Scrypted Script editor is still on stale code
+        // and a re-paste/save didn't take. If you do see it but the
+        // firmware still rejects 480x800, the rotation didn't apply
+        // (very rare ffmpeg build issue) and we'd need to look at
+        // installed ffmpeg version.
+        this.console.log(`stream "${v.name}": orientation=${v.orientation} panel=${panelW}x${panelH} vf="${vf}"`);
 
         // Pull the camera's video stream, convert to ffmpeg input args, and
         // pipe through a single ffmpeg child: input → scale(lanczos) →
