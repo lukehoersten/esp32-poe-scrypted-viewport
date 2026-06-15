@@ -296,13 +296,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const name = String(settings.name || "viewport").trim();
         const nativeId = `vp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
-        // Pre-populate the child's storage so its first registration uses
-        // the form values rather than empty defaults.
-        const childStore = deviceManager.getDeviceStorage(nativeId);
-        childStore.setItem("host",         String(settings.host || ""));
-        childStore.setItem("cameraId",     String(settings.cameraId || ""));
-        childStore.setItem("orientation",  String(settings.orientation || "portrait"));
-
+        // 1. Register the device with Scrypted FIRST. deviceManager
+        //    materialises the storage container only after discovery —
+        //    calling getDeviceStorage before this returns undefined and
+        //    setItem() throws "Cannot read properties of undefined".
         await deviceManager.onDeviceDiscovered({
             providerNativeId: this.nativeId,
             nativeId,
@@ -311,15 +308,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             interfaces: [ScryptedInterface.Settings],
         });
 
+        // 2. Now safe to seed the child's storage from the form values.
+        const childStore = deviceManager.getDeviceStorage(nativeId);
+        childStore.setItem("host",         String(settings.host || ""));
+        childStore.setItem("cameraId",     String(settings.cameraId || ""));
+        childStore.setItem("orientation",  String(settings.orientation || "portrait"));
+
         this.childIds = [...this.childIds, nativeId];
         this.console.log(`created viewport "${name}" (${nativeId})`);
 
-        // Fire-and-forget mDNS resolve so the host field is auto-populated
-        // by the time the operator opens the new device's settings page.
-        // getDevice() above already attempted a register; this catches the
-        // case where the operator left host blank and mDNS resolution was
-        // the only way to fill it.
-        const child = this.viewports.get(nativeId);
+        // Kick off the first register cycle (mDNS resolve + POST /config).
+        // Fire-and-forget — the new device shows up immediately either way.
+        const child = await this.getDevice(nativeId);
         if (child) this.registerViewport(child).catch(() => {});
 
         return nativeId;
