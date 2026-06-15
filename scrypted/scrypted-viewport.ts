@@ -291,6 +291,30 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }>();
     private scryptedBase = "";
 
+    // Per-host undici Agent so /frame POSTs reuse the TCP connection
+    // and pipeline two-in-flight. Reusing the socket saves the SYN +
+    // SYN-ACK + ACK round-trip (~1ms on LAN, more painful on Wi-Fi),
+    // and the connections:2 cap lets us overlap upload of frame N+1
+    // with the firmware's decode-and-paint of frame N. pipelining:0
+    // because esp_http_server doesn't support HTTP/1.1 request
+    // pipelining on a single connection — we want two independent
+    // sockets, not two requests stacked on one.
+    private dispatchers = new Map<string, any>();
+    private dispatcherFor(host: string): any {
+        let d = this.dispatchers.get(host);
+        if (!d) {
+            const { Agent } = require("undici");
+            d = new Agent({
+                keepAliveTimeout:     30_000,
+                keepAliveMaxTimeout:  60_000,
+                connections:          2,
+                pipelining:           0,
+            });
+            this.dispatchers.set(host, d);
+        }
+        return d;
+    }
+
     constructor(nativeId?: string) {
         super(nativeId);
         this.start().catch(e => this.console.error("start failed", e));
@@ -683,7 +707,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // Single-flight: only one POST /frame in flight at a time. The
         // firmware's JPEG decoder mutex returns 503 otherwise; we just
         // drop the spare frames silently — natural rate-limiter.
-        let inFlight = false;
+        // Allow up to MAX_INFLIGHT concurrent /frame POSTs so that the
+        // network upload of frame N+1 overlaps with the firmware's
+        // decode+paint of frame N. The firmware's JPEG decoder mutex
+        // serialises the decode itself; this only buys us the upload
+        // overlap (≈ half of total /frame wall time). Keep this in
+        // sync with cfg.max_open_sockets in main/http_api.c — that
+        // sits at 4 (2 for streaming + 2 spare for /state, /config).
+        const MAX_INFLIGHT = 2;
+        let inFlight = 0;
         let droppedFrames = 0;
         let sentFrames    = 0;
         let lastLogUs = Date.now();
@@ -737,8 +769,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     workBuf = workBuf.subarray(eoi + 2);
                     if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
 
-                    if (inFlight) { droppedFrames++; continue; }
-                    inFlight = true;
+                    if (inFlight >= MAX_INFLIGHT) { droppedFrames++; continue; }
+                    inFlight++;
                     sentFrames++;
                     this.pushStreamFrame(v, frame, abort)
                         .catch(e => {
@@ -747,7 +779,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                             const cause = (err as any)?.cause?.code || "";
                             this.console.warn(`pushStreamFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
                         })
-                        .finally(() => { inFlight = false; });
+                        .finally(() => { inFlight--; });
                 }
             });
 
@@ -858,7 +890,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             headers: { "Content-Type": "image/jpeg" },
             body: jpeg,
             signal: abort.signal,
-        });
+            // @ts-ignore - undici dispatcher: keep-alive + 2 connections
+            // per host. Lets frame N+1 begin uploading on socket B while
+            // frame N is still being decoded/painted on the device via
+            // socket A.
+            dispatcher: this.dispatcherFor(v.host),
+        } as any);
         const wallMs = Date.now() - t0;
         const n = (this.fetchCount.get(v.nativeId!) || 0) + 1;
         this.fetchCount.set(v.nativeId!, n);
@@ -949,12 +986,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // ------------------------------------------------------------------------
 
     private async postJSON(url: string, body: any) {
+        const host = new URL(url).host.split(":")[0];
         const res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-        });
+            // @ts-ignore - undici dispatcher
+            dispatcher: this.dispatcherFor(host),
+        } as any);
         if (!res.ok && res.status !== 204) {
             const text = await res.text().catch(() => "");
             throw new Error(`POST ${url} -> ${res.status} ${text}`);

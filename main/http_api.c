@@ -486,6 +486,12 @@ esp_err_t http_api_start(void)
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;
     cfg.stack_size       = 8192;  // POST /config alone has ~2.4 KiB of stack locals
+    // Allow Scrypted to keep two POST /frame in flight at once so the
+    // body upload of frame N+1 overlaps with the JPEG decode of frame
+    // N. The decoder mutex still serialises decode itself; this only
+    // unblocks the network half of the pipeline. +1 socket reserve for
+    // a concurrent /state or /config request landing during a stream.
+    cfg.max_open_sockets = 4;
 
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start");
