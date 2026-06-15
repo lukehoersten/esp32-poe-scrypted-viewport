@@ -300,19 +300,32 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // pipelining on a single connection — we want two independent
     // sockets, not two requests stacked on one.
     private dispatchers = new Map<string, any>();
+    private undiciAvailable: boolean | undefined;
     private dispatcherFor(host: string): any {
+        // Try undici exactly once per provider lifetime. Scrypted's
+        // plugin sandbox doesn't always expose it as a require()-able
+        // module — when that's the case we silently fall back to
+        // plain fetch (no socket pooling). Functionally still works,
+        // just costs the SYN+SYN-ACK+ACK round-trip per POST.
+        if (this.undiciAvailable === false) return undefined;
         let d = this.dispatchers.get(host);
-        if (!d) {
+        if (d !== undefined) return d;
+        try {
             const { Agent } = require("undici");
             d = new Agent({
-                keepAliveTimeout:     30_000,
-                keepAliveMaxTimeout:  60_000,
-                connections:          2,
-                pipelining:           0,
+                keepAliveTimeout:    30_000,
+                keepAliveMaxTimeout: 60_000,
+                connections:         2,
+                pipelining:          0,
             });
             this.dispatchers.set(host, d);
+            this.undiciAvailable = true;
+            return d;
+        } catch {
+            this.undiciAvailable = false;
+            this.console.warn(`undici not available in this Scrypted runtime — falling back to per-POST sockets (no keep-alive, no 2-way pipelining at the TCP layer)`);
+            return undefined;
         }
-        return d;
     }
 
     constructor(nativeId?: string) {
@@ -921,17 +934,20 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
         this.frameSeq.set(v.nativeId!, seq);
         const tFetchStart = Date.now();
-        const res = await fetch(`http://${v.host}/frame`, {
+        const opts: any = {
             method: "POST",
             headers: { "Content-Type": "image/jpeg", "X-Frame-Seq": String(seq) },
             body: jpeg,
             signal: abort.signal,
-            // @ts-ignore - undici dispatcher: keep-alive + 2 connections
-            // per host. Lets frame N+1 begin uploading on socket B while
-            // frame N is still being decoded/painted on the device via
-            // socket A.
-            dispatcher: this.dispatcherFor(v.host),
-        } as any);
+        };
+        // undici dispatcher: keep-alive + 2 connections per host so
+        // frame N+1 begins uploading on socket B while frame N is
+        // still being decoded/painted on the device via socket A.
+        // dispatcherFor returns undefined when undici isn't reachable
+        // from the Scrypted plugin sandbox.
+        const dispatcher = this.dispatcherFor(v.host);
+        if (dispatcher) opts.dispatcher = dispatcher;
+        const res = await fetch(`http://${v.host}/frame`, opts);
         const tHeaders = Date.now();
         const wasStale = res.headers.get("X-Frame-Drop") === "stale-seq";
         // Drain body so the socket can be released back to the pool.
@@ -1054,14 +1070,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private async postJSON(url: string, body: any) {
         const host = new URL(url).host.split(":")[0];
-        const res = await fetch(url, {
+        const opts: any = {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-            // @ts-ignore - undici dispatcher
-            dispatcher: this.dispatcherFor(host),
-        } as any);
+        };
+        const dispatcher = this.dispatcherFor(host);
+        if (dispatcher) opts.dispatcher = dispatcher;
+        const res = await fetch(url, opts);
         if (!res.ok && res.status !== 204) {
             const text = await res.text().catch(() => "");
             throw new Error(`POST ${url} -> ${res.status} ${text}`);
