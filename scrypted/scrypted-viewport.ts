@@ -213,7 +213,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     private async start() {
-        const raw = await endpointManager.getInsecurePublicLocalEndpoint(this.id);
+        // endpointManager.getInsecurePublicLocalEndpoint() takes a nativeId
+        // (string) — passing this.id (numeric Scrypted DB ID) throws
+        // "invalid nativeId N". this.nativeId is the right key, and an
+        // omitted nativeId falls back to the plugin's own endpoint.
+        const raw = await endpointManager.getInsecurePublicLocalEndpoint(this.nativeId);
         this.scryptedBase = raw.replace(/\/$/, "");
         this.console.log(`Scrypted Viewport up. Callback URL base: ${this.scryptedBase}`);
 
