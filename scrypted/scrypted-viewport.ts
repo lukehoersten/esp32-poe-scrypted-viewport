@@ -562,11 +562,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const w = v.orientation === "portrait" ? 480 : 800;
         const h = v.orientation === "portrait" ? 800 : 480;
 
-        const picture = await cam.takePicture({
-            picture: { width: w, height: h },
-            reason: "event",
-        });
-        const buf: Buffer = await mediaManager.convertMediaObjectToBuffer(picture, "image/jpeg");
+        // Request the camera's native-resolution snapshot (no width/height
+        // in the picture options) and downsize + re-encode locally with
+        // ffmpeg at high quality. Most camera plugins default snapshot
+        // JPEGs to q≈75 and do a quick bilinear downscale, which looked
+        // visibly worse than the original H.264 stream. Lanczos + q=2
+        // gets snapshot fidelity back close to the keyframe.
+        const picture = await cam.takePicture({ reason: "event" });
+        const native: Buffer = await mediaManager.convertMediaObjectToBuffer(picture, "image/jpeg");
+        const buf: Buffer = await this.resizeJpegHQ(native, w, h);
 
         const res = await fetch(`http://${v.host}/frame`, {
             method: "POST",
@@ -642,6 +646,39 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     async putSetting(_key: string, _value: SettingValue) {}
+
+    // ------------------------------------------------------------------------
+    // Image resize via ffmpeg (snapshot fidelity ≫ camera-plugin downscale)
+    // ------------------------------------------------------------------------
+
+    private async resizeJpegHQ(jpeg: any, w: number, h: number): Promise<any> {
+        const { spawn } = require("child_process");
+        const ffmpegPath =
+            (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
+            "ffmpeg";
+        return await new Promise<any>((resolve, reject) => {
+            const proc = spawn(ffmpegPath, [
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "image2pipe", "-c:v", "mjpeg", "-i", "pipe:0",
+                "-vf", `scale=${w}:${h}:flags=lanczos`,
+                "-c:v", "mjpeg", "-q:v", "2",
+                "-f", "image2pipe", "pipe:1",
+            ]);
+            const chunks: any[] = [];
+            const errs: any[]   = [];
+            proc.stdout.on("data", (c: any) => chunks.push(c));
+            proc.stderr.on("data", (c: any) => errs.push(c));
+            proc.on("error",  (e: any) => reject(e));
+            proc.on("close",  (code: number) => {
+                if (code !== 0) {
+                    reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(errs).toString("utf8").trim()}`));
+                    return;
+                }
+                resolve(Buffer.concat(chunks));
+            });
+            proc.stdin.end(jpeg);
+        });
+    }
 
     // ------------------------------------------------------------------------
     // Tiny HTTP helper
