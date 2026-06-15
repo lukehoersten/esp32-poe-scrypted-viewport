@@ -26,14 +26,21 @@
 // 6. Edit a viewport's settings from its own device page in the UI. The
 //    script re-registers and re-subscribes whenever a setting changes.
 //
-// v1 limits (path to v2: a packaged plugin with FFmpeg streaming)
-// ---------------------------------------------------------------
-// - Snapshot-rate (~1 fps) via Camera.takePicture(). Live-rate MJPEG over
-//   POST /stream is v2.
+// Streaming
+// ---------
+// On wake we subscribe to the camera's video stream, spawn one ffmpeg
+// child that scales + re-encodes to MJPEG (q:v 2, lanczos) at the
+// viewport's configured fps, demux JPEG frames out of stdout (FFD8…FFD9)
+// and POST each one to the firmware's existing /frame endpoint. Single-
+// flight semantics gate against the firmware's in-flight mutex; surplus
+// frames are dropped silently and counted for a periodic skip-rate log.
+//
+// Limits
+// ------
 // - Manual IP per viewport (see README for how to find it via mDNS from
 //   your shell). DHCP reservation recommended so the IP stays stable.
-// - Camera must respect picture.width/height OR be paired with a snapshot
-//   plugin that resizes. Otherwise /frame returns 400.
+// - Camera must expose a video stream; pure-snapshot cameras need a
+//   transcoder mixin upstream.
 
 // The Scripts plugin (in @scrypted/core) evaluates this file inside the
 // scryptedEval sandbox. The runtime pre-injects the SDK names as scope
@@ -233,9 +240,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister>(); // nativeId -> camera event listener
     private streams = new Map<string, {                           // viewport name -> stream control
-        interval: NodeJS.Timeout;
         timeout: NodeJS.Timeout;
-        abort: AbortController;
+        abort:   AbortController;
+        proc?:   any;            // ffmpeg child process (live-stream mode)
+        interval?: NodeJS.Timeout; // legacy snapshot-poll mode
     }>();
     private scryptedBase = "";
 
@@ -499,31 +507,113 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         await this.postJSON(`http://${v.host}/state`, { state: "wake" });
 
+        const cam: any = systemManager.getDeviceById(v.cameraId);
+        if (!cam) return;
+        const w   = v.orientation === "portrait" ? 480 : 800;
+        const h   = v.orientation === "portrait" ? 800 : 480;
+        const fps = Math.max(1, Math.round(1000 / v.frameIntervalMs));
+
+        // Pull the camera's video stream, convert to ffmpeg input args, and
+        // pipe through a single ffmpeg child: input → scale(lanczos) →
+        // mjpeg q:v 2 → image2pipe. We then framer the raw MJPEG bytes
+        // out of stdout into individual JPEGs and POST each one. This
+        // beats the snapshot path because:
+        //   - the camera's main encoder is producing keyframes anyway, so
+        //     we're paying ~zero extra on the source side,
+        //   - ffmpeg sustains real fps; the takePicture loop never could,
+        //   - quality stays high (lanczos + q:v 2 ≈ visually lossless).
+        let stream: any;
+        try {
+            stream = await cam.getVideoStream({ destination: "remote-recorder" });
+        } catch {
+            stream = await cam.getVideoStream();
+        }
+        const ffmpegInputBuf: Buffer = await mediaManager.convertMediaObjectToBuffer(
+            stream, "x-scrypted/x-ffmpeg-input");
+        let ffmpegInput: any;
+        try { ffmpegInput = JSON.parse(ffmpegInputBuf.toString("utf8")); }
+        catch (e) {
+            this.console.warn(`"${v.name}" no usable video stream for ffmpeg — skipping`);
+            return;
+        }
+
+        const { spawn } = require("child_process");
+        const ffmpegPath =
+            (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
+            "ffmpeg";
+
         const abort = new AbortController();
-        // Single-flight guard: at low intervals (≤ 200 ms) the camera's
-        // takePicture or the network round-trip can take longer than the
-        // tick. Without this we pile up overlapping fetches and Node
-        // surfaces them as the unhelpful "fetch failed".
+        const proc = spawn(ffmpegPath, [
+            "-hide_banner", "-loglevel", "error",
+            "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
+            ...(ffmpegInput.inputArguments || []),
+            "-an", "-sn",
+            "-vf", `scale=${w}:${h}:flags=lanczos,fps=${fps}`,
+            "-c:v", "mjpeg", "-q:v", "2",
+            "-f", "image2pipe", "-flush_packets", "1",
+            "pipe:1",
+        ]);
+
+        // Single-flight: only one POST /frame in flight at a time. The
+        // firmware's JPEG decoder mutex returns 503 otherwise; we just
+        // drop the spare frames silently — natural rate-limiter.
         let inFlight = false;
-        let dropped  = 0;
-        const interval = setInterval(() => {
+        let droppedFrames = 0;
+        let lastLogUs = Date.now();
+        let workBuf: Buffer = Buffer.alloc(0);
+
+        proc.stdout.on("data", (chunk: Buffer) => {
             if (abort.signal.aborted) return;
-            if (inFlight) { dropped++; return; }
-            inFlight = true;
-            this.pushFrame(v, abort)
-                .catch(e => {
-                    if (abort.signal.aborted) return;
-                    const err = (e as Error);
-                    const cause = (err as any)?.cause?.code || (err as any)?.cause?.message || "";
-                    this.console.warn(`pushFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
-                })
-                .finally(() => { inFlight = false; });
-            // Log dropped ticks once per second so the user sees if the
-            // configured interval is actually achievable.
-            if (dropped > 0 && dropped % Math.max(1, Math.round(1000 / v.frameIntervalMs)) === 0) {
-                this.console.log(`"${v.name}": ${dropped} ticks skipped (in-flight) — interval ${v.frameIntervalMs}ms is too fast for the pipeline`);
+            workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
+            // Frame each complete JPEG (SOI = 0xFF 0xD8 ... EOI = 0xFF 0xD9).
+            // ffmpeg with image2pipe + mjpeg writes back-to-back complete
+            // JPEGs so we just split on EOI.
+            while (true) {
+                const eoi = workBuf.indexOf(Buffer.from([0xff, 0xd9]));
+                if (eoi < 0) break;
+                const frame = workBuf.subarray(0, eoi + 2);
+                workBuf = workBuf.subarray(eoi + 2);
+                if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
+
+                if (inFlight) { droppedFrames++; continue; }
+                inFlight = true;
+                this.pushStreamFrame(v, frame, abort)
+                    .catch(e => {
+                        if (abort.signal.aborted) return;
+                        const err = (e as Error);
+                        const cause = (err as any)?.cause?.code || "";
+                        this.console.warn(`pushStreamFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
+                    })
+                    .finally(() => { inFlight = false; });
             }
-        }, v.frameIntervalMs);
+        });
+
+        proc.stderr.on("data", (chunk: Buffer) => {
+            const text = chunk.toString("utf8").trim();
+            if (text) this.console.warn(`ffmpeg "${v.name}": ${text}`);
+        });
+        proc.on("error", (e: any) => {
+            if (!abort.signal.aborted) this.console.warn(`ffmpeg "${v.name}" spawn error:`, e.message);
+        });
+        proc.on("close", (code: number) => {
+            if (!abort.signal.aborted) this.console.log(`ffmpeg "${v.name}" exited (code=${code})`);
+        });
+        abort.signal.addEventListener("abort", () => {
+            try { proc.kill("SIGTERM"); } catch {}
+        });
+
+        // Periodic skip-rate log so the operator sees the effective fps
+        // and can decide whether to bump frame_interval_ms up or down.
+        const skipLogger = setInterval(() => {
+            const now = Date.now();
+            if (droppedFrames > 0) {
+                const window = (now - lastLogUs) / 1000;
+                this.console.log(`"${v.name}": dropping ~${(droppedFrames / window).toFixed(1)} fps over the last ${window.toFixed(1)}s; firmware decode-paint is the ceiling`);
+                droppedFrames = 0;
+                lastLogUs     = now;
+            }
+        }, 10_000);
+        abort.signal.addEventListener("abort", () => clearInterval(skipLogger));
 
         const timeoutMs = v.idleTimeoutMs > 0 ? v.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
         const timeout = setTimeout(() => {
@@ -531,15 +621,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.stopStream(v.name);
         }, timeoutMs);
 
-        this.streams.set(v.name, { interval, timeout, abort });
+        this.streams.set(v.name, { timeout, abort, proc });
     }
 
     private stopStream(name: string, sendSleep = true) {
         const s = this.streams.get(name);
         if (!s) return;
         s.abort.abort();
-        clearInterval(s.interval);
+        if (s.interval) clearInterval(s.interval);
         clearTimeout(s.timeout);
+        if (s.proc) { try { s.proc.kill("SIGTERM"); } catch {} }
         this.streams.delete(name);
         if (sendSleep) {
             const v = this.findByName(name);
@@ -549,45 +640,37 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
-    private findByName(name: string): Viewport | undefined {
-        for (const v of this.viewports.values()) if (v.name === name) return v;
-        return undefined;
-    }
-
-    private async pushFrame(v: Viewport, abort: AbortController) {
+    private async pushStreamFrame(v: Viewport, jpeg: Buffer, abort: AbortController) {
         if (abort.signal.aborted) return;
-        const cam: any = systemManager.getDeviceById(v.cameraId);
-        if (!cam) return;
-
-        const w = v.orientation === "portrait" ? 480 : 800;
-        const h = v.orientation === "portrait" ? 800 : 480;
-
-        // Request the camera's native-resolution snapshot (no width/height
-        // in the picture options) and downsize + re-encode locally with
-        // ffmpeg at high quality. Most camera plugins default snapshot
-        // JPEGs to q≈75 and do a quick bilinear downscale, which looked
-        // visibly worse than the original H.264 stream. Lanczos + q=2
-        // gets snapshot fidelity back close to the keyframe.
-        const picture = await cam.takePicture({ reason: "event" });
-        const native: Buffer = await mediaManager.convertMediaObjectToBuffer(picture, "image/jpeg");
-        const buf: Buffer = await this.resizeJpegHQ(native, w, h);
-
         const res = await fetch(`http://${v.host}/frame`, {
             method: "POST",
             headers: { "Content-Type": "image/jpeg" },
-            body: buf,
+            body: jpeg,
             signal: abort.signal,
         });
-
         if (res.status === 409) {
             this.console.log(`"${v.name}" returned 409 — device went to sleep, stopping stream`);
             this.stopStream(v.name, /*sendSleep=*/ false);
         } else if (res.status === 400) {
             const reason = await res.text().catch(() => "");
-            this.console.warn(`"${v.name}" returned 400: ${reason}`);
+            this.console.warn(`"${v.name}" /frame -> 400: ${reason}`);
         } else if (!res.ok) {
             this.console.warn(`"${v.name}" /frame -> ${res.status}`);
+        } else {
+            // Frame painted; reset Scrypted-side idle timer alongside the
+            // device's own (each successful paint extends both).
+            const s = this.streams.get(v.name);
+            if (s) {
+                clearTimeout(s.timeout);
+                s.timeout = setTimeout(() => this.stopStream(v.name),
+                    Math.max(5000, v.idleTimeoutMs));
+            }
         }
+    }
+
+    private findByName(name: string): Viewport | undefined {
+        for (const v of this.viewports.values()) if (v.name === name) return v;
+        return undefined;
     }
 
     // ------------------------------------------------------------------------
@@ -646,39 +729,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     async putSetting(_key: string, _value: SettingValue) {}
-
-    // ------------------------------------------------------------------------
-    // Image resize via ffmpeg (snapshot fidelity ≫ camera-plugin downscale)
-    // ------------------------------------------------------------------------
-
-    private async resizeJpegHQ(jpeg: any, w: number, h: number): Promise<any> {
-        const { spawn } = require("child_process");
-        const ffmpegPath =
-            (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
-            "ffmpeg";
-        return await new Promise<any>((resolve, reject) => {
-            const proc = spawn(ffmpegPath, [
-                "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "image2pipe", "-c:v", "mjpeg", "-i", "pipe:0",
-                "-vf", `scale=${w}:${h}:flags=lanczos`,
-                "-c:v", "mjpeg", "-q:v", "2",
-                "-f", "image2pipe", "pipe:1",
-            ]);
-            const chunks: any[] = [];
-            const errs: any[]   = [];
-            proc.stdout.on("data", (c: any) => chunks.push(c));
-            proc.stderr.on("data", (c: any) => errs.push(c));
-            proc.on("error",  (e: any) => reject(e));
-            proc.on("close",  (code: number) => {
-                if (code !== 0) {
-                    reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(errs).toString("utf8").trim()}`));
-                    return;
-                }
-                resolve(Buffer.concat(chunks));
-            });
-            proc.stdin.end(jpeg);
-        });
-    }
 
     // ------------------------------------------------------------------------
     // Tiny HTTP helper
