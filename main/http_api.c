@@ -312,6 +312,11 @@ static esp_err_t respond_status(httpd_req_t *req, const char *status, const char
     return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
 }
 
+// Tracks when the previous /frame response finished so we can log the
+// idle gap until the next request enters. Large idle = Scrypted/network
+// upstream is the bottleneck; small idle = we're saturating the link.
+static int64_t s_last_post_us;
+
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
     // Content-Type must be image/jpeg.
@@ -417,16 +422,28 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     // draw_bitmap-returns and the response-send adds up.
     t_post = esp_timer_get_time();
 
+    // Idle gap = time from the PREVIOUS /frame response finishing to
+    // THIS request landing on the handler. Large gap = upstream
+    // (Scrypted / ffmpeg / TCP slow-start on a fresh socket) was idle;
+    // we're not the bottleneck. Skipped on the very first frame.
+    int64_t idle_us = s_last_post_us ? (t_entry - s_last_post_us) : 0;
+    s_last_post_us = t_post;
+
     // Timing log every 10 frames so the user can see where each /frame's
-    // wall-clock budget is going. Sub-breakdown of the previously-fat
-    // "recv" bucket: lock acquire + first-byte (TCP setup / TTFB) +
-    // body (actual data wire-time). Post-paint bookkeeping is the
-    // bookkeeping after draw_bitmap returns (state counters + unlock).
+    // wall-clock budget is going. Buckets:
+    //   idle  : time since the previous response finished (upstream gap)
+    //   lock  : mutex acquire
+    //   ttfb  : lock-acquired -> first body byte (TCP setup)
+    //   body  : remaining body bytes (wire time)
+    //   dec   : hardware JPEG decode
+    //   paint : esp_lcd_panel_draw_bitmap → DSI fast-path
+    //   post  : state counters + unlock
     if (fr % 10 == 0) {
         ESP_LOGI(TAG,
-            "frame %llu: lock=%lldus ttfb=%lldus body=%lldus "
+            "frame %llu: idle=%lldus lock=%lldus ttfb=%lldus body=%lldus "
             "dec=%lldus paint=%lldus post=%lldus total=%lldms (jpeg=%uKB)",
             (unsigned long long)fr,
+            (long long)idle_us,
             (long long)(t_lock       - t_entry),
             (long long)(t_first_byte - t_lock),
             (long long)(t_recv       - t_first_byte),

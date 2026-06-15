@@ -713,14 +713,26 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
+    // Scrypted-side per-fetch timing — mirrors the firmware's per-frame
+    // log. Counter advanced in the stdout demux loop; logged once every
+    // 10 fetches alongside the wall-clock duration of the fetch itself.
+    private fetchCount = new Map<string, number>();
+
     private async pushStreamFrame(v: Viewport, jpeg: Buffer, abort: AbortController) {
         if (abort.signal.aborted) return;
+        const t0 = Date.now();
         const res = await fetch(`http://${v.host}/frame`, {
             method: "POST",
             headers: { "Content-Type": "image/jpeg" },
             body: jpeg,
             signal: abort.signal,
         });
+        const wallMs = Date.now() - t0;
+        const n = (this.fetchCount.get(v.nativeId!) || 0) + 1;
+        this.fetchCount.set(v.nativeId!, n);
+        if (n % 10 === 0) {
+            this.console.log(`fetch "${v.name}" #${n}: ${wallMs}ms wall (jpeg=${(jpeg.length / 1024).toFixed(0)}KB)`);
+        }
         if (res.status === 409) {
             this.console.log(`"${v.name}" returned 409 — device went to sleep, stopping stream`);
             this.stopStream(v.name, /*sendSleep=*/ false);
