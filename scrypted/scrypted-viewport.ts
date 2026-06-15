@@ -42,19 +42,16 @@
 // declarations erase at compile time and the values come from the
 // runtime scope.
 declare const sdk: any;
-declare const require: any;
-
-// Everything the script touches at runtime comes off the `sdk` global —
-// older @scrypted/core versions don't inject `ScryptedDeviceBase` etc
-// as separate identifiers, only `sdk` itself. Accessing `sdk.X` is the
-// stable interface.
-const ScryptedDeviceBase = sdk.ScryptedDeviceBase;
-const ScryptedDeviceType = sdk.ScryptedDeviceType;
-const ScryptedInterface  = sdk.ScryptedInterface;
-const systemManager      = sdk.systemManager;
-const endpointManager    = sdk.endpointManager;
-const mediaManager       = sdk.mediaManager;
-const deviceManager      = sdk.deviceManager;
+declare const ScryptedDeviceBase: any;
+declare const ScryptedDeviceType: any;
+declare const ScryptedInterface:  any;
+declare const systemManager:      any;
+declare const endpointManager:    any;
+declare const mediaManager:       any;
+declare const deviceManager:      any;
+declare const log:                any;
+declare const device:             any;
+declare const require:            any;
 
 const dns = require("dns").promises;
 
