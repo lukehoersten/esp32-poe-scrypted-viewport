@@ -494,10 +494,29 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         await this.postJSON(`http://${v.host}/state`, { state: "wake" });
 
         const abort = new AbortController();
+        // Single-flight guard: at low intervals (≤ 200 ms) the camera's
+        // takePicture or the network round-trip can take longer than the
+        // tick. Without this we pile up overlapping fetches and Node
+        // surfaces them as the unhelpful "fetch failed".
+        let inFlight = false;
+        let dropped  = 0;
         const interval = setInterval(() => {
-            this.pushFrame(v, abort).catch(e => {
-                if (!abort.signal.aborted) this.console.warn(`pushFrame "${v.name}":`, (e as Error).message);
-            });
+            if (abort.signal.aborted) return;
+            if (inFlight) { dropped++; return; }
+            inFlight = true;
+            this.pushFrame(v, abort)
+                .catch(e => {
+                    if (abort.signal.aborted) return;
+                    const err = (e as Error);
+                    const cause = (err as any)?.cause?.code || (err as any)?.cause?.message || "";
+                    this.console.warn(`pushFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
+                })
+                .finally(() => { inFlight = false; });
+            // Log dropped ticks once per second so the user sees if the
+            // configured interval is actually achievable.
+            if (dropped > 0 && dropped % Math.max(1, Math.round(1000 / v.frameIntervalMs)) === 0) {
+                this.console.log(`"${v.name}": ${dropped} ticks skipped (in-flight) — interval ${v.frameIntervalMs}ms is too fast for the pipeline`);
+            }
         }, v.frameIntervalMs);
 
         const timeoutMs = v.idleTimeoutMs > 0 ? v.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
