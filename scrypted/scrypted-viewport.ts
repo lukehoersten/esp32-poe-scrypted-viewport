@@ -221,11 +221,23 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.scryptedBase = raw.replace(/\/$/, "");
         this.console.log(`Scrypted Viewport up. Callback URL base: ${this.scryptedBase}`);
 
-        // Eagerly instantiate every known child so its registration + camera
-        // event subscription happen at plugin load (rather than waiting for
-        // some other part of Scrypted to touch the child).
+        // Re-discover every known child so Scrypted reattaches its storage
+        // to the nativeId. Without this, `new Viewport(...)` instantiates
+        // with `this.storage === undefined` and every storage-backed getter
+        // (host / cameraId / orientation / ...) throws on script reload.
+        // Then eagerly instantiate so each child's registration + camera
+        // event subscription happen at plugin load.
         for (const nativeId of this.childIds) {
-            try { await this.getDevice(nativeId); }
+            try {
+                await deviceManager.onDeviceDiscovered({
+                    providerNativeId: this.nativeId,
+                    nativeId,
+                    name: nativeId,  // overridden by Scrypted from its existing record
+                    type: ScryptedDeviceType.Sensor,
+                    interfaces: [ScryptedInterface.Settings],
+                });
+                await this.getDevice(nativeId);
+            }
             catch (e) { this.console.warn(`load child ${nativeId} failed:`, (e as Error).message); }
         }
 
