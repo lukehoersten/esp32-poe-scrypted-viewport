@@ -651,12 +651,19 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         //     we're paying ~zero extra on the source side,
         //   - ffmpeg sustains real fps; the takePicture loop never could,
         //   - quality stays high (lanczos + q:v 2 ≈ visually lossless).
+        // Stream-source choice drives end-to-end latency more than
+        // anything else. remote-recorder hands us the high-bitrate
+        // main encoder with a large GOP and the camera's own ~10s
+        // prebuffer baked in — we'd watch the past, not the present.
+        // Walk substreams from lowest-latency → highest-latency and
+        // take the first one that resolves.
         let stream: any;
-        try {
-            stream = await cam.getVideoStream({ destination: "remote-recorder" });
-        } catch {
-            stream = await cam.getVideoStream();
+        const destOrder = ["low-resolution", "medium-resolution", "local", "remote", "remote-recorder"];
+        for (const destination of destOrder) {
+            try { stream = await cam.getVideoStream({ destination }); break; }
+            catch { /* try next */ }
         }
+        if (!stream) stream = await cam.getVideoStream();
         const ffmpegInputBuf: Buffer = await mediaManager.convertMediaObjectToBuffer(
             stream, "x-scrypted/x-ffmpeg-input");
         let ffmpegInput: any;
@@ -696,10 +703,23 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             workBuf = Buffer.alloc(0);   // reset framer state on each respawn
             const p = spawn(ffmpegPath, [
                 "-hide_banner", "-loglevel", "error",
-                "-fflags", "+genpts+nobuffer", "-flags", "low_delay",
+                // Latency tuning on the INPUT side: don't buffer, don't
+                // probe, decode straight through. probesize/analyzeduration
+                // at the minimum keeps ffmpeg from sitting on the first
+                // ~5s of source to learn the stream layout.
+                "-fflags", "+genpts+nobuffer+discardcorrupt",
+                "-flags", "low_delay",
+                "-avioflags", "direct",
+                "-probesize", "32",
+                "-analyzeduration", "0",
                 ...(ffmpegInput.inputArguments || []),
                 "-an", "-sn",
                 "-vf", `${vf},fps=${fps}`,
+                // -fps_mode drop: when the decoder is behind, throw the
+                // late frame on the floor instead of queueing it. Without
+                // this, ffmpeg's output queue fills up and the displayed
+                // image lags further and further behind reality.
+                "-fps_mode", "drop",
                 "-c:v", "mjpeg", "-q:v", "2",
                 "-f", "image2pipe", "-flush_packets", "1",
                 "pipe:1",
