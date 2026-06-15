@@ -233,7 +233,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     providerNativeId: this.nativeId,
                     nativeId,
                     name: nativeId,  // overridden by Scrypted from its existing record
-                    type: ScryptedDeviceType.Sensor,
+                    type: ScryptedDeviceType.SmartDisplay,
                     interfaces: [ScryptedInterface.Settings],
                 });
                 await this.getDevice(nativeId);
@@ -320,7 +320,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             providerNativeId: this.nativeId,
             nativeId,
             name,
-            type: ScryptedDeviceType.Sensor,
+            type: ScryptedDeviceType.SmartDisplay,
             interfaces: [ScryptedInterface.Settings],
         });
 
