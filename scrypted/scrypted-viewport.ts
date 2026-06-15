@@ -642,7 +642,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             const now = Date.now();
             if (droppedFrames > 0) {
                 const window = (now - lastLogUs) / 1000;
-                this.console.log(`"${v.name}": dropping ~${(droppedFrames / window).toFixed(1)} fps over the last ${window.toFixed(1)}s; firmware decode-paint is the ceiling`);
+                this.console.log(`"${v.name}": dropping ~${(droppedFrames / window).toFixed(1)} fps over the last ${window.toFixed(1)}s (in-flight HTTP POST hadn't returned when ffmpeg emitted the next frame; raise frame_interval_ms slightly to flatten this)`);
                 droppedFrames = 0;
                 lastLogUs     = now;
             }
