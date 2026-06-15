@@ -407,14 +407,25 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // Per-binding plumbing (camera subscription + /config registration)
     // ------------------------------------------------------------------------
 
+    // Per-viewport debounce timer. Scrypted's Settings UI does one
+    // putSetting per field on save, so a typical "Save" with 5 fields
+    // changed used to register 5 times. Coalesce into a single apply.
+    private bindingDebounce = new Map<string, NodeJS.Timeout>();
+
     onBindingChanged = async (v: Viewport): Promise<void> => {
         const nid = v.nativeId!;
-        this.detachListener(nid);
-        // Any active stream for this viewport is now stale (camera may have
-        // changed). Stop it cleanly; the next event/wake will start fresh.
-        this.stopStream(v.name, /*sendSleep=*/ false);
-        this.attachListener(v);
-        await this.registerViewport(v);
+        const pending = this.bindingDebounce.get(nid);
+        if (pending) clearTimeout(pending);
+        this.bindingDebounce.set(nid, setTimeout(() => {
+            this.bindingDebounce.delete(nid);
+            this.detachListener(nid);
+            // Any active stream for this viewport is now stale (camera
+            // may have changed). Stop cleanly; next event/wake will
+            // start fresh.
+            this.stopStream(v.name, /*sendSleep=*/ false);
+            this.attachListener(v);
+            this.registerViewport(v).catch(() => {});
+        }, 300));
     };
 
     private attachListener(v: Viewport) {
