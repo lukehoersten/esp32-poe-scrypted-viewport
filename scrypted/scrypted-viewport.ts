@@ -325,7 +325,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         });
 
         // 2. Now safe to seed the child's storage from the form values.
+        //    display_name is the canonical user-facing name; v.name (the
+        //    ScryptedDeviceBase one) is async-loaded from Scrypted's record
+        //    and races with our first registerViewport call, so we mirror
+        //    it into storage as a stable fallback for register/log paths.
         const childStore = deviceManager.getDeviceStorage(nativeId);
+        childStore.setItem("display_name", name);
         childStore.setItem("host",         String(settings.host || ""));
         childStore.setItem("cameraId",     String(settings.cameraId || ""));
         childStore.setItem("orientation",  String(settings.orientation || "portrait"));
@@ -358,8 +363,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     private attachListener(v: Viewport) {
         if (!v.cameraId) return;
         const cam = systemManager.getDeviceById(v.cameraId);
+        const tag = v.name || v.storage.getItem("display_name") || v.nativeId;
         if (!cam) {
-            this.console.warn(`viewport "${v.name}": camera ${v.cameraId} not found`);
+            this.console.warn(`viewport "${tag}": camera ${v.cameraId} not found`);
             return;
         }
         const ifaces = [
@@ -371,7 +377,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.handleCameraEvent(v, details, data);
         });
         this.listeners.set(v.nativeId!, reg);
-        this.console.log(`viewport "${v.name}": subscribed to "${cam.name}"`);
+        this.console.log(`viewport "${tag}": subscribed to "${cam.name}"`);
     }
 
     private detachListener(nativeId: string) {
@@ -391,22 +397,35 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     private async registerViewport(v: Viewport) {
+        // Guard against transient empty names. Scrypted occasionally hands
+        // us a Viewport whose `.name` hasn't resolved yet (race between
+        // device-record load and event delivery); POSTing /config with an
+        // empty viewport just gets a 400 from the firmware. Fall back to
+        // the stored display name from storage if it's there, else skip.
+        const name = (v.name && v.name.trim()) || v.storage.getItem("display_name") || "";
+        if (!name) {
+            this.console.warn(`register skipped — empty name on ${v.nativeId}; will retry on next event`);
+            return;
+        }
         await this.refreshHostFromMdns(v);
         if (!v.host) {
-            this.console.warn(`register "${v.name}" skipped — no host (set one manually or check mDNS)`);
+            this.console.warn(`register "${name}" skipped — no host (set one manually or check mDNS)`);
             return;
         }
         try {
             await this.postJSON(`http://${v.host}/config`, {
-                viewport: v.name,
+                viewport: name,
                 scrypted: this.scryptedBase,
                 idle_timeout_ms: v.idleTimeoutMs,
                 orientation: v.orientation,
                 brightness: v.brightness,
             });
-            this.console.log(`registered "${v.name}" (${v.host})`);
+            // Cache the name in storage so a future empty-.name event can
+            // still find it. createDevice + putSetting always update this.
+            v.storage.setItem("display_name", name);
+            this.console.log(`registered "${name}" (${v.host})`);
         } catch (e) {
-            this.console.warn(`register "${v.name}" failed:`, (e as Error).message);
+            this.console.warn(`register "${name}" failed:`, (e as Error).message);
         }
     }
 
