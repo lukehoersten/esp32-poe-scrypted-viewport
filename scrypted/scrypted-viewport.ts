@@ -274,10 +274,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // event subscription happen at plugin load.
         for (const nativeId of this.childIds) {
             try {
+                // Use the persisted display_name as the canonical device
+                // name so a script reload doesn't reset it to the nativeId.
+                // First-time provision falls back to the nativeId.
+                const displayName =
+                    deviceManager.getDeviceStorage(nativeId).getItem("display_name") || nativeId;
                 await deviceManager.onDeviceDiscovered({
                     providerNativeId: this.nativeId,
                     nativeId,
-                    name: nativeId,  // overridden by Scrypted from its existing record
+                    name: displayName,
                     type: ScryptedDeviceType.SmartDisplay,
                     interfaces: [ScryptedInterface.Settings],
                 });
@@ -434,12 +439,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     private async registerViewport(v: Viewport) {
-        // Guard against transient empty names. Scrypted occasionally hands
-        // us a Viewport whose `.name` hasn't resolved yet (race between
-        // device-record load and event delivery); POSTing /config with an
-        // empty viewport just gets a 400 from the firmware. Fall back to
-        // the stored display name from storage if it's there, else skip.
-        const name = (v.name && v.name.trim()) || v.storage.getItem("display_name") || "";
+        // display_name is the canonical user-facing name (written on
+        // createDevice and on every Settings save). v.name is just a
+        // render of it from the Scrypted device record and can briefly
+        // drift to the nativeId on script reload, so prefer the storage
+        // value as the source of truth.
+        const stored = v.storage.getItem("display_name");
+        const name = (stored && stored.trim()) || (v.name && v.name.trim()) || "";
         if (!name) {
             this.console.warn(`register skipped — empty name on ${v.nativeId}; will retry on next event`);
             return;
