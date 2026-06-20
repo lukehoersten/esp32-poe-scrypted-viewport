@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "568de10";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -366,6 +366,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         if (G.__viewportRegisterInterval) {
             try { clearInterval(G.__viewportRegisterInterval); } catch {}
         }
+        // Tear down any camera event listeners left over from a
+        // previous script load (same Scripts-sandbox lifecycle gap as
+        // the setInterval handle). Without this every re-paste stacks
+        // an extra callback on the camera, producing duplicate stream
+        // starts + concurrent snapshot transforms that race for the
+        // firmware decoder lock and visibly degrade quality.
+        if (Array.isArray(G.__viewportListenerCleaners)) {
+            for (const remove of G.__viewportListenerCleaners) {
+                try { remove(); } catch {}
+            }
+        }
+        G.__viewportListenerCleaners = [];
         G.__viewportRegisterInterval = setInterval(() => {
             for (const v of this.viewports.values()) {
                 this.registerViewport(v).catch(() => {});
@@ -539,6 +551,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.handleCameraEvent(v, details, data);
         });
         this.listeners.set(v.nativeId!, reg);
+        // Track on globalThis so script reload can remove this
+        // listener from the camera plugin. Without that, every
+        // re-paste leaves a dead callback subscribed to the camera
+        // and every motion/doorbell event triggers handleCameraEvent
+        // N times for N stacked reloads — observable as duplicate
+        // "stream start" log lines + two simultaneous pushSnapshots
+        // racing for the firmware decoder lock.
+        const G = globalThis as any;
+        if (!G.__viewportListenerCleaners) G.__viewportListenerCleaners = [];
+        G.__viewportListenerCleaners.push(() => { try { reg.removeListener(); } catch {} });
         this.console.log(`viewport "${tag}": subscribed to "${cam.name}"`);
     }
 
@@ -953,70 +975,67 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             try { currentProc?.kill("SIGTERM"); } catch {}
         });
 
-        // Periodic stream-health log. Emits delivered fps + sustained
-        // MB/s + socket.write p50/p95/max + drop count + backpressure
-        // flag every 10s. drops here count frames the demux loop
-        // threw away because the socket wasn't connected yet (initial
-        // race at stream start) — once the socket is up we keep
-        // writing past kernel backpressure and let the firmware's
-        // FIONREAD skip drop the stale frames before decode.
-        const skipLogger = setInterval(() => {
+        // Unified stream-health log every 10s: Scrypted-side sent fps
+        // + firmware-side painted fps side-by-side, so the user can
+        // see at a glance "we sent N, the panel showed M." The gap
+        // (sent - painted) is what the firmware's FIONREAD skip
+        // dropped to keep the panel showing the freshest frame.
+        // Includes firmware-side per-stage timings (recv/dec/paint/
+        // idle min/avg/max) + glass-to-glass age of the most recent
+        // painted frame. /state poll is folded in so there's one log
+        // line per window instead of two interleaved timelines.
+        const streamLogger = setInterval(async () => {
             const now = Date.now();
             const window = (now - lastLogUs) / 1000;
-            if (window > 0 && (sentFrames > 0 || droppedFrames > 0)) {
-                const sentRate = sentFrames / window;
-                const dropRate = droppedFrames / window;
-                const mbPerSec = (bytesSent / window) / (1024 * 1024);
-                const sortedW  = writeLatencies.slice().sort((a, b) => a - b);
-                const p50 = sortedW.length ? sortedW[Math.floor(sortedW.length * 0.5)] : 0;
-                const p95 = sortedW.length ? sortedW[Math.floor(sortedW.length * 0.95)] : 0;
-                const max = sortedW.length ? sortedW[sortedW.length - 1] : 0;
-                this.console.log(
-                    `stream "${v.name}": ${sentRate.toFixed(1)} fps, ${mbPerSec.toFixed(2)} MB/s ` +
-                    `over ${window.toFixed(1)}s ` +
-                    `(drops=${droppedFrames}=${dropRate.toFixed(1)} fps) ` +
-                    `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms ` +
-                    `backpressured=${socketBackpressured}`);
-                droppedFrames = 0;
-                sentFrames    = 0;
-                bytesSent     = 0;
-                writeLatencies.length = 0;
-                lastLogUs     = now;
-            }
-        }, 10_000);
-        abort.signal.addEventListener("abort", () => clearInterval(skipLogger));
+            if (window <= 0 || (sentFrames === 0 && droppedFrames === 0)) return;
+            const sentRate = sentFrames / window;
+            const dropRate = droppedFrames / window;
+            const mbPerSec = (bytesSent / window) / (1024 * 1024);
+            const sortedW  = writeLatencies.slice().sort((a, b) => a - b);
+            const p50 = sortedW.length ? sortedW[Math.floor(sortedW.length * 0.5)] : 0;
+            const p95 = sortedW.length ? sortedW[Math.floor(sortedW.length * 0.95)] : 0;
+            const max = sortedW.length ? sortedW[sortedW.length - 1] : 0;
 
-        // Periodic /state poll to surface firmware-side window stats +
-        // computed glass-to-glass. Runs every 5s while the stream is
-        // active. g2g = (nowUsLow - last_paint_event_us_low) with
-        // 32-bit wrap; clamped to a 30s sanity ceiling because event
-        // timestamps from before the stream started are stale and
-        // would yield gigantic apparent latencies.
-        const fwPoller = setInterval(async () => {
+            // Best-effort firmware-side snapshot. Timeout < 1s so a
+            // missed /state never wedges the logger.
+            let painted = "?", paintedMb = "?", g2g = "?", paintedNum = -1;
+            let recvStr = "?", decStr = "?", paintStr = "?", idleStr = "?";
             try {
                 const st: any = await fetch(`http://${v.host}/state`, {
-                    signal: AbortSignal.timeout(1500),
+                    signal: AbortSignal.timeout(800),
                 }).then(r => r.json());
                 const fs = st?.stream;
-                if (!fs || !fs.frames) return;
-                const fps = fs.window_us > 0 ? (fs.frames / (fs.window_us / 1e6)) : 0;
-                const mb  = fs.window_us > 0 ? ((fs.bytes  / (fs.window_us / 1e6)) / (1024 * 1024)) : 0;
-                let g2gMs = -1;
-                if (fs.last_paint_event_us_low) {
+                if (fs?.frames && fs.window_us > 0) {
+                    paintedNum = fs.frames / (fs.window_us / 1e6);
+                    painted    = paintedNum.toFixed(1);
+                    paintedMb  = ((fs.bytes / (fs.window_us / 1e6)) / (1024 * 1024)).toFixed(2);
+                    recvStr    = `${fs.recv_min_us}/${fs.recv_avg_us}/${fs.recv_max_us}`;
+                    decStr     = `${fs.dec_min_us}/${fs.dec_avg_us}/${fs.dec_max_us}`;
+                    paintStr   = `${fs.paint_min_us}/${fs.paint_avg_us}/${fs.paint_max_us}`;
+                    idleStr    = `${fs.idle_min_us}/${fs.idle_avg_us}/${fs.idle_max_us}`;
+                }
+                if (fs?.last_paint_event_us_low) {
                     const nowUsLow = (Date.now() * 1000) >>> 0;
                     const diff = (nowUsLow - fs.last_paint_event_us_low) >>> 0;
-                    if (diff < 30_000_000) g2gMs = diff / 1000;
+                    if (diff < 30_000_000) g2g = (diff / 1000).toFixed(0) + "ms";
                 }
-                this.console.log(
-                    `firmware "${v.name}": fps=${fps.toFixed(1)} ${mb.toFixed(2)}MB/s | ` +
-                    `recv=${fs.recv_min_us}/${fs.recv_avg_us}/${fs.recv_max_us}us | ` +
-                    `dec=${fs.dec_min_us}/${fs.dec_avg_us}/${fs.dec_max_us}us | ` +
-                    `paint=${fs.paint_min_us}/${fs.paint_avg_us}/${fs.paint_max_us}us | ` +
-                    `idle=${fs.idle_min_us}/${fs.idle_avg_us}/${fs.idle_max_us}us | ` +
-                    `g2g=${g2gMs >= 0 ? g2gMs.toFixed(0) + "ms" : "(no event yet)"}`);
-            } catch { /* /state timeout is fine, try next tick */ }
-        }, 5_000);
-        abort.signal.addEventListener("abort", () => clearInterval(fwPoller));
+            } catch { /* keep the local stats; firmware-side just shows ? */ }
+
+            const skipped = paintedNum >= 0 ? Math.max(0, sentRate - paintedNum).toFixed(1) : "?";
+            this.console.log(
+                `stream "${v.name}": sent=${sentRate.toFixed(1)}fps painted=${painted}fps ` +
+                `(fw-skipped=${skipped}fps, drops=${droppedFrames}) ` +
+                `${mbPerSec.toFixed(2)}MB/s sent / ${paintedMb}MB/s painted | ` +
+                `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} | ` +
+                `recv=${recvStr}us dec=${decStr}us paint=${paintStr}us idle=${idleStr}us | g2g=${g2g}`);
+
+            droppedFrames = 0;
+            sentFrames    = 0;
+            bytesSent     = 0;
+            writeLatencies.length = 0;
+            lastLogUs     = now;
+        }, 10_000);
+        abort.signal.addEventListener("abort", () => clearInterval(streamLogger));
 
         const timeoutMs = v.idleTimeoutMs > 0 ? v.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
         const timeout = setTimeout(() => {
