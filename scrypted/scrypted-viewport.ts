@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "131c46f";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -300,88 +300,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         interval?: NodeJS.Timeout;        // legacy snapshot-poll mode
     }>();
     private scryptedBase = "";
-
-    // Per-host node:http Agent for the control plane (/state, /config,
-    // and the snapshot /frame POST). Over-engineered for our volume
-    // (<1 POST/min steady state, ~5 around a wake event) — legacy of
-    // the HTTP-streaming era where it backed the per-frame /frame
-    // POSTs. Phase 2 of the cleanup retires the pool and reverts
-    // postJSON to a plain fetch() with AbortSignal.timeout.
-    private agents = new Map<string, any>();
-    private agentFor(host: string): any {
-        let a = this.agents.get(host);
-        if (!a) {
-            const http = require("http");
-            a = new http.Agent({
-                keepAlive:        true,
-                keepAliveMsecs:   30_000,
-                maxSockets:       2,
-                maxFreeSockets:   2,
-                timeout:          30_000,
-                // noDelay was load-bearing when this Agent fronted the
-                // live stream's per-frame POSTs (200ms Nagle+delayed-
-                // ACK stall). It's now a no-op safety for control-plane
-                // traffic; harmless to leave on.
-                noDelay:          true,
-            });
-            this.agents.set(host, a);
-        }
-        return a;
-    }
-
-    // Raw http.request wrapper that gives us per-stage timing the
-    // built-in fetch hides. Returns { status, headers, tHeaders,
-    // tDone } so callers can compute req-time vs body-read separately.
-    private httpRequest(
-        opts: {
-            host: string; port: number; path: string; method: string;
-            headers: Record<string, string>;
-            body?: Buffer | string;
-            timeoutMs: number;
-            abort?: AbortSignal;
-        }
-    ): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; tHeaders: number; tDone: number; }> {
-        return new Promise((resolve, reject) => {
-            const http = require("http");
-            const req = http.request({
-                host:    opts.host,
-                port:    opts.port,
-                path:    opts.path,
-                method:  opts.method,
-                headers: opts.headers,
-                agent:   this.agentFor(opts.host),
-                timeout: opts.timeoutMs,
-            }, (res: any) => {
-                const tHeaders = Date.now();
-                // Drain body so the socket can return to the keep-alive
-                // pool. Empty body responses (204/200) still need this
-                // — the agent won't recycle the socket until 'end'.
-                res.on("data", () => {});
-                res.on("end", () => resolve({
-                    status:  res.statusCode || 0,
-                    headers: res.headers,
-                    tHeaders,
-                    tDone:   Date.now(),
-                }));
-                res.on("error", reject);
-            });
-            const onAbort = () => req.destroy(new Error("aborted"));
-            if (opts.abort) {
-                if (opts.abort.aborted) onAbort();
-                else opts.abort.addEventListener("abort", onAbort, { once: true });
-            }
-            req.on("timeout", () => req.destroy(new Error("request timeout")));
-            req.on("error", reject);
-            // Belt-and-suspenders: in case the Agent's noDelay option
-            // isn't honored on every Node version, force it on the
-            // socket as soon as it's allocated. Without this the
-            // socket inherits Nagle ON and a JPEG body ending mid-MTU
-            // stalls for the 200ms delayed-ACK window.
-            req.on("socket", (s: any) => { try { s.setNoDelay(true); } catch {} });
-            if (opts.body != null) req.write(opts.body);
-            req.end();
-        });
-    }
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -761,9 +679,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // scaling to an EXPLICIT panelWxpanelH (with setsar to clear
         // any leftover aspect-ratio metadata) makes the final encoded
         // dimensions deterministic regardless of source resolution.
-        const vf = v.orientation === "portrait"
-            ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
-            : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
+        const vf  = this.buildVf(v.orientation, panelW, panelH);
         const qv  = String(v.jpegQuality);
         // Diagnostic — confirms which filter chain the *currently loaded*
         // script is actually using. If you don't see this line in the
@@ -1060,7 +976,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         clearTimeout(s.timeout);
         this.streams.delete(name);
         const v = this.findByName(name);
-        if (v) this.frameSeq.delete(v.nativeId!);
         if (sendSleep && v?.host) {
             this.postJSON(`http://${v.host}/state`, { state: "sleep" }).catch(() => {});
         }
@@ -1124,9 +1039,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // Path 3: ffmpeg fallback. The slow ~500ms cold-start path.
         if (!transformed.length) {
-            const vf = needsRotate
-                ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
-                : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
+            const vf = this.buildVf(v.orientation, panelW, panelH);
             const { spawn } = require("child_process");
             const ffmpegPath =
                 (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
@@ -1157,31 +1070,33 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         if (transformed.length < 4) return;
         const tTransformed = Date.now();
 
-        const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
-        this.frameSeq.set(v.nativeId!, seq);
         try {
             const res = await fetch(`http://${v.host}/frame`, {
                 method: "POST",
-                headers: { "Content-Type": "image/jpeg", "X-Frame-Seq": String(seq) },
+                headers: { "Content-Type": "image/jpeg" },
                 body: transformed,
                 signal: AbortSignal.timeout(2000),
             });
             await res.text().catch(() => "");
             const tPosted   = Date.now();
-            const wasStale  = res.headers.get("X-Frame-Drop") === "stale-seq";
             this.console.log(
                 `snapshot "${v.name}" via ${path}: ${tPosted - t0}ms total ` +
                 `(takePicture=${tDecoded - t0}ms transform=${tTransformed - tDecoded}ms ` +
-                `post=${tPosted - tTransformed}ms, ${(transformed.length / 1024).toFixed(0)}KB)` +
-                (wasStale ? " — beaten by stream frame" : ""));
+                `post=${tPosted - tTransformed}ms, ${(transformed.length / 1024).toFixed(0)}KB)`);
         } catch { /* stream is starting anyway */ }
     }
 
-    // Legacy of the HTTP-streaming era. Used to feed the X-Frame-Seq
-    // header on /frame POSTs so the firmware could drop pipelined-
-    // out-of-order frames. /frame is now snapshot-only (single-shot),
-    // so the comparator never trips. Retired in Phase 2.
-    private frameSeq = new Map<string, number>();
+    // ffmpeg -vf filter chain producing panel-native 800x480 BGR888.
+    // Used by both startStream (live) and pushSnapshot (one-shot
+    // ffmpeg fallback). Rotation goes FIRST so the final mjpeg encoder
+    // sees the exact target dimensions — earlier we observed mjpeg
+    // writing pre-rotation dims into the JPEG SOF marker when scale
+    // came first, breaking the firmware's strict dim check.
+    private buildVf(orientation: string, panelW: number, panelH: number): string {
+        return orientation === "portrait"
+            ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
+            : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
+    }
 
     private findByName(name: string): Viewport | undefined {
         for (const v of this.viewports.values()) if (v.name === name) return v;
@@ -1250,26 +1165,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // ------------------------------------------------------------------------
 
     private async postJSON(url: string, body: any) {
-        const u = new URL(url);
-        const payload = JSON.stringify(body);
-        const ctrl = new AbortController();
-        const to = setTimeout(() => ctrl.abort(), HTTP_TIMEOUT_MS);
-        try {
-            const res = await this.httpRequest({
-                host: u.hostname, port: Number(u.port) || 80, path: u.pathname + u.search,
-                method: "POST",
-                headers: {
-                    "Content-Type":   "application/json",
-                    "Content-Length": String(Buffer.byteLength(payload)),
-                },
-                body: payload,
-                timeoutMs: HTTP_TIMEOUT_MS,
-                abort: ctrl.signal,
-            });
-            if ((res.status < 200 || res.status >= 300) && res.status !== 204) {
-                throw new Error(`POST ${url} -> ${res.status}`);
-            }
-        } finally { clearTimeout(to); }
+        const res = await fetch(url, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify(body),
+            signal:  AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        });
+        if (!res.ok && res.status !== 204) {
+            throw new Error(`POST ${url} -> ${res.status}`);
+        }
     }
 }
 

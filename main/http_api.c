@@ -10,7 +10,6 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "lwip/sockets.h"  // TCP_NODELAY setsockopt for /frame socket
 
 #include "display.h"
 #include "jpeg_decoder.h"
@@ -266,13 +265,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 // ============================================================================
 // POST /state
 // ============================================================================
-// Legacy of the HTTP-streaming era (multiple /frame POSTs in flight).
-// /frame is now snapshot-only and inherently single-shot, so this
-// comparator is effectively unused — but state_post_handler still
-// resets it on wake until Phase 2 of the cleanup removes the
-// X-Frame-Seq parsing path entirely.
-static uint32_t s_last_painted_seq;
-
 static esp_err_t state_post_handler(httpd_req_t *req)
 {
     char buf[64];
@@ -291,9 +283,6 @@ static esp_err_t state_post_handler(httpd_req_t *req)
     viewport_run_state_t target;
     if (strcmp(j->valuestring, "wake") == 0) {
         target = VIEWPORT_STATE_AWAKE;
-        // Reset the (legacy) per-stream sequence comparator; harmless
-        // now that /frame is snapshot-only, removed in Phase 2.
-        s_last_painted_seq = 0;
     } else if (strcmp(j->valuestring, "sleep") == 0) {
         target = VIEWPORT_STATE_ASLEEP;
     } else {
@@ -323,30 +312,8 @@ static esp_err_t respond_status(httpd_req_t *req, const char *status, const char
     return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
 }
 
-// (Legacy from the HTTP-streaming era: tracked idle gap between
-// successive /frame POSTs. /frame is now snapshot-only — fires at
-// most once per wake — so the gap measurement is no longer meaningful
-// in steady state. Field is left in place to avoid touching the
-// timing-log format; Phase 2 will retire it alongside the rest of
-// the streaming machinery.)
-static int64_t  s_last_post_us;
-// (s_last_painted_seq is forward-declared above state_post_handler;
-// description there.)
-
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
-    // Nagle off. Originally added for HTTP streaming where Nagle +
-    // delayed-ACK on a 130 KB body POST would stall 40 ms before the
-    // last partial-MTU segment shipped. /frame is now snapshot-only
-    // (one POST per wake) so the optimisation is largely moot — but
-    // setsockopt is essentially free per request and there's no harm
-    // in leaving it. Phase 2 of the cleanup removes this entirely.
-    int sockfd = httpd_req_to_sockfd(req);
-    if (sockfd >= 0) {
-        int one = 1;
-        (void)setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    }
-
     // Content-Type must be image/jpeg.
     char ct[40] = {0};
     if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK ||
@@ -373,22 +340,11 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     int64_t t_entry = esp_timer_get_time();
 
-    // X-Frame-Seq is a legacy artifact of the HTTP-streaming era,
-    // where multiple /frame POSTs could be in flight at once and
-    // arrive out of order. /frame is now snapshot-only so the
-    // header is always missing in practice — kept-alive for one
-    // more cycle and then removed in Phase 2.
-    uint32_t seq = 0;
-    char seq_str[16] = {0};
-    if (httpd_req_get_hdr_value_str(req, "X-Frame-Seq", seq_str, sizeof(seq_str)) == ESP_OK) {
-        seq = (uint32_t)strtoul(seq_str, NULL, 10);
-    }
-
-    // Decoder mutex. Used to serialise pipelined /frame POSTs during
-    // the HTTP-streaming era; now mostly redundant since /frame is
-    // snapshot-only and the live stream owns the decoder via
-    // stream_server. Concurrent posts (e.g. a snapshot landing while
-    // the live stream is mid-decode) get 503.
+    // Fence /frame snapshot against an in-flight stream decode. The
+    // live stream task owns the decoder via stream_server; a snapshot
+    // landing mid-decode gets 503 here and Scrypted silently drops it
+    // (the snapshot is a fast-path nicety; the stream is the real
+    // data plane).
     if (!jpeg_decoder_try_lock(0)) {
         return respond_status(req, "503 Service Unavailable", "frame in flight");
     }
@@ -412,17 +368,6 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     }
 
     int64_t t_recv = esp_timer_get_time();
-
-    // (Legacy stale-frame guard from HTTP-streaming era; never
-    // triggers under snapshot-only /frame because the header is
-    // missing. Removed in Phase 2 along with the rest of the
-    // sequencing machinery.)
-    if (seq != 0 && seq <= s_last_painted_seq) {
-        jpeg_decoder_unlock();
-        httpd_resp_set_status(req, "200 OK");
-        httpd_resp_set_hdr(req, "X-Frame-Drop", "stale-seq");
-        return httpd_resp_send(req, NULL, 0);
-    }
 
     // Decode straight into the panel's back framebuffer — no scratch
     // buffer, no later memcpy. The flip below is a cache writeback +
@@ -458,7 +403,6 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     esp_err_t paint_err = display_flip_back_buffer();
     int64_t t_paint = esp_timer_get_time();
-    int64_t t_post  = 0;
     if (paint_err != ESP_OK) {
         jpeg_decoder_unlock();
         return respond_status(req, "500 Internal Server Error", "display paint failed");
@@ -468,64 +412,24 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     viewport_state_t *st = viewport_state_get();
     st->frames_received++;
     st->last_frame_us = esp_timer_get_time();
-    uint64_t fr = st->frames_received;
     viewport_state_unlock();
-
-    if (seq != 0) s_last_painted_seq = seq;
 
     jpeg_decoder_unlock();
 
-    // Track the bookkeeping tail too so we can see if anything between
-    // draw_bitmap-returns and the response-send adds up.
-    t_post = esp_timer_get_time();
-
-    // Idle gap = time from the PREVIOUS /frame response finishing to
-    // THIS request landing on the handler. Large gap = upstream
-    // (Scrypted / ffmpeg / TCP slow-start on a fresh socket) was idle;
-    // we're not the bottleneck. Skipped on the very first frame.
-    int64_t idle_us = s_last_post_us ? (t_entry - s_last_post_us) : 0;
-    s_last_post_us = t_post;
-
-    // Timing log every 10 frames so the user can see where each /frame's
-    // wall-clock budget is going. Buckets:
-    //   idle  : time since the previous response finished (upstream gap)
-    //   lock  : mutex acquire
-    //   ttfb  : lock-acquired -> first body byte (TCP setup)
-    //   body  : remaining body bytes (wire time)
-    //   dec   : hardware JPEG decode
-    //   paint : esp_lcd_panel_draw_bitmap → DSI fast-path
-    //   post  : state counters + unlock
-    if (fr % 10 == 0) {
-        ESP_LOGI(TAG,
-            "frame %llu: idle=%lldus lock=%lldus ttfb=%lldus body=%lldus "
-            "dec=%lldus paint=%lldus post=%lldus total=%lldms (jpeg=%uKB)",
-            (unsigned long long)fr,
-            (long long)idle_us,
-            (long long)(t_lock       - t_entry),
-            (long long)(t_first_byte - t_lock),
-            (long long)(t_recv       - t_first_byte),
-            (long long)(t_decode     - t_recv),
-            (long long)(t_paint      - t_decode),
-            (long long)(t_post       - t_paint),
-            (long long)((t_post - t_entry) / 1000),
-            (unsigned)(got / 1024));
-    }
+    // Snapshot stage timings, one line per /frame POST. /frame fires
+    // at most once per wake event, so logging every snapshot (not
+    // every 10) is the right cadence.
+    ESP_LOGI(TAG,
+        "snapshot: lock=%lldus ttfb=%lldus body=%lldus dec=%lldus paint=%lldus total=%lldms (jpeg=%uKB)",
+        (long long)(t_lock       - t_entry),
+        (long long)(t_first_byte - t_lock),
+        (long long)(t_recv       - t_first_byte),
+        (long long)(t_decode     - t_recv),
+        (long long)(t_paint      - t_decode),
+        (long long)((t_paint - t_entry) / 1000),
+        (unsigned)(got / 1024));
 
     state_machine_frame_painted();  // reset idle timer
-
-    // (Legacy Server-Timing emission from the HTTP-streaming era;
-    // no Scrypted-side consumer remains — the live-stream cross-side
-    // trace now flows over the TCP framer's seq field plus per-window
-    // /state polling. Removed in Phase 2.)
-    char st_hdr[160];
-    snprintf(st_hdr, sizeof(st_hdr),
-             "recv;dur=%.1f, dec;dur=%.1f, paint;dur=%.1f, post;dur=%.1f, handle;dur=%.1f",
-             (t_recv   - t_first_byte) / 1000.0,
-             (t_decode - t_recv)       / 1000.0,
-             (t_paint  - t_decode)     / 1000.0,
-             (t_post   - t_paint)      / 1000.0,
-             (t_post   - t_entry)      / 1000.0);
-    httpd_resp_set_hdr(req, "Server-Timing", st_hdr);
 
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
@@ -557,14 +461,10 @@ esp_err_t http_api_start(void)
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;
     cfg.stack_size       = 8192;  // POST /config alone has ~2.4 KiB of stack locals
-    // 2 sockets is enough now that /frame is snapshot-only and the
-    // live stream owns its own TCP socket on port 81: one slot for
-    // the snapshot POST + one for a concurrent /state or /config
-    // request. (Was 4 during the HTTP-streaming era to allow
-    // pipelined /frame POSTs.) Phase 2 of the cleanup actually
-    // bumps this down; for Phase 1 (comments-only) the value stays
-    // at 4 so behaviour is unchanged.
-    cfg.max_open_sockets = 4;
+    // /frame is snapshot-only and the live stream owns its own TCP
+    // socket on port 81. Two HTTP sockets cover: one snapshot POST
+    // concurrent with one /state or /config request.
+    cfg.max_open_sockets = 2;
 
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start");
