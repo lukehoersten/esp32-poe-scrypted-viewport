@@ -29,18 +29,14 @@ CONFIG_LWIP_IPV4=y
 CONFIG_LWIP_IPV6=y
 CONFIG_MDNS_MAX_INTERFACES=1
 
-# TCP receive-window + buffer tuning. Earlier attempt under HTTP
-# regressed because every /frame opened a fresh socket and we ate
-# the slow-start cost repeatedly. Under the streaming pivot the
-# socket is long-lived: slow-start happens once, then we run with
-# the full window for the rest of the session — which is exactly
-# the workload these knobs are designed for. Larger WND lets the
-# sender keep more bytes in flight per ACK and pushes our recv
-# throughput ceiling up from ~5.3 MB/s.
-CONFIG_LWIP_TCP_WND_DEFAULT=65535
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
-CONFIG_LWIP_TCP_SACK_OUT=y
+# TCP tuning attempted (WND=64k, SND_BUF=64k, RECVMBOX=16, SACK on)
+# after the streaming pivot landed. The accept path then silently
+# failed — Scrypted's SYN was acked but no client-connected log
+# fired, and the stream never moved a byte. Almost certainly lwIP's
+# PBUF / MEMP pools weren't scaled to back the larger windows on
+# multiple concurrent sockets (httpd has 4, stream has 1). Revisit
+# with PBUF_POOL_SIZE + MEMP_NUM_TCP_PCB bumps next time, but for
+# now ride the lwIP defaults which sustain ~5.3 MB/s ingest.
 
 # HTTP server
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
