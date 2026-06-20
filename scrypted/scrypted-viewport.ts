@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "846e4db";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -1112,21 +1112,41 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 const sorted = arr.slice().sort((a, b) => a - b);
                 return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
             };
-            const fmt = (arr: number[]) => arr.length
-                ? `p50=${p(arr, 0.5).toFixed(1)}ms p95=${p(arr, 0.95).toFixed(1)}ms`
-                : `(no data)`;
+            const stats = (arr: number[]) => {
+                if (!arr.length) return null;
+                let mn = arr[0], mx = arr[0];
+                for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; }
+                return { min: mn, p50: p(arr, 0.5), p95: p(arr, 0.95), max: mx };
+            };
+            const fmt = (arr: number[]) => {
+                const s = stats(arr);
+                if (!s) return `(no data)`;
+                return `min=${s.min.toFixed(1)} p50=${s.p50.toFixed(1)} p95=${s.p95.toFixed(1)} max=${s.max.toFixed(1)}ms`;
+            };
+            // Identify the worst-wall sample in the window and decompose
+            // it into its own stages — answers "what made the slowest
+            // frame slow?" without us having to guess from percentiles.
+            let worstIdx = 0;
+            for (let i = 1; i < b.wall.length; i++) if (b.wall[i] > b.wall[worstIdx]) worstIdx = i;
+            const at = (arr: number[], i: number) =>
+                (i < arr.length && arr[i] != null) ? arr[i].toFixed(1) : "n/a";
             this.console.log(
                 `fetch "${v.name}" #${n} (jpeg=${(jpeg.length / 1024).toFixed(0)}KB)\n` +
-                `   wall      ${fmt(b.wall)}\n` +
-                `   emit→post ${fmt(b.emit)}   (queue wait before fetch() called)\n` +
-                `   req       ${fmt(b.req)}   (fetch start → Response headers)\n` +
-                `     net_up  ${fmt(b.net_up)}   (req − fw_total: TCP setup + body wire + dispatch)\n` +
-                `     fw_recv ${fmt(b.fw_recv)}   (firmware body read off the wire)\n` +
-                `     fw_dec  ${fmt(b.fw_dec)}   (hardware JPEG → BGR888)\n` +
-                `     fw_paint${fmt(b.fw_paint)}   (backbuffer flip)\n` +
-                `     fw_post ${fmt(b.fw_post)}   (state counters + unlock)\n` +
-                `   body-read ${fmt(b.bread)}   (Response → drained)\n` +
-                `   inflight  d0=${b.depths.d0} d1=${b.depths.d1} d2=${b.depths.d2}   (queue depth at fetch start)\n` +
+                `   wall       ${fmt(b.wall)}\n` +
+                `   emit→post  ${fmt(b.emit)}     (queue wait before fetch() called)\n` +
+                `   req        ${fmt(b.req)}     (fetch start → Response headers)\n` +
+                `     net_up   ${fmt(b.net_up)}     (req − fw_total: TCP setup + body wire + dispatch)\n` +
+                `     fw_recv  ${fmt(b.fw_recv)}     (firmware body read off the wire)\n` +
+                `     fw_dec   ${fmt(b.fw_dec)}     (hardware JPEG → BGR888)\n` +
+                `     fw_paint ${fmt(b.fw_paint)}     (backbuffer flip)\n` +
+                `     fw_post  ${fmt(b.fw_post)}     (state counters + unlock)\n` +
+                `   body-read  ${fmt(b.bread)}     (Response → drained)\n` +
+                `   inflight   d0=${b.depths.d0} d1=${b.depths.d1} d2=${b.depths.d2}    (queue depth at fetch start)\n` +
+                `   worst (#${worstIdx + 1}/${b.wall.length} in window): wall=${at(b.wall, worstIdx)}ms = ` +
+                `emit→post ${at(b.emit, worstIdx)} + net_up ${at(b.net_up, worstIdx)} + ` +
+                `fw_recv ${at(b.fw_recv, worstIdx)} + fw_dec ${at(b.fw_dec, worstIdx)} + ` +
+                `fw_paint ${at(b.fw_paint, worstIdx)} + fw_post ${at(b.fw_post, worstIdx)} + ` +
+                `body-read ${at(b.bread, worstIdx)}\n` +
                 `   stale-drops=${b.staleDrops}`);
             this.fetchSamples.delete(v.nativeId!);   // reset window
         }

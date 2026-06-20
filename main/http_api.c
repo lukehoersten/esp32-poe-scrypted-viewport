@@ -10,6 +10,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "lwip/sockets.h"  // TCP_NODELAY setsockopt for /frame socket
 
 #include "display.h"
 #include "jpeg_decoder.h"
@@ -334,6 +335,19 @@ static uint32_t s_last_painted_seq;
 
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
+    // Nagle off on this socket. /frame is a single large POST followed
+    // by a tiny (empty 204) response — the worst case for Nagle. The
+    // last partial-MTU packet of the body, and the response packet,
+    // both sit in the kernel send buffer up to 40ms waiting for an
+    // ACK that the peer's also delaying-ACKing. setsockopt is cheap
+    // and idempotent; if keep-alive is ever added the flag persists
+    // for the connection's life.
+    int sockfd = httpd_req_to_sockfd(req);
+    if (sockfd >= 0) {
+        int one = 1;
+        (void)setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+
     // Content-Type must be image/jpeg.
     char ct[40] = {0};
     if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK ||
