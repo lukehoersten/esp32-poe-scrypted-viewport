@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "4d5fd28";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -607,19 +607,27 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             if (detections.some((d: any) => d?.className === "person")) trigger = true;
         }
         if (!trigger) return;
-        this.console.log(`event ${iface} -> "${v.name}": wake`);
+        // Capture the wall-clock at event arrival so every downstream
+        // log line can rebase onto it (+Xms since event). This is the
+        // anchor for measuring glass-to-glass and confirming that
+        // snapshot + stream start truly in parallel.
+        const tEvent = Date.now();
+        this.console.log(`event ${iface} -> "${v.name}": fired at +0ms (wake)`);
         // If a stream is already in flight for this viewport, the event
         // is just reinforcement — the existing ffmpeg child is already
         // pushing frames. We do NOT relaunch (would race with previous).
         if (this.streams.has(v.name)) return;
         if (this.streamStarting.has(v.nativeId!)) return;
         this.streamStarting.add(v.nativeId!);
-        this.startStream(v)
+        this.startStream(v, tEvent)
             .catch(e => this.console.error("startStream failed", e))
             .finally(() => this.streamStarting.delete(v.nativeId!));
     }
 
-    async startStream(v: Viewport) {
+    async startStream(v: Viewport, tEvent: number = Date.now()) {
+        const since = () => Date.now() - tEvent;
+        this.console.log(`stream "${v.name}": start +${since()}ms`);
+
         // Race rule: cancel pending operations on every callback before
         // beginning a fresh stream.
         this.stopStream(v.name, /*sendSleep=*/ false);
@@ -643,7 +651,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // just overpaints stale data on top of a fresher frame for
         // ~1 paint cycle. Errors are silent so a missing snapshot path
         // doesn't break the stream start.
-        this.pushSnapshot(v, cam).catch(() => {});
+        this.pushSnapshot(v, cam, tEvent).catch(() => {});
 
         // Fetch the panel's native dimensions from the firmware and
         // cache them on the viewport's storage. Falls back to 800x480
@@ -782,6 +790,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             if (abort.signal.aborted) return;
             socketReady = false;
             socketBackpressured = false;
+            this.console.log(`stream "${v.name}": socket connect requested +${since()}ms`);
             sock = net.createConnection({
                 host:    v.host,
                 port:    81,
@@ -789,7 +798,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             });
             sock.on("connect", () => {
                 socketReady = true;
-                this.console.log(`stream "${v.name}": tcp/81 open`);
+                this.console.log(`stream "${v.name}": socket connect open +${since()}ms`);
             });
             sock.on("drain", () => { socketBackpressured = false; });
             sock.on("error", (e: Error) => {
@@ -845,6 +854,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             ]);
             currentProc = p;
 
+            let firstFfmpegFrameLogged = false;
+            let firstSocketWriteLogged = false;
             p.stdout.on("data", (chunk: Buffer) => {
                 if (abort.signal.aborted) return;
                 workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
@@ -854,6 +865,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     const frame = workBuf.subarray(0, eoi + 2);
                     workBuf = workBuf.subarray(eoi + 2);
                     if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
+
+                    if (!firstFfmpegFrameLogged) {
+                        this.console.log(`stream "${v.name}": first ffmpeg frame +${since()}ms (jpeg=${(frame.length / 1024).toFixed(0)}KB)`);
+                        firstFfmpegFrameLogged = true;
+                    }
 
                     // Drop only when the socket isn't connected yet
                     // (initial-open race) — once it's up we just keep
@@ -876,6 +892,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     // and body across two TCP packets — the firmware
                     // sees them as one contiguous segment when possible.
                     const ok = sock.write(Buffer.concat([header, frame]));
+                    if (!firstSocketWriteLogged) {
+                        this.console.log(`stream "${v.name}": first socket.write +${since()}ms (jpeg=${(frame.length / 1024).toFixed(0)}KB)`);
+                        firstSocketWriteLogged = true;
+                    }
                     writeLatencies.push(Date.now() - t0);
                     if (writeLatencies.length > 200) writeLatencies.shift();
                     bytesSent += 8 + frame.length;
@@ -992,8 +1012,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     //                use it for landscape (no rotate needed).
     //   3. ffmpeg one-shot — old slow path, ~500-700ms cold start.
     //                Always works; the safety net.
-    private async pushSnapshot(v: Viewport, cam: any) {
-        const t0 = Date.now();
+    private async pushSnapshot(v: Viewport, cam: any, tEvent: number = Date.now()) {
+        const since = () => Date.now() - tEvent;
+        this.console.log(`snapshot "${v.name}": start +${since()}ms`);
         let mo: any;
         try { mo = await cam.takePicture({ reason: "event" }); }
         catch (e) { return; }                 // camera doesn't support snapshots
@@ -1001,7 +1022,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         const srcJpeg: Buffer = await mediaManager.convertMediaObjectToBuffer(mo, "image/jpeg");
         if (!srcJpeg || srcJpeg.length < 4) return;
-        const tDecoded = Date.now();
+        this.console.log(`snapshot "${v.name}": takePicture +${since()}ms`);
 
         // Cached dims from prior /state read; falls back to 800x480.
         const panelW = parseInt(v.storage.getItem("panel_w") || "0", 10) || 800;
@@ -1068,9 +1089,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
 
         if (transformed.length < 4) return;
-        const tTransformed = Date.now();
+        this.console.log(`snapshot "${v.name}": transform +${since()}ms via ${path} (${(transformed.length / 1024).toFixed(0)}KB)`);
 
         try {
+            this.console.log(`snapshot "${v.name}": post sent +${since()}ms`);
             const res = await fetch(`http://${v.host}/frame`, {
                 method: "POST",
                 headers: { "Content-Type": "image/jpeg" },
@@ -1078,11 +1100,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 signal: AbortSignal.timeout(2000),
             });
             await res.text().catch(() => "");
-            const tPosted   = Date.now();
-            this.console.log(
-                `snapshot "${v.name}" via ${path}: ${tPosted - t0}ms total ` +
-                `(takePicture=${tDecoded - t0}ms transform=${tTransformed - tDecoded}ms ` +
-                `post=${tPosted - tTransformed}ms, ${(transformed.length / 1024).toFixed(0)}KB)`);
+            // post_acked is the snapshot's true glass-to-glass — /frame
+            // returns after display_flip_back_buffer, so the firmware
+            // has the new pixels queued for the DPI scanout by then.
+            this.console.log(`snapshot "${v.name}": post acked +${since()}ms ← first user-visible paint`);
         } catch { /* stream is starting anyway */ }
     }
 
