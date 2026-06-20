@@ -239,7 +239,18 @@ static void handle_client(int fd, const char *peer)
         viewport_state_unlock();
 
         last_painted_seq = seq;
-        if (event_us_low != 0) last_event_us_low = event_us_low;
+        if (event_us_low != 0) {
+            last_event_us_low = event_us_low;
+            // Live update: /state needs this fresh on every painted
+            // frame so the script's g2g reflects the actual age of
+            // the currently-displayed frame, not the age at last
+            // window roll (which can be up to ~1.5s stale). The
+            // other window stats stay at roll cadence — they
+            // genuinely need a full window to compute.
+            portENTER_CRITICAL(&s_stats_mux);
+            s_stats.last_paint_event_us_low = event_us_low;
+            portEXIT_CRITICAL(&s_stats_mux);
+        }
         jpeg_decoder_unlock();
         state_machine_frame_painted();
         frames_decoded++;
