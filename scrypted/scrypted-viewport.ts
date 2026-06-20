@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "6d74d02";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -123,16 +123,6 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const v = this.storage.getItem("brightness");
         return v ? Math.max(0, Math.min(100, parseInt(v, 10) || 0)) : DEFAULT_BRIGHTNESS;
     }
-    // Preferred camera substream. "auto" walks a low-latency-first
-    // priority list and takes the first that resolves; the other
-    // options pin a specific substream so the user can pick a higher-
-    // fps source when "auto" lands on a slow 5-fps preview stream.
-    get streamDestination(): string {
-        const v = this.storage.getItem("stream_destination");
-        const allowed = new Set(["auto", "low-resolution", "medium-resolution",
-                                 "local", "remote", "remote-recorder"]);
-        return allowed.has(v as any) ? (v as string) : "auto";
-    }
     // ffmpeg mjpeg encoder -q:v. Valid range 1..31, lower = higher
     // quality + bigger JPEG (1 ≈ visually lossless, 31 ≈ very lossy).
     // Default 1 — with HTTP keep-alive + NODELAY we have plenty of
@@ -204,14 +194,6 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 description: "How long the device stays awake after the last paint before it sleeps itself. 0 disables; non-zero must be ≥ 5000.",
                 type: "number",
                 value: this.idleTimeoutMs,
-            } as any,
-            {
-                group: "Display",
-                key: "stream_destination",
-                title: "Camera substream",
-                description: "Which camera-side stream to pull. 'auto' walks low-latency-first and picks the first that resolves (typically a low-fps preview substream — ~5-8 fps). Pin to medium-resolution or remote-recorder to force a higher-fps stream at the cost of larger frames + latency.",
-                choices: ["auto", "low-resolution", "medium-resolution", "local", "remote", "remote-recorder"],
-                value: this.streamDestination,
             } as any,
             {
                 group: "Display",
@@ -794,13 +776,26 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // prebuffer baked in — we'd watch the past, not the present.
         // Walk substreams from lowest-latency → highest-latency and
         // take the first one that resolves.
+        // Source substream selection. We always want the highest-fps
+        // highest-quality option that still has acceptable latency.
+        // The wire cost is unaffected — we re-encode to panel-native
+        // 800x480 mjpeg q:v 1 regardless of input resolution — so the
+        // only tradeoff is Scrypted-side ffmpeg CPU (irrelevant here).
+        //
+        // Order of preference:
+        //   medium-resolution  — usually the camera's main 1080p
+        //                        stream at 15-30 fps, low latency
+        //   local              — main stream for local clients
+        //   remote             — main stream for remote clients
+        //   (camera default)   — last-ditch fallback
+        //
+        // Explicitly NOT trying:
+        //   low-resolution — preview substream, capped 5-8 fps
+        //   remote-recorder — has ~10s prebuffer baked in (we'd watch
+        //                     the past, not the present)
         let stream: any;
         let pickedDest = "(default)";
-        const userPref = v.streamDestination;
-        const destOrder = userPref === "auto"
-            ? ["low-resolution", "medium-resolution", "local", "remote", "remote-recorder"]
-            : [userPref];
-        for (const destination of destOrder) {
+        for (const destination of ["medium-resolution", "local", "remote"]) {
             try { stream = await cam.getVideoStream({ destination }); pickedDest = destination; break; }
             catch { /* try next */ }
         }
