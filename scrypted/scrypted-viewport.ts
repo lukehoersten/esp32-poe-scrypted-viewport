@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "e4a6d07";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -1034,14 +1034,27 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // Path 1: sharp. require()-fail caught at the boundary so a
         // missing native module just falls through.
+        //
+        // Quality math: ffmpeg's mjpeg -q:v 1 corresponds to sharp JPEG
+        // quality ~99-100 (their scales aren't 1:1 but the practical
+        // result matches). Our previous formula maxed out at 97 — that
+        // was the visible delta vs the stream. New formula: at
+        // jpegQuality=1 emit 100; at 10 emit ~82; at 31 emit ~40.
+        // Also force chromaSubsampling 4:4:4 at the top end so colored
+        // edges (text, UI overlays) don't smear — sharp's default 4:2:0
+        // is half-rate chroma and is the dominant visible artifact at
+        // panel-native resolution. mozjpeg encoder for tighter files at
+        // the same visual quality.
         if (!transformed.length) {
             try {
                 const sharp = require("sharp");
                 let img = sharp(srcJpeg, { failOnError: false });
                 if (needsRotate) img = img.rotate(90);
+                const sharpQuality = Math.min(100, 102 - v.jpegQuality * 2);
+                const chroma = v.jpegQuality <= 2 ? "4:4:4" : "4:2:0";
                 transformed = await img
                     .resize(panelW, panelH, { fit: "fill", kernel: "lanczos3" })
-                    .jpeg({ quality: Math.max(50, 100 - v.jpegQuality * 3) })
+                    .jpeg({ quality: sharpQuality, chromaSubsampling: chroma, mozjpeg: true })
                     .toBuffer();
                 path = "sharp";
             } catch { /* fall through */ }
