@@ -632,6 +632,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const cam: any = systemManager.getDeviceById(v.cameraId);
         if (!cam) return;
 
+        // Snapshot-then-stream: fire takePicture in parallel with the
+        // main ffmpeg spawn below. takePicture often hits a cached
+        // image and resolves in 50–300ms, vs. 0.5–3s before the first
+        // ffmpeg-emitted frame lands (ffmpeg startup + RTSP connect +
+        // first H.264 keyframe wait). The snapshot fills the gap so
+        // the panel shows the camera near-instantly on tap/event.
+        // Fire-and-forget — if it loses the race to the first stream
+        // frame (which has a higher X-Frame-Seq), the firmware will
+        // stale-drop it. Errors are silent so a missing snapshot path
+        // doesn't break the stream start.
+        this.pushSnapshot(v, cam).catch(() => {});
+
         // Fetch the panel's native dimensions from the firmware and
         // cache them on the viewport's storage. Falls back to 800x480
         // if /state is unreachable (e.g. mid-reboot). Panel dims never
@@ -919,6 +931,73 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.fetchSamples.set(nid, s);
         }
         return s;
+    }
+
+    // First-paint fast path. takePicture → quick ffmpeg one-shot to
+    // transpose+scale to panel-native dims → POST /frame. Shares the
+    // viewport's frameSeq counter so a slow snapshot can't paint over
+    // a faster stream frame — whichever loses the race gets stale-
+    // dropped by the firmware.
+    private async pushSnapshot(v: Viewport, cam: any) {
+        const t0 = Date.now();
+        let mo: any;
+        try { mo = await cam.takePicture({ reason: "event" }); }
+        catch (e) { return; }                 // camera doesn't support snapshots
+        if (!mo) return;
+
+        const srcJpeg: Buffer = await mediaManager.convertMediaObjectToBuffer(mo, "image/jpeg");
+        if (!srcJpeg || srcJpeg.length < 4) return;
+
+        // Cached dims from prior /state read; falls back to 800x480.
+        const panelW = parseInt(v.storage.getItem("panel_w") || "0", 10) || 800;
+        const panelH = parseInt(v.storage.getItem("panel_h") || "0", 10) || 480;
+        const vf = v.orientation === "portrait"
+            ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
+            : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
+
+        const { spawn } = require("child_process");
+        const ffmpegPath =
+            (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
+            "ffmpeg";
+
+        const transformed: Buffer = await new Promise<Buffer>((resolve, reject) => {
+            const p = spawn(ffmpegPath, [
+                "-hide_banner", "-loglevel", "error",
+                "-f", "image2pipe", "-i", "pipe:0",
+                "-vf", vf,
+                "-frames:v", "1",
+                "-c:v", "mjpeg", "-q:v", "2",
+                "-f", "image2pipe", "pipe:1",
+            ]);
+            const chunks: Buffer[] = [];
+            p.stdout.on("data", (c: Buffer) => chunks.push(c));
+            p.on("close", (code: number) => {
+                if (code !== 0) reject(new Error(`ffmpeg snapshot exit ${code}`));
+                else resolve(Buffer.concat(chunks));
+            });
+            p.on("error", reject);
+            p.stdin.on("error", () => {});   // suppress EPIPE if ffmpeg fails early
+            p.stdin.end(srcJpeg);
+            // Hard cap so a stuck ffmpeg can't delay the main stream
+            // (which is starting in parallel anyway).
+            setTimeout(() => { try { p.kill("SIGTERM"); } catch {} }, 2000);
+        }).catch(() => Buffer.alloc(0));
+
+        if (transformed.length < 4) return;
+
+        const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
+        this.frameSeq.set(v.nativeId!, seq);
+        try {
+            const res = await fetch(`http://${v.host}/frame`, {
+                method: "POST",
+                headers: { "Content-Type": "image/jpeg", "X-Frame-Seq": String(seq) },
+                body: transformed,
+                signal: AbortSignal.timeout(2000),
+            });
+            await res.text().catch(() => "");
+            const wasStale = res.headers.get("X-Frame-Drop") === "stale-seq";
+            this.console.log(`snapshot "${v.name}": ${Date.now() - t0}ms total (${(transformed.length / 1024).toFixed(0)}KB)${wasStale ? " — beaten by stream frame" : ""}`);
+        } catch { /* stream is starting anyway */ }
     }
 
     // Monotonic per-viewport sequence number paired with X-Frame-Seq
