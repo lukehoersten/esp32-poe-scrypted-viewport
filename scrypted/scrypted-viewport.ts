@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "d8d9a66";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -123,6 +123,16 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const v = this.storage.getItem("brightness");
         return v ? Math.max(0, Math.min(100, parseInt(v, 10) || 0)) : DEFAULT_BRIGHTNESS;
     }
+    // Preferred camera substream. "auto" walks a low-latency-first
+    // priority list and takes the first that resolves; the other
+    // options pin a specific substream so the user can pick a higher-
+    // fps source when "auto" lands on a slow 5-fps preview stream.
+    get streamDestination(): string {
+        const v = this.storage.getItem("stream_destination");
+        const allowed = new Set(["auto", "low-resolution", "medium-resolution",
+                                 "local", "remote", "remote-recorder"]);
+        return allowed.has(v as any) ? (v as string) : "auto";
+    }
     // ffmpeg mjpeg encoder -q:v. Valid range 1..31, lower = higher
     // quality + bigger JPEG (1 ≈ visually lossless, 31 ≈ very lossy).
     // Default 1 — with HTTP keep-alive + NODELAY we have plenty of
@@ -194,6 +204,14 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 description: "How long the device stays awake after the last paint before it sleeps itself. 0 disables; non-zero must be ≥ 5000.",
                 type: "number",
                 value: this.idleTimeoutMs,
+            } as any,
+            {
+                group: "Display",
+                key: "stream_destination",
+                title: "Camera substream",
+                description: "Which camera-side stream to pull. 'auto' walks low-latency-first and picks the first that resolves (typically a low-fps preview substream — ~5-8 fps). Pin to medium-resolution or remote-recorder to force a higher-fps stream at the cost of larger frames + latency.",
+                choices: ["auto", "low-resolution", "medium-resolution", "local", "remote", "remote-recorder"],
+                value: this.streamDestination,
             } as any,
             {
                 group: "Display",
@@ -759,7 +777,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // firmware still rejects 480x800, the rotation didn't apply
         // (very rare ffmpeg build issue) and we'd need to look at
         // installed ffmpeg version.
-        this.console.log(`stream "${v.name}": orientation=${v.orientation} panel=${panelW}x${panelH} vf="${vf}"`);
+        // (stream config log emitted after substream selection below)
 
         // Pull the camera's video stream, convert to ffmpeg input args, and
         // pipe through a single ffmpeg child: input → scale(lanczos) →
@@ -777,12 +795,17 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // Walk substreams from lowest-latency → highest-latency and
         // take the first one that resolves.
         let stream: any;
-        const destOrder = ["low-resolution", "medium-resolution", "local", "remote", "remote-recorder"];
+        let pickedDest = "(default)";
+        const userPref = v.streamDestination;
+        const destOrder = userPref === "auto"
+            ? ["low-resolution", "medium-resolution", "local", "remote", "remote-recorder"]
+            : [userPref];
         for (const destination of destOrder) {
-            try { stream = await cam.getVideoStream({ destination }); break; }
+            try { stream = await cam.getVideoStream({ destination }); pickedDest = destination; break; }
             catch { /* try next */ }
         }
-        if (!stream) stream = await cam.getVideoStream();
+        if (!stream) { stream = await cam.getVideoStream(); pickedDest = "(camera-default)"; }
+        this.console.log(`stream "${v.name}": orientation=${v.orientation} panel=${panelW}x${panelH} vf="${vf}" substream=${pickedDest}`);
         const ffmpegInputBuf: Buffer = await mediaManager.convertMediaObjectToBuffer(
             stream, "x-scrypted/x-ffmpeg-input");
         let ffmpegInput: any;
@@ -1022,11 +1045,17 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
-    // First-paint fast path. takePicture → quick ffmpeg one-shot to
-    // transpose+scale to panel-native dims → POST /frame. Shares the
-    // viewport's frameSeq counter so a slow snapshot can't paint over
-    // a faster stream frame — whichever loses the race gets stale-
-    // dropped by the firmware.
+    // First-paint fast path. takePicture → resize/rotate to panel
+    // native → POST /frame. Tries three transforms in order of cost:
+    //   1. sharp   — libvips bindings, ~5-15ms per image, handles
+    //                resize + rotate in one call. Not always present
+    //                in Scrypted's plugin sandbox.
+    //   2. mediaManager.convertMediaObjectToBuffer with size hint —
+    //                Scrypted's native converter (often vips-backed).
+    //                Resize-capable; rotation support varies. We only
+    //                use it for landscape (no rotate needed).
+    //   3. ffmpeg one-shot — old slow path, ~500-700ms cold start.
+    //                Always works; the safety net.
     private async pushSnapshot(v: Viewport, cam: any) {
         const t0 = Date.now();
         let mo: any;
@@ -1036,43 +1065,76 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         const srcJpeg: Buffer = await mediaManager.convertMediaObjectToBuffer(mo, "image/jpeg");
         if (!srcJpeg || srcJpeg.length < 4) return;
+        const tDecoded = Date.now();
 
         // Cached dims from prior /state read; falls back to 800x480.
         const panelW = parseInt(v.storage.getItem("panel_w") || "0", 10) || 800;
         const panelH = parseInt(v.storage.getItem("panel_h") || "0", 10) || 480;
-        const vf = v.orientation === "portrait"
-            ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
-            : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
+        const needsRotate = v.orientation === "portrait";
 
-        const { spawn } = require("child_process");
-        const ffmpegPath =
-            (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
-            "ffmpeg";
+        let transformed: Buffer = Buffer.alloc(0);
+        let path = "";
 
-        const transformed: Buffer = await new Promise<Buffer>((resolve, reject) => {
-            const p = spawn(ffmpegPath, [
-                "-hide_banner", "-loglevel", "error",
-                "-f", "image2pipe", "-i", "pipe:0",
-                "-vf", vf,
-                "-frames:v", "1",
-                "-c:v", "mjpeg", "-q:v", String(v.jpegQuality),
-                "-f", "image2pipe", "pipe:1",
-            ]);
-            const chunks: Buffer[] = [];
-            p.stdout.on("data", (c: Buffer) => chunks.push(c));
-            p.on("close", (code: number) => {
-                if (code !== 0) reject(new Error(`ffmpeg snapshot exit ${code}`));
-                else resolve(Buffer.concat(chunks));
-            });
-            p.on("error", reject);
-            p.stdin.on("error", () => {});   // suppress EPIPE if ffmpeg fails early
-            p.stdin.end(srcJpeg);
-            // Hard cap so a stuck ffmpeg can't delay the main stream
-            // (which is starting in parallel anyway).
-            setTimeout(() => { try { p.kill("SIGTERM"); } catch {} }, 2000);
-        }).catch(() => Buffer.alloc(0));
+        // Path 1: sharp. require()-fail caught at the boundary so a
+        // missing native module just falls through.
+        if (!transformed.length) {
+            try {
+                const sharp = require("sharp");
+                let img = sharp(srcJpeg, { failOnError: false });
+                if (needsRotate) img = img.rotate(90);
+                transformed = await img
+                    .resize(panelW, panelH, { fit: "fill", kernel: "lanczos3" })
+                    .jpeg({ quality: Math.max(50, 100 - v.jpegQuality * 3) })
+                    .toBuffer();
+                path = "sharp";
+            } catch { /* fall through */ }
+        }
+
+        // Path 2: Scrypted's native converter. Only used for landscape
+        // because the mime-parameter spec has no documented rotation
+        // and most implementations don't support it.
+        if (!transformed.length && !needsRotate) {
+            try {
+                transformed = await mediaManager.convertMediaObjectToBuffer(
+                    mo, `image/jpeg;width=${panelW};height=${panelH}`);
+                if (transformed?.length) path = "media-mgr";
+            } catch { /* fall through */ }
+        }
+
+        // Path 3: ffmpeg fallback. The slow ~500ms cold-start path.
+        if (!transformed.length) {
+            const vf = needsRotate
+                ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
+                : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
+            const { spawn } = require("child_process");
+            const ffmpegPath =
+                (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
+                "ffmpeg";
+            transformed = await new Promise<Buffer>((resolve, reject) => {
+                const p = spawn(ffmpegPath, [
+                    "-hide_banner", "-loglevel", "error",
+                    "-f", "image2pipe", "-i", "pipe:0",
+                    "-vf", vf,
+                    "-frames:v", "1",
+                    "-c:v", "mjpeg", "-q:v", String(v.jpegQuality),
+                    "-f", "image2pipe", "pipe:1",
+                ]);
+                const chunks: Buffer[] = [];
+                p.stdout.on("data", (c: Buffer) => chunks.push(c));
+                p.on("close", (code: number) => {
+                    if (code !== 0) reject(new Error(`ffmpeg snapshot exit ${code}`));
+                    else resolve(Buffer.concat(chunks));
+                });
+                p.on("error", reject);
+                p.stdin.on("error", () => {});
+                p.stdin.end(srcJpeg);
+                setTimeout(() => { try { p.kill("SIGTERM"); } catch {} }, 2000);
+            }).catch(() => Buffer.alloc(0));
+            if (transformed.length) path = "ffmpeg";
+        }
 
         if (transformed.length < 4) return;
+        const tTransformed = Date.now();
 
         const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
         this.frameSeq.set(v.nativeId!, seq);
@@ -1084,8 +1146,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 signal: AbortSignal.timeout(2000),
             });
             await res.text().catch(() => "");
-            const wasStale = res.headers.get("X-Frame-Drop") === "stale-seq";
-            this.console.log(`snapshot "${v.name}": ${Date.now() - t0}ms total (${(transformed.length / 1024).toFixed(0)}KB)${wasStale ? " — beaten by stream frame" : ""}`);
+            const tPosted   = Date.now();
+            const wasStale  = res.headers.get("X-Frame-Drop") === "stale-seq";
+            this.console.log(
+                `snapshot "${v.name}" via ${path}: ${tPosted - t0}ms total ` +
+                `(takePicture=${tDecoded - t0}ms transform=${tTransformed - tDecoded}ms ` +
+                `post=${tPosted - tTransformed}ms, ${(transformed.length / 1024).toFixed(0)}KB)` +
+                (wasStale ? " — beaten by stream frame" : ""));
         } catch { /* stream is starting anyway */ }
     }
 

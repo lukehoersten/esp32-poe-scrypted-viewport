@@ -67,6 +67,15 @@ static void handle_client(int fd, const char *peer)
     uint64_t frames_decoded   = 0;
     int64_t  t_window_start   = esp_timer_get_time();
     uint64_t bytes_in_window  = 0;
+    int64_t  t_prev_paint_done = 0;        // for idle-gap measurement
+
+    // Per-window min/max accumulators (microseconds).
+    int64_t  recv_min = INT64_MAX, recv_max = 0, recv_sum = 0;
+    int64_t  dec_min  = INT64_MAX, dec_max  = 0, dec_sum  = 0;
+    int64_t  pnt_min  = INT64_MAX, pnt_max  = 0, pnt_sum  = 0;
+    int64_t  idle_min = INT64_MAX, idle_max = 0, idle_sum = 0;
+    int64_t  lock_min = INT64_MAX, lock_max = 0, lock_sum = 0;
+    uint64_t window_samples = 0;
 
     while (1) {
         uint8_t hdr[HEADER_BYTES];
@@ -86,12 +95,18 @@ static void handle_client(int fd, const char *peer)
         }
 
         int64_t t_entry = esp_timer_get_time();
+        // Idle gap: time between the previous paint completing and
+        // this header landing. Large idle = ffmpeg/network is the
+        // bottleneck; near-zero idle = we're the bottleneck, source
+        // is queued up waiting.
+        int64_t idle_us = t_prev_paint_done ? (t_entry - t_prev_paint_done) : 0;
 
         if (!jpeg_decoder_try_lock(2000)) {
             ESP_LOGW(TAG, "decoder busy 2s — skipping seq %u", (unsigned)seq);
             if (drain_n(fd, jpeg_len) != ESP_OK) return;
             continue;
         }
+        int64_t t_lock_done = esp_timer_get_time();
 
         uint8_t *in = jpeg_decoder_input_buffer();
         if (read_n(fd, in, jpeg_len) != ESP_OK) {
@@ -154,27 +169,65 @@ static void handle_client(int fd, const char *peer)
         state_machine_frame_painted();
         frames_decoded++;
 
-        // Every 30 frames log a per-stage breakdown + window throughput
-        // — same shape as the old /frame log so the serial output stays
-        // useful for debugging without the script side.
-        if (frames_decoded % 30 == 0) {
+        // Stage timings for this frame, in microseconds.
+        int64_t lock_us = t_lock_done - t_entry;
+        int64_t recv_us = t_recv      - t_lock_done;
+        int64_t dec_us  = t_decode    - t_recv;
+        int64_t pnt_us  = t_paint     - t_decode;
+
+        if (lock_us < lock_min) lock_min = lock_us;
+        if (lock_us > lock_max) lock_max = lock_us;
+        lock_sum += lock_us;
+        if (recv_us < recv_min) recv_min = recv_us;
+        if (recv_us > recv_max) recv_max = recv_us;
+        recv_sum += recv_us;
+        if (dec_us  < dec_min)  dec_min  = dec_us;
+        if (dec_us  > dec_max)  dec_max  = dec_us;
+        dec_sum  += dec_us;
+        if (pnt_us  < pnt_min)  pnt_min  = pnt_us;
+        if (pnt_us  > pnt_max)  pnt_max  = pnt_us;
+        pnt_sum  += pnt_us;
+        if (idle_us > 0) {
+            if (idle_us < idle_min) idle_min = idle_us;
+            if (idle_us > idle_max) idle_max = idle_us;
+            idle_sum += idle_us;
+        }
+        window_samples++;
+        t_prev_paint_done = t_paint;
+
+        // Every 30 frames log a windowed min/avg/max breakdown +
+        // sustained throughput. Idle = gap between previous paint
+        // and next header arriving (= upstream slack). lock = mutex
+        // acquire (should be ~0 with single client). recv = body
+        // bytes off the wire. dec = HW JPEG. paint = backbuffer flip.
+        if (frames_decoded % 30 == 0 && window_samples > 0) {
             int64_t now      = esp_timer_get_time();
             double  win_s    = (now - t_window_start) / 1.0e6;
             double  mb_per_s = (win_s > 0)
                 ? ((double)bytes_in_window / win_s) / (1024.0 * 1024.0) : 0.0;
+            double  fps      = (win_s > 0) ? (double)window_samples / win_s : 0.0;
             ESP_LOGI(TAG,
-                "frame %llu seq=%u: recv=%lldus dec=%lldus paint=%lldus "
-                "total=%lldus (jpeg=%uKB) window=%llumiB/%.1fs (%.2fMB/s)",
-                (unsigned long long)frames_decoded, (unsigned)seq,
-                (long long)(t_recv   - t_entry),
-                (long long)(t_decode - t_recv),
-                (long long)(t_paint  - t_decode),
-                (long long)(t_paint  - t_entry),
-                (unsigned)(jpeg_len / 1024),
-                (unsigned long long)(bytes_in_window / (1024 * 1024)),
-                win_s, mb_per_s);
+                "%llu frames over %.1fs: %.1ffps %.2fMB/s avg-jpeg=%uKB | "
+                "lock min/avg/max=%lld/%lld/%lldus | "
+                "recv min/avg/max=%lld/%lld/%lldus | "
+                "dec  min/avg/max=%lld/%lld/%lldus | "
+                "paint min/avg/max=%lld/%lld/%lldus | "
+                "idle min/avg/max=%lld/%lld/%lldus",
+                (unsigned long long)window_samples, win_s, fps, mb_per_s,
+                (unsigned)((bytes_in_window / window_samples) / 1024),
+                (long long)lock_min, (long long)(lock_sum / window_samples), (long long)lock_max,
+                (long long)recv_min, (long long)(recv_sum / window_samples), (long long)recv_max,
+                (long long)dec_min,  (long long)(dec_sum  / window_samples), (long long)dec_max,
+                (long long)pnt_min,  (long long)(pnt_sum  / window_samples), (long long)pnt_max,
+                (long long)(idle_min == INT64_MAX ? 0 : idle_min),
+                (long long)(idle_sum  / window_samples),
+                (long long)idle_max);
             t_window_start  = now;
             bytes_in_window = 0;
+            recv_min = dec_min = pnt_min = idle_min = lock_min = INT64_MAX;
+            recv_max = dec_max = pnt_max = idle_max = lock_max = 0;
+            recv_sum = dec_sum = pnt_sum = idle_sum = lock_sum = 0;
+            window_samples = 0;
         }
     }
 }
