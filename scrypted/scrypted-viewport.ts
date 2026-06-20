@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "521de7e";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -947,12 +947,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     workBuf = workBuf.subarray(eoi + 2);
                     if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
 
-                    // Drop if the socket isn't connected yet (initial
-                    // open) or if the kernel send buffer is full
-                    // (firmware can't ingest as fast as ffmpeg emits).
-                    // Frame is gone forever — TCP doesn't queue what
-                    // we don't write.
-                    if (!socketReady || socketBackpressured) {
+                    // Drop only when the socket isn't connected yet
+                    // (initial-open race) — once it's up we just keep
+                    // writing. Node buffers internally if the kernel
+                    // send buffer is full; under 16 MB/s ffmpeg output
+                    // and ~5-7 MB/s firmware ingest the buffer rarely
+                    // exceeds a frame or two. The firmware's FIONREAD-
+                    // skip ensures it always paints the LATEST queued
+                    // frame, so any backlog gets shed there for free.
+                    if (!socketReady) {
                         droppedFrames++;
                         continue;
                     }
@@ -969,7 +972,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     if (writeLatencies.length > 200) writeLatencies.shift();
                     bytesSent += 8 + frame.length;
                     sentFrames++;
+                    // Track but don't gate on backpressure — the metric
+                    // is still useful as a "kernel buffer was full"
+                    // indicator for diagnostics.
                     if (!ok) socketBackpressured = true;
+                    else      socketBackpressured = false;
                 }
             });
 

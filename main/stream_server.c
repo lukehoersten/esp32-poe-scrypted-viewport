@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "sys/ioctl.h"
 
 #include "display.h"
 #include "jpeg_decoder.h"
@@ -128,6 +129,19 @@ static void handle_client(int fd, const char *peer)
         // Stale-seq guard. Each socket starts at 0 so the first
         // frame (seq=1) always paints.
         if (seq != 0 && seq <= last_painted_seq) {
+            jpeg_decoder_unlock();
+            continue;
+        }
+
+        // "Always paint the latest" — if the socket already has more
+        // bytes queued in the kernel receive buffer, at least one more
+        // header is on the way. The frame we just finished receiving
+        // is no longer the freshest possible; skip its decode+paint
+        // (saves ~6ms per skip) and loop straight to the next header.
+        // This trades some intermediate frames for lower
+        // glass-to-glass latency on the latest one.
+        int queued = 0;
+        if (ioctl(fd, FIONREAD, &queued) == 0 && queued >= HEADER_BYTES) {
             jpeg_decoder_unlock();
             continue;
         }
