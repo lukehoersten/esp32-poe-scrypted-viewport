@@ -266,6 +266,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 // ============================================================================
 // POST /state
 // ============================================================================
+// Defined alongside other /frame static state further down — forward
+// referenced here because state_post_handler resets it on wake.
+static uint32_t s_last_painted_seq;
+
 static esp_err_t state_post_handler(httpd_req_t *req)
 {
     char buf[64];
@@ -321,17 +325,8 @@ static esp_err_t respond_status(httpd_req_t *req, const char *status, const char
 // idle gap until the next request enters. Large idle = Scrypted/network
 // upstream is the bottleneck; small idle = we're saturating the link.
 static int64_t  s_last_post_us;
-// Highest X-Frame-Seq value we've actually painted. With two /frame
-// POSTs pipelined over separate sockets the firmware's decoder mutex
-// is the serialisation point, but FreeRTOS semaphore acquisition is
-// not FIFO — under jitter task B can grab the lock for frame N+1
-// before task A grabs it for frame N. Without a sequence check, the
-// later-arriving older frame would paint over the newer one and the
-// panel would briefly travel backwards in time. Frames with seq <=
-// s_last_painted_seq are acknowledged 200 OK but not painted. Reset
-// to 0 on every device wake — Scrypted's counter starts fresh per
-// stream so we don't drag a stale comparison forward.
-static uint32_t s_last_painted_seq;
+// (s_last_painted_seq is forward-declared above state_post_handler;
+// description there.)
 
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
