@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "b97c250";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -85,7 +85,10 @@ type SettingValue            = any;
 
 // Tuning constants. Frame interval is also exposed on the parent's
 // Settings page so it can be tweaked without editing the script.
-const DEFAULT_FRAME_INTERVAL_MS  = 500;   // ~2 fps — snapshot-based; cameras typically can't sustain faster
+// (frame_interval_ms removed in b97c250 — under the TCP streaming
+// data plane ffmpeg emits at the camera's native rate and TCP back-
+// pressure naturally caps us when the firmware can't keep up. The
+// fps filter was only ever useful as a max-fps safety under HTTP.)
 const REREGISTER_INTERVAL_MS     = 5 * 60_000;
 // 5s gives /state + /config posts enough headroom to slip in between
 // /frame POSTs when the device is mid-stream. The firmware's single
@@ -95,7 +98,7 @@ const REREGISTER_INTERVAL_MS     = 5 * 60_000;
 // back-to-back startStream calls.
 const HTTP_TIMEOUT_MS            = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
-const DEFAULT_BRIGHTNESS         = 80;
+const DEFAULT_BRIGHTNESS         = 100;
 
 // ============================================================================
 // Child: one viewport binding
@@ -119,11 +122,6 @@ class Viewport extends ScryptedDeviceBase implements Settings {
     get brightness(): number {
         const v = this.storage.getItem("brightness");
         return v ? Math.max(0, Math.min(100, parseInt(v, 10) || 0)) : DEFAULT_BRIGHTNESS;
-    }
-    get frameIntervalMs(): number {
-        const v = this.storage.getItem("frame_interval_ms");
-        const parsed = v ? parseInt(v, 10) : NaN;
-        return Number.isFinite(parsed) ? Math.max(33, parsed) : DEFAULT_FRAME_INTERVAL_MS;
     }
     // ffmpeg mjpeg encoder -q:v. Valid range 1..31, lower = higher
     // quality + bigger JPEG (1 ≈ visually lossless, 31 ≈ very lossy).
@@ -196,14 +194,6 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 description: "How long the device stays awake after the last paint before it sleeps itself. 0 disables; non-zero must be ≥ 5000.",
                 type: "number",
                 value: this.idleTimeoutMs,
-            } as any,
-            {
-                group: "Display",
-                key: "frame_interval_ms",
-                title: "Frame push interval (ms)",
-                description: `How often a JPEG snapshot is POSTed during an active stream. Lower = smoother but more network + CPU; clamped to ≥ 33 ms (~30 fps max). Default ${DEFAULT_FRAME_INTERVAL_MS}.`,
-                type: "number",
-                value: this.frameIntervalMs,
             } as any,
             {
                 group: "Display",
@@ -761,7 +751,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const vf = v.orientation === "portrait"
             ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
             : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
-        const fps = Math.max(1, Math.round(1000 / v.frameIntervalMs));
         const qv  = String(v.jpegQuality);
         // Diagnostic — confirms which filter chain the *currently loaded*
         // script is actually using. If you don't see this line in the
@@ -892,7 +881,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 "-analyzeduration", "0",
                 ...(ffmpegInput.inputArguments || []),
                 "-an", "-sn",
-                "-vf", `${vf},fps=${fps}`,
+                "-vf", vf,
                 // -fps_mode drop: when the decoder is behind, throw the
                 // late frame on the floor instead of queueing it. Without
                 // this, ffmpeg's output queue fills up and the displayed
