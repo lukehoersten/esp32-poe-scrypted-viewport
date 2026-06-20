@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "28f39bf";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -1022,11 +1022,24 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             } catch { /* keep the local stats; firmware-side just shows ? */ }
 
             const skipped = paintedNum >= 0 ? Math.max(0, sentRate - paintedNum).toFixed(1) : "?";
+            // node_buf = bytes Scrypted has handed to socket.write but
+            // the kernel send buffer hasn't accepted yet — they sit in
+            // Node's internal queue, NOT on the wire. Divide by the
+            // current send rate to estimate how many seconds of
+            // already-emitted frames are waiting at the source. This
+            // is the load-bearing piece of the g2g "buffer depth"
+            // story: when this is large, the firmware can't possibly
+            // be showing the freshest bytes because we haven't even
+            // sent them yet.
+            const nodeBufBytes = sock?.writableLength ?? 0;
+            const sentBps      = mbPerSec * 1024 * 1024;
+            const nodeBufMs    = sentBps > 0 ? (nodeBufBytes / sentBps * 1000).toFixed(0) : "?";
             this.console.log(
                 `stream "${v.name}": sent=${sentRate.toFixed(1)}fps painted=${painted}fps ` +
                 `(fw-skipped=${skipped}fps, drops=${droppedFrames}) ` +
                 `${mbPerSec.toFixed(2)}MB/s sent / ${paintedMb}MB/s painted | ` +
-                `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} | ` +
+                `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} ` +
+                `node_buf=${(nodeBufBytes / 1024).toFixed(0)}KB≈${nodeBufMs}ms | ` +
                 `recv=${recvStr}us dec=${decStr}us paint=${paintStr}us idle=${idleStr}us | g2g=${g2g}`);
 
             droppedFrames = 0;
