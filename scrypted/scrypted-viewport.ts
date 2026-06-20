@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "e3bccca";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -238,17 +238,18 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             } as any,
         ];
 
-        // Live device snapshot: GET /state + /config in parallel with a
-        // short timeout, then render as a read-only "Status" section. If
-        // the device is offline we still surface the binding fields so the
-        // operator can change them — the status fields just say "offline".
+        // Live device snapshot: GET /state then /config sequentially
+        // (parallel ate both httpd slots simultaneously after Phase 2
+        // dropped max_open_sockets to 2, and could collide with an
+        // in-flight stream-socket cap-flush reconnect). 3s timeout is
+        // generous but not so long that an offline device feels
+        // unresponsive in the UI.
         if (this.host) {
             try {
-                const ctrl = AbortSignal.timeout(1500);
-                const [stateRes, configRes] = await Promise.all([
-                    fetch(`http://${this.host}/state`,  { signal: ctrl }).then(r => r.json()),
-                    fetch(`http://${this.host}/config`, { signal: ctrl }).then(r => r.json()),
-                ]);
+                const stateRes = await fetch(`http://${this.host}/state`,
+                    { signal: AbortSignal.timeout(3000) }).then(r => r.json());
+                const configRes = await fetch(`http://${this.host}/config`,
+                    { signal: AbortSignal.timeout(3000) }).then(r => r.json());
                 settings.push(
                     { group: "Status (live)", key: "_st_name",   title: "name",                value: stateRes.name,                                                 readonly: true } as any,
                     { group: "Status (live)", key: "_st_mac",    title: "mac",                 value: stateRes.mac,                                                  readonly: true } as any,
