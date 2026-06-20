@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "pending";
+const SCRIPT_VERSION = "e88aa51";
 //
 // Architecture
 // ------------
