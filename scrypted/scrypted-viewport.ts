@@ -125,6 +125,17 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const parsed = v ? parseInt(v, 10) : NaN;
         return Number.isFinite(parsed) ? Math.max(33, parsed) : DEFAULT_FRAME_INTERVAL_MS;
     }
+    // ffmpeg mjpeg encoder -q:v. Valid range 1..31, lower = higher
+    // quality + bigger JPEG (1 ≈ visually lossless, 31 ≈ very lossy).
+    // Default 1 — with HTTP keep-alive + NODELAY we have plenty of
+    // body-upload headroom for the bigger frames. Bump up only if
+    // you're chasing fewer bytes on the wire at the cost of visible
+    // artifacts.
+    get jpegQuality(): number {
+        const v = this.storage.getItem("jpeg_quality");
+        const parsed = v ? parseInt(v, 10) : NaN;
+        return Number.isFinite(parsed) ? Math.max(1, Math.min(31, parsed)) : 1;
+    }
     // Which camera-event types wake this viewport. Empty = tap-only,
     // never woken by Scrypted. Default = all three (doorbell + motion +
     // person detection).
@@ -193,6 +204,14 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 description: `How often a JPEG snapshot is POSTed during an active stream. Lower = smoother but more network + CPU; clamped to ≥ 33 ms (~30 fps max). Default ${DEFAULT_FRAME_INTERVAL_MS}.`,
                 type: "number",
                 value: this.frameIntervalMs,
+            } as any,
+            {
+                group: "Display",
+                key: "jpeg_quality",
+                title: "JPEG quality (1–31, lower = better)",
+                description: "ffmpeg mjpeg encoder -q:v. 1 ≈ visually lossless (~140KB at panel-native), 5 ≈ good (~70KB), 10+ noticeably lossy. Default 1.",
+                type: "number",
+                value: this.jpegQuality,
             } as any,
             {
                 group: "Actions",
@@ -727,6 +746,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
             : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
         const fps = Math.max(1, Math.round(1000 / v.frameIntervalMs));
+        const qv  = String(v.jpegQuality);
         // Diagnostic — confirms which filter chain the *currently loaded*
         // script is actually using. If you don't see this line in the
         // plugin log, the Scrypted Script editor is still on stale code
@@ -823,7 +843,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 // this, ffmpeg's output queue fills up and the displayed
                 // image lags further and further behind reality.
                 "-fps_mode", "drop",
-                "-c:v", "mjpeg", "-q:v", "1",
+                "-c:v", "mjpeg", "-q:v", qv,
                 "-f", "image2pipe", "-flush_packets", "1",
                 "pipe:1",
             ]);
@@ -1049,7 +1069,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 "-f", "image2pipe", "-i", "pipe:0",
                 "-vf", vf,
                 "-frames:v", "1",
-                "-c:v", "mjpeg", "-q:v", "1",
+                "-c:v", "mjpeg", "-q:v", String(v.jpegQuality),
                 "-f", "image2pipe", "pipe:1",
             ]);
             const chunks: Buffer[] = [];
