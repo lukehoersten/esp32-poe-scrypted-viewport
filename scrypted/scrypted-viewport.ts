@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "e4a546c";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -627,11 +627,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     async startStream(v: Viewport, tEvent: number = Date.now()) {
         const since = () => Date.now() - tEvent;
         this.console.log(`stream "${v.name}": start +${since()}ms`);
-        // event_us_low: low 32 bits of the Scrypted-host monotonic µs
-        // at camera-event arrival. The firmware stamps this on the
-        // most recently painted frame and echoes it back via /state,
-        // letting us compute glass-to-glass.
-        const eventUsLow = (tEvent * 1000) >>> 0;
+        // (event_us_low is stamped per frame at emit time inside the
+        // demux loop — see the writeUInt32BE call below. This gives
+        // "age of the currently-displayed frame" semantics for g2g,
+        // not "time since wake".)
 
         // Race rule: cancel pending operations on every callback before
         // beginning a fresh stream.
@@ -891,12 +890,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     seq++;
                     // 16-byte v1 header. Magic "VPRT" (0x56505254) lets
                     // the firmware autodetect old-vs-new clients during
-                    // the rollout window.
+                    // the rollout window. event_us_low is stamped per
+                    // frame at emit time so /state's g2g = age of the
+                    // most recently painted frame (not time since wake).
                     const header = Buffer.alloc(16);
                     header.writeUInt32BE(0x56505254, 0);   // "VPRT"
                     header.writeUInt32BE(frame.length, 4);
                     header.writeUInt32BE(seq, 8);
-                    header.writeUInt32BE(eventUsLow, 12);
+                    header.writeUInt32BE((Date.now() * 1000) >>> 0, 12);
                     const t0 = Date.now();
                     // Single combined write avoids splitting header
                     // and body across two TCP packets — the firmware
@@ -1078,15 +1079,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // missing native module just falls through.
         //
         // Quality math: ffmpeg's mjpeg -q:v 1 corresponds to sharp JPEG
-        // quality ~99-100 (their scales aren't 1:1 but the practical
-        // result matches). Our previous formula maxed out at 97 — that
-        // was the visible delta vs the stream. New formula: at
-        // jpegQuality=1 emit 100; at 10 emit ~82; at 31 emit ~40.
-        // Also force chromaSubsampling 4:4:4 at the top end so colored
-        // edges (text, UI overlays) don't smear — sharp's default 4:2:0
-        // is half-rate chroma and is the dominant visible artifact at
-        // panel-native resolution. mozjpeg encoder for tighter files at
-        // the same visual quality.
+        // quality ~99-100. At jpegQuality=1 emit 100; at 10 emit ~82;
+        // at 31 emit ~40. chromaSubsampling 4:4:4 at the top end (≤2)
+        // so colored edges don't smear — sharp's default 4:2:0 is
+        // half-rate chroma and was the dominant visible artifact at
+        // panel-native resolution.
+        //
+        // mozjpeg: false intentionally. mozjpeg gave us ~3-4× slower
+        // encode (sharp transform 1.6s vs 400ms) for a maybe-5% file
+        // size win that we can't perceive at 800x480. libjpeg-turbo
+        // default is the right call when first-paint latency matters.
         if (!transformed.length) {
             try {
                 const sharp = require("sharp");
@@ -1096,7 +1098,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 const chroma = v.jpegQuality <= 2 ? "4:4:4" : "4:2:0";
                 transformed = await img
                     .resize(panelW, panelH, { fit: "fill", kernel: "lanczos3" })
-                    .jpeg({ quality: sharpQuality, chromaSubsampling: chroma, mozjpeg: true })
+                    .jpeg({ quality: sharpQuality, chromaSubsampling: chroma })
                     .toBuffer();
                 path = "sharp";
             } catch { /* fall through */ }
