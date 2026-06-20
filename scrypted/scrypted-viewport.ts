@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "1063a4e";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -338,6 +338,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 maxSockets:       2,
                 maxFreeSockets:   2,
                 timeout:          30_000,
+                // CRITICAL: without this, the keep-alive socket inherits
+                // Nagle ON by default. When a 128KB JPEG body doesn't
+                // end on an MTU boundary, the kernel sits on the final
+                // partial packet for up to 200ms (delayed-ACK window)
+                // waiting for either more data or an ACK. Firmware-side
+                // TCP_NODELAY only affects firmware's sends; the sender
+                // also has to opt out. Without noDelay we measured
+                // fw_recv p95 spiking from ~25ms to ~230ms — the exact
+                // 200ms Nagle+delayed-ACK deadlock signature.
+                noDelay:          true,
             });
             this.agents.set(host, a);
         }
@@ -387,6 +397,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             }
             req.on("timeout", () => req.destroy(new Error("request timeout")));
             req.on("error", reject);
+            // Belt-and-suspenders: in case the Agent's noDelay option
+            // isn't honored on every Node version, force it on the
+            // socket as soon as it's allocated. Without this the
+            // socket inherits Nagle ON and a JPEG body ending mid-MTU
+            // stalls for the 200ms delayed-ACK window.
+            req.on("socket", (s: any) => { try { s.setNoDelay(true); } catch {} });
             if (opts.body != null) req.write(opts.body);
             req.end();
         });
