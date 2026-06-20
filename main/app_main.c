@@ -7,6 +7,7 @@
 #include "nvs_config.h"
 #include "state_client.h"
 #include "state_machine.h"
+#include "stream_server.h"
 #include "touch.h"
 #include "viewport_state.h"
 
@@ -52,7 +53,7 @@ void app_main(void)
     // don't get a DHCP lease. mDNS + HTTP advertise / bind anyway and will
     // start serving the moment the link comes up.
     // ------------------------------------------------------------------
-    char flags[7] = { '-','-','-','-','-','-', 0 };  // E M H D J T
+    char flags[8] = { '-','-','-','-','-','-','-', 0 };  // E M H S D J T
     esp_err_t eth_err = net_eth_init();
     mark(eth_err, 'E', &flags[0]);
 
@@ -71,6 +72,10 @@ void app_main(void)
     ESP_ERROR_CHECK(state_client_init());
     mark(mdns_service_start(), 'M', &flags[1]);
     mark(http_api_start(),     'H', &flags[2]);
+    // Data plane: raw TCP on :81 for back-to-back JPEG streaming,
+    // bypassing per-frame HTTP overhead. /frame HTTP stays alive for
+    // the snapshot one-shot and for curl debugging.
+    mark(stream_server_start(81), 'S', &flags[3]);
 
     // ------------------------------------------------------------------
     // Display + I²C-bound peripherals run on their own task. ESP-IDF's

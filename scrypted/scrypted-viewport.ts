@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "e88aa51";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -810,22 +810,61 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         const abort = new AbortController();
 
-        // Single-flight: only one POST /frame in flight at a time. The
-        // firmware's JPEG decoder mutex returns 503 otherwise; we just
-        // drop the spare frames silently — natural rate-limiter.
-        // Allow up to MAX_INFLIGHT concurrent /frame POSTs so that the
-        // network upload of frame N+1 overlaps with the firmware's
-        // decode+paint of frame N. The firmware's JPEG decoder mutex
-        // serialises the decode itself; this only buys us the upload
-        // overlap (≈ half of total /frame wall time). Keep this in
-        // sync with cfg.max_open_sockets in main/http_api.c — that
-        // sits at 4 (2 for streaming + 2 spare for /state, /config).
-        const MAX_INFLIGHT = 2;
-        let inFlight = 0;
+        // ── DATA PLANE: raw TCP socket to firmware port 81 ────────────
+        // Replaces per-frame HTTP POSTs. One socket per stream session.
+        // Frame format on the wire (big-endian):
+        //   [4 bytes jpeg_len][4 bytes seq][jpeg_len bytes JPEG body]
+        // We let TCP flow-control backpressure us naturally: if
+        // socket.write() returns false the kernel buffer is full —
+        // we drop incoming ffmpeg frames until 'drain' fires. No HTTP
+        // headers, no per-frame ACK round-trip, no Nagle/delayed-ACK
+        // dance, no httpd worker churn.
+        const net = require("net");
+        let sock: any = null;
+        let socketReady = false;
+        let socketBackpressured = false;
+        let seq = 0;
         let droppedFrames = 0;
         let sentFrames    = 0;
+        let bytesSent     = 0;
         let lastLogUs = Date.now();
         let workBuf: Buffer = Buffer.alloc(0);
+
+        // Latency probe — wall-clock from "ffmpeg emitted the JPEG"
+        // to "kernel accepted the socket.write". With the keep-alive
+        // socket + TCP_NODELAY this should be sub-millisecond steady
+        // state; visible-double-digit numbers here mean kernel send
+        // buffer is full (= firmware can't ingest fast enough).
+        const writeLatencies: number[] = [];
+
+        const openStreamSocket = () => {
+            if (abort.signal.aborted) return;
+            socketReady = false;
+            socketBackpressured = false;
+            sock = net.createConnection({
+                host:    v.host,
+                port:    81,
+                noDelay: true,        // TCP_NODELAY on the outbound socket
+            });
+            sock.on("connect", () => {
+                socketReady = true;
+                this.console.log(`stream "${v.name}": tcp/81 open`);
+            });
+            sock.on("drain", () => { socketBackpressured = false; });
+            sock.on("error", (e: Error) => {
+                this.console.warn(`stream "${v.name}" socket: ${e.message}`);
+                socketReady = false;
+                if (!abort.signal.aborted) setTimeout(openStreamSocket, 500);
+            });
+            sock.on("close", () => {
+                socketReady = false;
+                if (!abort.signal.aborted) setTimeout(openStreamSocket, 500);
+            });
+        };
+        openStreamSocket();
+        abort.signal.addEventListener("abort", () => {
+            try { sock?.destroy(); } catch {}
+        });
 
         // Auto-restart accounting: cameras occasionally end their RTSP
         // stream mid-event (network blip, source rotation, etc.) and
@@ -875,19 +914,29 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     workBuf = workBuf.subarray(eoi + 2);
                     if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
 
-                    if (inFlight >= MAX_INFLIGHT) { droppedFrames++; continue; }
-                    const emitMs        = Date.now();
-                    const depthAtQueue  = inFlight;       // BEFORE the increment
-                    inFlight++;
+                    // Drop if the socket isn't connected yet (initial
+                    // open) or if the kernel send buffer is full
+                    // (firmware can't ingest as fast as ffmpeg emits).
+                    // Frame is gone forever — TCP doesn't queue what
+                    // we don't write.
+                    if (!socketReady || socketBackpressured) {
+                        droppedFrames++;
+                        continue;
+                    }
+                    seq++;
+                    const header = Buffer.alloc(8);
+                    header.writeUInt32BE(frame.length, 0);
+                    header.writeUInt32BE(seq, 4);
+                    const t0 = Date.now();
+                    // Single combined write avoids splitting header
+                    // and body across two TCP packets — the firmware
+                    // sees them as one contiguous segment when possible.
+                    const ok = sock.write(Buffer.concat([header, frame]));
+                    writeLatencies.push(Date.now() - t0);
+                    if (writeLatencies.length > 200) writeLatencies.shift();
+                    bytesSent += 8 + frame.length;
                     sentFrames++;
-                    this.pushStreamFrame(v, frame, abort, emitMs, depthAtQueue)
-                        .catch(e => {
-                            if (abort.signal.aborted) return;
-                            const err = (e as Error);
-                            const cause = (err as any)?.cause?.code || "";
-                            this.console.warn(`pushStreamFrame "${v.name}":`, err.message, cause ? `(${cause})` : "");
-                        })
-                        .finally(() => { inFlight--; });
+                    if (!ok) socketBackpressured = true;
                 }
             });
 
@@ -935,23 +984,23 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             const now = Date.now();
             const window = (now - lastLogUs) / 1000;
             if (window > 0 && (sentFrames > 0 || droppedFrames > 0)) {
-                const sentRate   = sentFrames / window;
-                const targetRate = 1000 / v.frameIntervalMs;
-                const dropRate   = droppedFrames / window;
-                // Two distinct symptoms to call out:
-                //  - drops > 25% of target → backpressure: HTTP POST or
-                //    panel is the bottleneck, advice is to raise interval.
-                //  - delivered < 60% AND drops are negligible → ffmpeg's
-                //    fps filter / camera substream simply isn't producing
-                //    the requested rate. Raising interval won't help;
-                //    surface a different message.
-                if (dropRate > targetRate * 0.25) {
-                    this.console.log(`"${v.name}": backpressure — delivered ~${sentRate.toFixed(1)} fps vs target ${targetRate.toFixed(1)} fps, dropped ~${dropRate.toFixed(1)} fps over ${window.toFixed(1)}s (POST stack can't keep up; raise frame_interval_ms slightly to flatten this)`);
-                } else if (sentRate < targetRate * 0.6 && sentRate > 0) {
-                    this.console.log(`"${v.name}": source-limited — delivered ~${sentRate.toFixed(1)} fps vs target ${targetRate.toFixed(1)} fps over ${window.toFixed(1)}s (camera substream / ffmpeg fps filter producing below requested rate; raising frame_interval_ms won't help)`);
-                }
+                const sentRate = sentFrames / window;
+                const dropRate = droppedFrames / window;
+                const mbPerSec = (bytesSent / window) / (1024 * 1024);
+                const sortedW  = writeLatencies.slice().sort((a, b) => a - b);
+                const p50 = sortedW.length ? sortedW[Math.floor(sortedW.length * 0.5)] : 0;
+                const p95 = sortedW.length ? sortedW[Math.floor(sortedW.length * 0.95)] : 0;
+                const max = sortedW.length ? sortedW[sortedW.length - 1] : 0;
+                this.console.log(
+                    `stream "${v.name}": ${sentRate.toFixed(1)} fps, ${mbPerSec.toFixed(2)} MB/s ` +
+                    `over ${window.toFixed(1)}s ` +
+                    `(drops=${droppedFrames}=${dropRate.toFixed(1)} fps) ` +
+                    `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms ` +
+                    `backpressured=${socketBackpressured}`);
                 droppedFrames = 0;
                 sentFrames    = 0;
+                bytesSent     = 0;
+                writeLatencies.length = 0;
                 lastLogUs     = now;
             }
         }, 10_000);
@@ -982,74 +1031,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         if (sendSleep && v?.host) {
             this.postJSON(`http://${v.host}/state`, { state: "sleep" }).catch(() => {});
         }
-    }
-
-    // Scrypted-side per-fetch timing. We log aggregated stats every
-    // 10 fetches instead of a single-sample line — single samples were
-    // hiding tail latency. Each fetch records four buckets:
-    //   emit→post : ms from ffmpeg-emitted-the-jpeg to fetch() called.
-    //               Nonzero means the inFlight queue gated us.
-    //   req       : fetch() called → Response headers arrive. Body
-    //               upload + server processing + status line round-trip.
-    //   body-read : Response received → response body drained. Should
-    //               be near-zero (firmware returns empty 204/200/409).
-    //   wall      : total of all three for sanity.
-    // Plus inflight-at-queue (0/1/2) so we can see whether pipelining
-    // is actually overlapping anything, and a stale-drop counter for
-    // X-Frame-Drop responses from the firmware.
-    private fetchCount = new Map<string, number>();
-    private fetchSamples = new Map<string, {
-        // Script-side wall-clock spans, ms.
-        emit:    number[];   // ffmpeg emit → fetch() call
-        wall:    number[];   // emit → fetch resolved (end-to-end)
-        req:     number[];   // fetch() → Response headers
-        bread:   number[];   // Response → body drained
-        // Firmware-side spans from Server-Timing (already ms).
-        fw_recv: number[];   // body bytes off the wire
-        fw_dec:  number[];   // hardware JPEG decode
-        fw_paint:number[];   // back buffer flip
-        fw_post: number[];   // state counters + unlock + resp headers
-        fw_tot:  number[];   // firmware total (recv + dec + paint + post)
-        // Derived: time fetch() spent in flight that firmware DIDN'T
-        // see. net_up = req - fw_tot ≈ TCP setup + body wire time
-        // + httpd dispatch.
-        net_up:  number[];
-        depths:  { d0: number; d1: number; d2: number };
-        staleDrops: number;
-    }>();
-
-    private bucketsFor(nid: string) {
-        let s = this.fetchSamples.get(nid);
-        if (!s) {
-            s = { emit: [], wall: [], req: [], bread: [],
-                  fw_recv: [], fw_dec: [], fw_paint: [], fw_post: [], fw_tot: [],
-                  net_up: [],
-                  depths: { d0: 0, d1: 0, d2: 0 }, staleDrops: 0 };
-            this.fetchSamples.set(nid, s);
-        }
-        return s;
-    }
-
-    // Parse a Server-Timing header like
-    //   recv;dur=12.3, dec;dur=4.5, paint;dur=0.1, post;dur=0.2, handle;dur=17.1
-    // into a record of name→duration_ms. Robust to whitespace and
-    // missing entries; returns {} on malformed input.
-    private parseServerTiming(h: string | null): Record<string, number> {
-        const out: Record<string, number> = {};
-        if (!h) return out;
-        for (const tok of h.split(",")) {
-            const parts = tok.trim().split(";");
-            const name  = parts[0]?.trim();
-            if (!name) continue;
-            for (let i = 1; i < parts.length; i++) {
-                const [k, v] = parts[i].trim().split("=");
-                if (k === "dur") {
-                    const n = Number(v);
-                    if (Number.isFinite(n)) out[name] = n;
-                }
-            }
-        }
-        return out;
     }
 
     // First-paint fast path. takePicture → quick ffmpeg one-shot to
@@ -1125,119 +1106,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // firmware also resets its comparator on /state {wake}, so the
     // two stay in step.
     private frameSeq = new Map<string, number>();
-
-    private async pushStreamFrame(v: Viewport, jpeg: Buffer, abort: AbortController,
-                                  emitMs: number, depthAtQueue: number) {
-        if (abort.signal.aborted) return;
-        const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
-        this.frameSeq.set(v.nativeId!, seq);
-        const tFetchStart = Date.now();
-        const res = await this.httpRequest({
-            host: v.host, port: 80, path: "/frame", method: "POST",
-            headers: {
-                "Content-Type": "image/jpeg",
-                "X-Frame-Seq":  String(seq),
-                "Content-Length": String(jpeg.length),
-            },
-            body: jpeg,
-            timeoutMs: 10_000,
-            abort: abort.signal,
-        });
-        const tHeaders = res.tHeaders;
-        const tDone    = res.tDone;
-        const status   = res.status;
-        const hdrGet   = (k: string) => {
-            const v = res.headers[k.toLowerCase()];
-            return Array.isArray(v) ? v[0] : v;
-        };
-        const wasStale = hdrGet("X-Frame-Drop") === "stale-seq";
-        const fwTiming = this.parseServerTiming(hdrGet("Server-Timing") ?? null);
-
-        const b = this.bucketsFor(v.nativeId!);
-        const req_ms  = tHeaders - tFetchStart;
-        const fw_tot  = fwTiming.handle ?? 0;
-        b.emit.push (tFetchStart - emitMs);
-        b.req.push  (req_ms);
-        b.bread.push(tDone       - tHeaders);
-        b.wall.push (tDone       - emitMs);
-        if (fwTiming.recv  != null) b.fw_recv.push(fwTiming.recv);
-        if (fwTiming.dec   != null) b.fw_dec.push(fwTiming.dec);
-        if (fwTiming.paint != null) b.fw_paint.push(fwTiming.paint);
-        if (fwTiming.post  != null) b.fw_post.push(fwTiming.post);
-        if (fw_tot         >  0)    b.fw_tot.push(fw_tot);
-        // net_up = the slice of req that the firmware DIDN'T see —
-        // TCP handshake (when no keep-alive), body bytes on the wire,
-        // and httpd dispatch from socket-readable to handler entry.
-        // Can go slightly negative under clock skew; clamp at 0.
-        if (fw_tot > 0) b.net_up.push(Math.max(0, req_ms - fw_tot));
-        if (depthAtQueue === 0) b.depths.d0++;
-        else if (depthAtQueue === 1) b.depths.d1++;
-        else b.depths.d2++;
-        if (wasStale) b.staleDrops++;
-
-        const n = (this.fetchCount.get(v.nativeId!) || 0) + 1;
-        this.fetchCount.set(v.nativeId!, n);
-        if (n % 10 === 0) {
-            const p = (arr: number[], q: number) => {
-                if (!arr.length) return 0;
-                const sorted = arr.slice().sort((a, b) => a - b);
-                return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
-            };
-            const stats = (arr: number[]) => {
-                if (!arr.length) return null;
-                let mn = arr[0], mx = arr[0];
-                for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; }
-                return { min: mn, p50: p(arr, 0.5), p95: p(arr, 0.95), max: mx };
-            };
-            const fmt = (arr: number[]) => {
-                const s = stats(arr);
-                if (!s) return `(no data)`;
-                return `min=${s.min.toFixed(1)} p50=${s.p50.toFixed(1)} p95=${s.p95.toFixed(1)} max=${s.max.toFixed(1)}ms`;
-            };
-            // Identify the worst-wall sample in the window and decompose
-            // it into its own stages — answers "what made the slowest
-            // frame slow?" without us having to guess from percentiles.
-            let worstIdx = 0;
-            for (let i = 1; i < b.wall.length; i++) if (b.wall[i] > b.wall[worstIdx]) worstIdx = i;
-            const at = (arr: number[], i: number) =>
-                (i < arr.length && arr[i] != null) ? arr[i].toFixed(1) : "n/a";
-            this.console.log(
-                `fetch "${v.name}" #${n} (jpeg=${(jpeg.length / 1024).toFixed(0)}KB)\n` +
-                `   wall       ${fmt(b.wall)}\n` +
-                `   emit→post  ${fmt(b.emit)}     (queue wait before fetch() called)\n` +
-                `   req        ${fmt(b.req)}     (fetch start → Response headers)\n` +
-                `     net_up   ${fmt(b.net_up)}     (req − fw_total: TCP setup + body wire + dispatch)\n` +
-                `     fw_recv  ${fmt(b.fw_recv)}     (firmware body read off the wire)\n` +
-                `     fw_dec   ${fmt(b.fw_dec)}     (hardware JPEG → BGR888)\n` +
-                `     fw_paint ${fmt(b.fw_paint)}     (backbuffer flip)\n` +
-                `     fw_post  ${fmt(b.fw_post)}     (state counters + unlock)\n` +
-                `   body-read  ${fmt(b.bread)}     (Response → drained)\n` +
-                `   inflight   d0=${b.depths.d0} d1=${b.depths.d1} d2=${b.depths.d2}    (queue depth at fetch start)\n` +
-                `   worst (#${worstIdx + 1}/${b.wall.length} in window): wall=${at(b.wall, worstIdx)}ms = ` +
-                `emit→post ${at(b.emit, worstIdx)} + net_up ${at(b.net_up, worstIdx)} + ` +
-                `fw_recv ${at(b.fw_recv, worstIdx)} + fw_dec ${at(b.fw_dec, worstIdx)} + ` +
-                `fw_paint ${at(b.fw_paint, worstIdx)} + fw_post ${at(b.fw_post, worstIdx)} + ` +
-                `body-read ${at(b.bread, worstIdx)}\n` +
-                `   stale-drops=${b.staleDrops}`);
-            this.fetchSamples.delete(v.nativeId!);   // reset window
-        }
-        if (status === 409) {
-            this.console.log(`"${v.name}" returned 409 — device went to sleep, stopping stream`);
-            this.stopStream(v.name, /*sendSleep=*/ false);
-        } else if (status === 400) {
-            // Body already drained; we lost the reason text. Log status
-            // alone — repeat 400s in steady state should be rare.
-            this.console.warn(`"${v.name}" /frame -> 400`);
-        } else if ((status < 200 || status >= 300) && !wasStale) {
-            this.console.warn(`"${v.name}" /frame -> ${status}`);
-        }
-        // Do NOT reset the idle timer on successful paint. The timer is
-        // anchored to the triggering CAMERA EVENT, not to "frames are
-        // flowing" — otherwise a continuously-streaming source means the
-        // stream never times out. Repeated events naturally cancel-and-
-        // restart the stream via startStream → stopStream(false), which
-        // covers the "still active" case.
-    }
 
     private findByName(name: string): Viewport | undefined {
         for (const v of this.viewports.values()) if (v.name === name) return v;
