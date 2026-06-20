@@ -51,3 +51,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Log level
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# OTA: dual-partition layout in partitions.csv. Rollback marks new
+# images as PENDING_VERIFY at first boot; ota_arm_healthy_timer flips
+# them to VALID after 30 s of healthy uptime, otherwise the bootloader
+# reverts to the previous slot on the next reset.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

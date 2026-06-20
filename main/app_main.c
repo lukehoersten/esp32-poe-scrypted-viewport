@@ -5,6 +5,7 @@
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
+#include "ota.h"
 #include "state_client.h"
 #include "state_machine.h"
 #include "stream_server.h"
@@ -76,6 +77,11 @@ void app_main(void)
     // bypassing per-frame HTTP overhead. /frame HTTP stays alive for
     // the snapshot one-shot and for curl debugging.
     mark(stream_server_start(81), 'S', &flags[3]);
+
+    // If this image is still PENDING_VERIFY from a fresh OTA, mark it
+    // valid after 30 s of healthy uptime so the bootloader stops
+    // considering it revertible. No-op once already marked valid.
+    ota_arm_healthy_timer();
 
     // ------------------------------------------------------------------
     // Display + I²C-bound peripherals run on their own task. ESP-IDF's

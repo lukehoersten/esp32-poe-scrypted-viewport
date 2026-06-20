@@ -93,6 +93,23 @@ Scrypted-side discovery flow:
 
 If mDNS-SD is unavailable in the deployment (some Docker setups, certain VLAN configurations), allow the operator to set an explicit `http://<ip>:<port>` per viewport in Scrypted-side config as a fallback.
 
+### Discover from the CLI
+
+The custom service type is the discovery handle — no need to know names ahead of time. From macOS:
+
+```sh
+# List every viewport on the LAN
+dns-sd -B _scrypted-viewport._tcp local.
+
+# Resolve one to an IPv4 address
+dns-sd -G v4 viewport-kitchen.local.
+
+# Talk to it (mDNS resolves the hostname directly)
+curl http://viewport-kitchen.local/state
+```
+
+On Linux: `avahi-browse -rt _scrypted-viewport._tcp` for the same effect with addresses inline. The instance name (`viewport-kitchen`) **is** the hostname prefix — they're the same string.
+
 ## API
 
 Four endpoints. `GET /state` and `GET /config` are the read surface; `POST /config`, `POST /state`, and `POST /frame` are the write surface.
@@ -191,6 +208,37 @@ Paints a frame. Does **not** change wake/sleep state.
 - Single in-flight frame; concurrent posts may be rejected with `503`.
 - Returns `204` once decoded and pushed to the panel.
 - `400` malformed JPEG, `409` device asleep, `413` over size, `500` decode/display failure. On failure the previous frame stays on screen.
+
+### POST /firmware
+
+Push a new application image and reboot into it. The device's HTTP OTA
+endpoint — replaces USB reflash once the device is on the LAN.
+
+- `Content-Type: application/octet-stream`, body is the raw built app
+  image (`build/scrypted-viewport.bin`, ~1.5 MB). `Content-Length`
+  required.
+- Single-shot: a second concurrent POST returns `409 Conflict`.
+- Streams straight to the inactive OTA slot (no full-image RAM buffer),
+  validates header + checksum on `esp_ota_end`, flips `otadata` to point
+  at the new slot, replies `200` with
+  `{"status":"ok","previous":"<git>","next":"<git>","slot":"ota_1","reboot_in_ms":500}`,
+  then reboots ~500 ms later so the response can flush.
+- On failure (`400` bad body / validate failed, `413` over partition size,
+  `500` flash error) the OTA handle is aborted and the running image stays
+  live. No partial-write half-state.
+- **Rollback armed.** The new image boots `pending-verify`; firmware
+  flips it to `valid` after 30 s of healthy uptime
+  (`ota_arm_healthy_timer`). If the new image panics or the device is
+  power-cycled before the timer fires, the bootloader reverts to the
+  previous slot on next reset. `/state` reports the current state via
+  `ota_state`.
+
+```sh
+idf.py build
+curl -v --data-binary @build/scrypted-viewport.bin \
+    -H 'Content-Type: application/octet-stream' \
+    http://<device-ip>/firmware
+```
 
 ## Wake / Sleep
 
@@ -422,7 +470,7 @@ Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its
 
 ## Ops
 
-- Firmware updates: reflash over USB. No OTA in v1 (planned post-v1: HTTP OTA from Scrypted).
+- Firmware updates: `POST /firmware` with the raw built `.bin` (see [POST /firmware](#post-firmware)). First flash of any new device still needs USB to install the bootloader + initial image; every update after that is over the LAN. Rollback is armed — a panicking new image reverts to the previous slot on next reset.
 - Provisioning: flash the same firmware to every device. On first boot the screen shows its IP; register it from Scrypted via `POST /config`.
 - Viewport names must be unique across the LAN — mDNS hostnames are derived from `viewport` and two devices configured with the same name will collide.
 - NVS wipe: plug USB and run `idf.py erase-flash` followed by `idf.py flash`. The device boots clean and shows the info screen until `/config` is POSTed.
@@ -439,6 +487,16 @@ cd ~/Dev/code/git/esp32/projects/esp32-poe-scrypted-viewport
 idf.py set-target esp32p4
 idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
+```
+
+After the first USB flash, subsequent updates go over the LAN — no cable
+needed:
+
+```sh
+idf.py build
+curl --data-binary @build/scrypted-viewport.bin \
+    -H 'Content-Type: application/octet-stream' \
+    http://<device-ip>/firmware
 ```
 
 ## Firmware implementation notes

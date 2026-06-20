@@ -4,11 +4,17 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <stdatomic.h>
+
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 
 #include "display.h"
@@ -16,6 +22,7 @@
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
+#include "ota.h"
 #include "stream_server.h"
 #include "state_machine.h"
 #include "viewport_state.h"
@@ -43,6 +50,7 @@ static esp_err_t state_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "name", st->viewport_name);
     cJSON_AddStringToObject(root, "mac",  st->mac_str);
     cJSON_AddStringToObject(root, "version", VIEWPORT_VERSION);
+    cJSON_AddStringToObject(root, "ota_state", ota_running_state_str());
     cJSON_AddBoolToObject  (root, "configured", st->configured);
     cJSON_AddStringToObject(root, "state",
         (st->state == VIEWPORT_STATE_AWAKE) ? "awake" : "asleep");
@@ -466,6 +474,157 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 }
 
 // ============================================================================
+// POST /firmware  — push raw app .bin, flip OTA slot, reboot
+// ============================================================================
+static atomic_flag s_ota_in_progress = ATOMIC_FLAG_INIT;
+
+static void reboot_cb(void *arg)
+{
+    ESP_LOGW(TAG, "rebooting into new image");
+    esp_restart();
+}
+
+static esp_err_t firmware_post_handler(httpd_req_t *req)
+{
+    if (atomic_flag_test_and_set(&s_ota_in_progress)) {
+        return respond_status(req, "409 Conflict", "OTA already in progress");
+    }
+
+    esp_err_t result   = ESP_OK;
+    const char *err_msg = NULL;
+    const char *err_status = "500 Internal Server Error";
+    esp_ota_handle_t handle = 0;
+    bool handle_open = false;
+
+    if (req->content_len <= 0) {
+        err_status = "400 Bad Request";
+        err_msg = "missing Content-Length";
+        result = ESP_FAIL;
+        goto done;
+    }
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *target  = esp_ota_get_next_update_partition(NULL);
+    if (!target) {
+        err_msg = "no OTA target partition";
+        result = ESP_FAIL;
+        goto done;
+    }
+    if ((size_t)req->content_len > target->size) {
+        err_status = "413 Payload Too Large";
+        err_msg = "image exceeds partition size";
+        result = ESP_FAIL;
+        goto done;
+    }
+
+    ESP_LOGI(TAG, "ota: begin target=%s size=%d running=%s",
+             target->label, req->content_len,
+             running ? running->label : "?");
+
+    esp_err_t err = esp_ota_begin(target, req->content_len, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin: %s", esp_err_to_name(err));
+        err_msg = esp_err_to_name(err);
+        result = ESP_FAIL;
+        goto done;
+    }
+    handle_open = true;
+
+    uint8_t buf[4096];
+    int remaining = req->content_len;
+    int last_logged_pct = -1;
+    while (remaining > 0) {
+        int want = remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf);
+        int n = httpd_req_recv(req, (char *)buf, want);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (n <= 0) {
+            err_status = "400 Bad Request";
+            err_msg = "body read failed";
+            result = ESP_FAIL;
+            goto done;
+        }
+        err = esp_ota_write(handle, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write: %s", esp_err_to_name(err));
+            err_msg = esp_err_to_name(err);
+            result = ESP_FAIL;
+            goto done;
+        }
+        remaining -= n;
+        int pct = (int)(100LL * (req->content_len - remaining) / req->content_len);
+        if (pct / 10 != last_logged_pct / 10) {
+            ESP_LOGI(TAG, "ota: %d%% (%d/%d bytes)",
+                     pct, req->content_len - remaining, req->content_len);
+            last_logged_pct = pct;
+        }
+    }
+
+    err = esp_ota_end(handle);
+    handle_open = false;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end: %s", esp_err_to_name(err));
+        err_status = (err == ESP_ERR_OTA_VALIDATE_FAILED)
+            ? "400 Bad Request" : "500 Internal Server Error";
+        err_msg = esp_err_to_name(err);
+        result = ESP_FAIL;
+        goto done;
+    }
+
+    err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition: %s", esp_err_to_name(err));
+        err_msg = esp_err_to_name(err);
+        result = ESP_FAIL;
+        goto done;
+    }
+
+    ESP_LOGI(TAG, "ota: success — booting %s on reboot", target->label);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", "ok");
+    const esp_app_desc_t *running_desc = esp_app_get_description();
+    cJSON_AddStringToObject(root, "previous",
+        running_desc ? running_desc->version : "?");
+    esp_app_desc_t next_desc;
+    if (esp_ota_get_partition_description(target, &next_desc) == ESP_OK) {
+        cJSON_AddStringToObject(root, "next", next_desc.version);
+    } else {
+        cJSON_AddStringToObject(root, "next", "?");
+    }
+    cJSON_AddStringToObject(root, "slot", target->label);
+    cJSON_AddNumberToObject(root, "reboot_in_ms", 500);
+    char *body = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(body);
+    cJSON_Delete(root);
+
+    // Reboot after the response has time to flush. One-shot esp_timer so
+    // this handler can return cleanly and httpd can finish the socket.
+    const esp_timer_create_args_t args = {
+        .callback = &reboot_cb,
+        .name     = "ota_reboot",
+    };
+    esp_timer_handle_t t = NULL;
+    if (esp_timer_create(&args, &t) == ESP_OK) {
+        esp_timer_start_once(t, 500 * 1000);
+    } else {
+        esp_restart();
+    }
+    // Leave s_ota_in_progress set — we're rebooting.
+    return ESP_OK;
+
+done:
+    if (handle_open) esp_ota_abort(handle);
+    atomic_flag_clear(&s_ota_in_progress);
+    if (result != ESP_OK) {
+        return respond_status(req, err_status, err_msg ? err_msg : "OTA failed");
+    }
+    return ESP_OK;
+}
+
+// ============================================================================
 // Route table + start
 // ============================================================================
 static const httpd_uri_t s_state_get = {
@@ -482,6 +641,9 @@ static const httpd_uri_t s_state_post = {
 };
 static const httpd_uri_t s_frame_post = {
     .uri = "/frame",  .method = HTTP_POST, .handler = frame_post_handler,
+};
+static const httpd_uri_t s_firmware_post = {
+    .uri = "/firmware", .method = HTTP_POST, .handler = firmware_post_handler,
 };
 
 esp_err_t http_api_start(void)
@@ -508,8 +670,10 @@ esp_err_t http_api_start(void)
                        TAG, "register POST /state");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_frame_post),
                        TAG, "register POST /frame");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_firmware_post),
+                       TAG, "register POST /firmware");
 
     ESP_LOGI(TAG, "http server listening on :80 "
-                  "(GET/POST /state, GET/POST /config, POST /frame)");
+                  "(GET/POST /state, GET/POST /config, POST /frame, POST /firmware)");
     return ESP_OK;
 }

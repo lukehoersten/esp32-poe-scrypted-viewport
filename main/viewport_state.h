@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define VIEWPORT_VERSION       "1.1.0"
+#define VIEWPORT_VERSION       "1.2.0"
 #define VIEWPORT_PANEL_WIDTH   800
 #define VIEWPORT_PANEL_HEIGHT  480
 
