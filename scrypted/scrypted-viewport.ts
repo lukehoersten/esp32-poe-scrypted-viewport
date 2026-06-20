@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "496da49";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -83,19 +83,12 @@ type Setting                 = any;
 type Settings                = any;
 type SettingValue            = any;
 
-// Tuning constants. Frame interval is also exposed on the parent's
-// Settings page so it can be tweaked without editing the script.
-// (frame_interval_ms removed in b97c250 — under the TCP streaming
-// data plane ffmpeg emits at the camera's native rate and TCP back-
-// pressure naturally caps us when the firmware can't keep up. The
-// fps filter was only ever useful as a max-fps safety under HTTP.)
+// Tuning constants.
+// Stream rate is paced by camera + TCP backpressure; no app-level fps
+// cap, no per-frame pipelining semaphore.
 const REREGISTER_INTERVAL_MS     = 5 * 60_000;
-// 5s gives /state + /config posts enough headroom to slip in between
-// /frame POSTs when the device is mid-stream. The firmware's single
-// httpd task processes one connection at a time; under heavy /frame
-// load a /state {wake} can queue behind 1–3 in-flight /frames before
-// landing. 1s was tripping when a burst of camera events triggered
-// back-to-back startStream calls.
+// 5s is generous for snapshot POSTs (the only HTTP traffic during a
+// stream) and survives long-tail latency on a busy Scrypted host.
 const HTTP_TIMEOUT_MS            = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
 const DEFAULT_BRIGHTNESS         = 100;
@@ -308,15 +301,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }>();
     private scryptedBase = "";
 
-    // Per-host node:http Agent with keep-alive. Replaces the previous
-    // undici dispatcher path — undici isn't reachable as a require()
-    // module from Scrypted's plugin sandbox, but node:http is always
-    // available. keepAlive: true reuses the underlying TCP connection
-    // across POSTs (skips SYN+SYN-ACK+ACK per frame, ~1ms saved on
-    // LAN and tail-spike-killer on Wi-Fi). maxSockets: 2 caps the
-    // pool at the same value as the firmware's pipelining capacity,
-    // so frame N+1 can begin uploading on socket B while frame N is
-    // still being decoded on the device via socket A.
+    // Per-host node:http Agent for the control plane (/state, /config,
+    // and the snapshot /frame POST). Over-engineered for our volume
+    // (<1 POST/min steady state, ~5 around a wake event) — legacy of
+    // the HTTP-streaming era where it backed the per-frame /frame
+    // POSTs. Phase 2 of the cleanup retires the pool and reverts
+    // postJSON to a plain fetch() with AbortSignal.timeout.
     private agents = new Map<string, any>();
     private agentFor(host: string): any {
         let a = this.agents.get(host);
@@ -328,15 +318,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 maxSockets:       2,
                 maxFreeSockets:   2,
                 timeout:          30_000,
-                // CRITICAL: without this, the keep-alive socket inherits
-                // Nagle ON by default. When a 128KB JPEG body doesn't
-                // end on an MTU boundary, the kernel sits on the final
-                // partial packet for up to 200ms (delayed-ACK window)
-                // waiting for either more data or an ACK. Firmware-side
-                // TCP_NODELAY only affects firmware's sends; the sender
-                // also has to opt out. Without noDelay we measured
-                // fw_recv p95 spiking from ~25ms to ~230ms — the exact
-                // 200ms Nagle+delayed-ACK deadlock signature.
+                // noDelay was load-bearing when this Agent fronted the
+                // live stream's per-frame POSTs (200ms Nagle+delayed-
+                // ACK stall). It's now a no-op safety for control-plane
+                // traffic; harmless to leave on.
                 noDelay:          true,
             });
             this.agents.set(host, a);
@@ -734,9 +719,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // ffmpeg-emitted frame lands (ffmpeg startup + RTSP connect +
         // first H.264 keyframe wait). The snapshot fills the gap so
         // the panel shows the camera near-instantly on tap/event.
-        // Fire-and-forget — if it loses the race to the first stream
-        // frame (which has a higher X-Frame-Seq), the firmware will
-        // stale-drop it. Errors are silent so a missing snapshot path
+        // Fire-and-forget — runs in parallel with stream socket bring-up.
+        // Whichever lands first wins user-visibly; if the stream's
+        // first frame arrives before the snapshot finishes, the snapshot
+        // just overpaints stale data on top of a fresher frame for
+        // ~1 paint cycle. Errors are silent so a missing snapshot path
         // doesn't break the stream start.
         this.pushSnapshot(v, cam).catch(() => {});
 
@@ -855,6 +842,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const net = require("net");
         let sock: any = null;
         let socketReady = false;
+        // Diagnostic only. Never gates writes; we keep pushing past
+        // kernel-buffer fullness because the firmware's FIONREAD skip
+        // (stream_server.c) drops superseded frames before decode.
         let socketBackpressured = false;
         let seq = 0;
         let droppedFrames = 0;
@@ -864,10 +854,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         let workBuf: Buffer = Buffer.alloc(0);
 
         // Latency probe — wall-clock from "ffmpeg emitted the JPEG"
-        // to "kernel accepted the socket.write". With the keep-alive
-        // socket + TCP_NODELAY this should be sub-millisecond steady
-        // state; visible-double-digit numbers here mean kernel send
-        // buffer is full (= firmware can't ingest fast enough).
+        // to "kernel accepted the socket.write". With TCP_NODELAY on
+        // the stream socket this is sub-millisecond steady state;
+        // double-digit ms numbers here mean kernel send buffer is
+        // full (= firmware can't ingest fast enough), which is fine
+        // — we don't gate on it and the firmware's FIONREAD skip
+        // drops the surplus before decode.
         const writeLatencies: number[] = [];
 
         const openStreamSocket = () => {
@@ -1014,12 +1006,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             try { currentProc?.kill("SIGTERM"); } catch {}
         });
 
-        // Periodic skip-rate log. The metric that matters is *delivered*
-        // fps vs. requested rate, not raw drop count — at low intervals
-        // ffmpeg's fps filter emits timestamp-clumped pairs and our
-        // single-flight guard correctly skips the second, but the
-        // first still painted on time. Only warn if delivered fps falls
-        // below 75% of target.
+        // Periodic stream-health log. Emits delivered fps + sustained
+        // MB/s + socket.write p50/p95/max + drop count + backpressure
+        // flag every 10s. drops here count frames the demux loop
+        // threw away because the socket wasn't connected yet (initial
+        // race at stream start) — once the socket is up we keep
+        // writing past kernel backpressure and let the firmware's
+        // FIONREAD skip drop the stale frames before decode.
         const skipLogger = setInterval(() => {
             const now = Date.now();
             const window = (now - lastLogUs) / 1000;
@@ -1184,11 +1177,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         } catch { /* stream is starting anyway */ }
     }
 
-    // Monotonic per-viewport sequence number paired with X-Frame-Seq
-    // so the firmware can drop pipelined-out-of-order frames. Reset
-    // on every stopStream so each stream session starts fresh; the
-    // firmware also resets its comparator on /state {wake}, so the
-    // two stay in step.
+    // Legacy of the HTTP-streaming era. Used to feed the X-Frame-Seq
+    // header on /frame POSTs so the firmware could drop pipelined-
+    // out-of-order frames. /frame is now snapshot-only (single-shot),
+    // so the comparator never trips. Retired in Phase 2.
     private frameSeq = new Map<string, number>();
 
     private findByName(name: string): Viewport | undefined {

@@ -266,8 +266,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 // ============================================================================
 // POST /state
 // ============================================================================
-// Defined alongside other /frame static state further down — forward
-// referenced here because state_post_handler resets it on wake.
+// Legacy of the HTTP-streaming era (multiple /frame POSTs in flight).
+// /frame is now snapshot-only and inherently single-shot, so this
+// comparator is effectively unused — but state_post_handler still
+// resets it on wake until Phase 2 of the cleanup removes the
+// X-Frame-Seq parsing path entirely.
 static uint32_t s_last_painted_seq;
 
 static esp_err_t state_post_handler(httpd_req_t *req)
@@ -288,9 +291,8 @@ static esp_err_t state_post_handler(httpd_req_t *req)
     viewport_run_state_t target;
     if (strcmp(j->valuestring, "wake") == 0) {
         target = VIEWPORT_STATE_AWAKE;
-        // Reset the pipelined-POST sequence comparator so the next
-        // stream's first frame isn't rejected as stale just because
-        // the previous stream's counter happened to be higher.
+        // Reset the (legacy) per-stream sequence comparator; harmless
+        // now that /frame is snapshot-only, removed in Phase 2.
         s_last_painted_seq = 0;
     } else if (strcmp(j->valuestring, "sleep") == 0) {
         target = VIEWPORT_STATE_ASLEEP;
@@ -321,22 +323,24 @@ static esp_err_t respond_status(httpd_req_t *req, const char *status, const char
     return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
 }
 
-// Tracks when the previous /frame response finished so we can log the
-// idle gap until the next request enters. Large idle = Scrypted/network
-// upstream is the bottleneck; small idle = we're saturating the link.
+// (Legacy from the HTTP-streaming era: tracked idle gap between
+// successive /frame POSTs. /frame is now snapshot-only — fires at
+// most once per wake — so the gap measurement is no longer meaningful
+// in steady state. Field is left in place to avoid touching the
+// timing-log format; Phase 2 will retire it alongside the rest of
+// the streaming machinery.)
 static int64_t  s_last_post_us;
 // (s_last_painted_seq is forward-declared above state_post_handler;
 // description there.)
 
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
-    // Nagle off on this socket. /frame is a single large POST followed
-    // by a tiny (empty 204) response — the worst case for Nagle. The
-    // last partial-MTU packet of the body, and the response packet,
-    // both sit in the kernel send buffer up to 40ms waiting for an
-    // ACK that the peer's also delaying-ACKing. setsockopt is cheap
-    // and idempotent; if keep-alive is ever added the flag persists
-    // for the connection's life.
+    // Nagle off. Originally added for HTTP streaming where Nagle +
+    // delayed-ACK on a 130 KB body POST would stall 40 ms before the
+    // last partial-MTU segment shipped. /frame is now snapshot-only
+    // (one POST per wake) so the optimisation is largely moot — but
+    // setsockopt is essentially free per request and there's no harm
+    // in leaving it. Phase 2 of the cleanup removes this entirely.
     int sockfd = httpd_req_to_sockfd(req);
     if (sockfd >= 0) {
         int one = 1;
@@ -369,17 +373,22 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     int64_t t_entry = esp_timer_get_time();
 
-    // Read the optional X-Frame-Seq header used to keep pipelined
-    // POSTs in monotonic paint order. Missing or zero header = no
-    // ordering enforcement (treat every frame as newer than the
-    // previous one, same behaviour we had before pipelining).
+    // X-Frame-Seq is a legacy artifact of the HTTP-streaming era,
+    // where multiple /frame POSTs could be in flight at once and
+    // arrive out of order. /frame is now snapshot-only so the
+    // header is always missing in practice — kept-alive for one
+    // more cycle and then removed in Phase 2.
     uint32_t seq = 0;
     char seq_str[16] = {0};
     if (httpd_req_get_hdr_value_str(req, "X-Frame-Seq", seq_str, sizeof(seq_str)) == ESP_OK) {
         seq = (uint32_t)strtoul(seq_str, NULL, 10);
     }
 
-    // Single in-flight frame. Concurrent posts get 503 (spec).
+    // Decoder mutex. Used to serialise pipelined /frame POSTs during
+    // the HTTP-streaming era; now mostly redundant since /frame is
+    // snapshot-only and the live stream owns the decoder via
+    // stream_server. Concurrent posts (e.g. a snapshot landing while
+    // the live stream is mid-decode) get 503.
     if (!jpeg_decoder_try_lock(0)) {
         return respond_status(req, "503 Service Unavailable", "frame in flight");
     }
@@ -404,17 +413,12 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     int64_t t_recv = esp_timer_get_time();
 
-    // Pipelined-POST stale-frame check. With the X-Frame-Seq header
-    // set, drop anything we've already advanced past — we hold the
-    // decoder lock, so re-checking here is race-free. Without the
-    // header (seq==0) every frame paints, preserving pre-pipelining
-    // behaviour.
+    // (Legacy stale-frame guard from HTTP-streaming era; never
+    // triggers under snapshot-only /frame because the header is
+    // missing. Removed in Phase 2 along with the rest of the
+    // sequencing machinery.)
     if (seq != 0 && seq <= s_last_painted_seq) {
         jpeg_decoder_unlock();
-        // 200 OK with an empty body keeps the keep-alive socket
-        // healthy and lets Scrypted's per-fetch wall-clock log
-        // stay accurate; we just won't count this toward
-        // frames_received.
         httpd_resp_set_status(req, "200 OK");
         httpd_resp_set_hdr(req, "X-Frame-Drop", "stale-seq");
         return httpd_resp_send(req, NULL, 0);
@@ -436,10 +440,11 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
         return respond_status(req, "400 Bad Request", "JPEG decode failed");
     }
 
-    // /frame always expects the panel-native 800x480 BGR888 layout —
-    // Scrypted does the rotation + scale, the firmware just decodes and
-    // paints. Orientation lives in viewport_state for /state reporting
-    // and the Scrypted-side ffmpeg pipeline only.
+    // /frame always expects the panel-native 800x480 BGR888 layout.
+    // Scrypted does the rotation + scale (snapshot: sharp / mediaManager
+    // / ffmpeg cascade; stream: ffmpeg -vf transpose+scale). Orientation
+    // is informational for /state reporting only — firmware never
+    // rotates pixels.
     if (w != VIEWPORT_PANEL_WIDTH || h != VIEWPORT_PANEL_HEIGHT) {
         viewport_state_lock();
         viewport_state_get()->decode_errors++;
@@ -508,12 +513,10 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     state_machine_frame_painted();  // reset idle timer
 
-    // Server-Timing per-stage breakdown so the Scrypted side can build
-    // a unified end-to-end trace per frame (joined by X-Frame-Seq).
-    // Units are ms with 0.1ms precision — paint is sub-millisecond
-    // so the decimal matters there. Scrypted subtracts the sum from
-    // its own (fetch_start → Response_headers) measurement to derive
-    // the network up + handler-dispatch overhead it can't see directly.
+    // (Legacy Server-Timing emission from the HTTP-streaming era;
+    // no Scrypted-side consumer remains — the live-stream cross-side
+    // trace now flows over the TCP framer's seq field plus per-window
+    // /state polling. Removed in Phase 2.)
     char st_hdr[160];
     snprintf(st_hdr, sizeof(st_hdr),
              "recv;dur=%.1f, dec;dur=%.1f, paint;dur=%.1f, post;dur=%.1f, handle;dur=%.1f",
@@ -554,11 +557,13 @@ esp_err_t http_api_start(void)
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;
     cfg.stack_size       = 8192;  // POST /config alone has ~2.4 KiB of stack locals
-    // Allow Scrypted to keep two POST /frame in flight at once so the
-    // body upload of frame N+1 overlaps with the JPEG decode of frame
-    // N. The decoder mutex still serialises decode itself; this only
-    // unblocks the network half of the pipeline. +1 socket reserve for
-    // a concurrent /state or /config request landing during a stream.
+    // 2 sockets is enough now that /frame is snapshot-only and the
+    // live stream owns its own TCP socket on port 81: one slot for
+    // the snapshot POST + one for a concurrent /state or /config
+    // request. (Was 4 during the HTTP-streaming era to allow
+    // pipelined /frame POSTs.) Phase 2 of the cleanup actually
+    // bumps this down; for Phase 1 (comments-only) the value stays
+    // at 4 so behaviour is unchanged.
     cfg.max_open_sockets = 4;
 
     httpd_handle_t server = NULL;
