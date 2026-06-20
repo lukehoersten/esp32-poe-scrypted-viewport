@@ -127,17 +127,12 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const parsed = v ? parseInt(v, 10) : NaN;
         return Number.isFinite(parsed) ? Math.max(1, Math.min(31, parsed)) : 1;
     }
-    // Hard cap on Node's TCP send buffer for the stream socket, in MB.
-    // ffmpeg pumps faster than firmware can ingest so socket.write
-    // returning false (kernel buffer full) causes Node to accumulate
-    // the surplus in its own internal queue — which is unbounded by
-    // default. Without this cap, a long-running stream's heap grows
-    // monotonically and every frame painted on the panel becomes
-    // progressively staler (the buffer depth = display lag). When the
-    // measured node_buf exceeds the cap, the demux loop drops new
-    // ffmpeg frames at source instead of queueing them. Lower =
-    // tighter latency + more drops under sustained backpressure;
-    // higher = more memory + worse latency but less visual choppiness.
+    // Emergency cap on Node's TCP send buffer for the stream socket,
+    // in MB. Skip-oldest backpressure handling (see stream send loop)
+    // keeps only one in-flight frame plus one pending — Node's queue
+    // should stay at ~1 frame steady-state. This cap is the safety net
+    // for a stuck connection that never fires 'drain': when exceeded,
+    // the socket is destroyed and reconnected so a fresh frame can land.
     get maxNodeBufMb(): number {
         const v = this.storage.getItem("max_node_buf_mb");
         const parsed = v ? parseInt(v, 10) : NaN;
@@ -216,7 +211,7 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 group: "Display",
                 key: "max_node_buf_mb",
                 title: "Max Scrypted-side buffer (MB)",
-                description: "Hard cap on Node's TCP send queue for the stream socket. When exceeded, the socket is destroyed and reconnected — drops the entire backlog so the next frame painted is fresh. Lower = tighter glass-to-glass at cost of brief reconnect gaps under sustained backpressure. Default 20.",
+                description: "Emergency cap on Node's TCP send queue for the stream socket. Skip-oldest backpressure handling normally keeps the queue at ~1 in-flight frame, so this should rarely trigger; if it does (stuck connection that never fires 'drain') the socket is destroyed and reconnected. Default 20.",
                 type: "number",
                 value: this.maxNodeBufMb,
             } as any,
@@ -807,25 +802,44 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // ── DATA PLANE: raw TCP socket to firmware port 81 ────────────
         // Replaces per-frame HTTP POSTs. One socket per stream session.
-        // Frame format on the wire (big-endian):
-        //   [4 bytes jpeg_len][4 bytes seq][jpeg_len bytes JPEG body]
-        // We let TCP flow-control backpressure us naturally: if
-        // socket.write() returns false the kernel buffer is full —
-        // we drop incoming ffmpeg frames until 'drain' fires. No HTTP
-        // headers, no per-frame ACK round-trip, no Nagle/delayed-ACK
-        // dance, no httpd worker churn.
+        // Frame format on the wire (big-endian, 16-byte v1 header):
+        //   ["VPRT"][4 bytes jpeg_len][4 bytes seq][4 bytes event_us_low]
+        //   followed by jpeg_len bytes of JPEG body.
+        //
+        // Backpressure strategy — skip-oldest:
+        //   sock.write() returns false → mark backpressured, hold the
+        //   NEXT frame in a single-slot `pendingFrame`. New frames
+        //   arriving during backpressure REPLACE the held one (drop
+        //   oldest). On 'drain', flush the held frame and clear the
+        //   flag. The in-flight write is already past us — we never
+        //   queue more than (1 in-flight + 1 pending) ≈ ~400KB at our
+        //   frame sizes, regardless of sustained mismatch.
+        //
+        // No HTTP headers, no per-frame ACK round-trip, no Nagle/
+        // delayed-ACK dance, no httpd worker churn.
         const net = require("net");
         let sock: any = null;
         let socketReady = false;
-        // Diagnostic only. Never gates writes; we keep pushing past
-        // kernel-buffer fullness because the firmware's FIONREAD skip
-        // (stream_server.c) drops superseded frames before decode.
+        // While true, we hold the most recent frame in `pendingFrame`
+        // instead of calling write(). On 'drain' we flush the held
+        // frame (if any) and clear the flag. Skip-oldest semantics:
+        // a new ffmpeg frame arriving during backpressure replaces
+        // whatever was held — the older pending frame is dropped.
         let socketBackpressured = false;
+        let pendingFrame: Buffer | null = null;
         let seq = 0;
-        let droppedFrames = 0;
-        let sentFrames    = 0;
-        let bytesSent     = 0;
-        let flushCount    = 0;   // socket destroy+reconnect count due to buffer cap
+        let droppedFrames     = 0;   // dropped because socket wasn't open yet
+        let droppedOldest     = 0;   // dropped from pending slot when a newer frame replaced it
+        let sentFrames        = 0;
+        let bytesSent         = 0;
+        let flushCount        = 0;   // socket destroy+reconnect count due to buffer cap (safety net)
+        // Duty cycle: framesSampled = every ffmpeg frame we considered
+        // sending this window; framesUnderBp = the subset for which the
+        // socket was backpressured at decision time. Ratio = % of frames
+        // the link couldn't accept on demand — a continuous measure that
+        // complements the point-in-time backpressured= flag.
+        let framesSampled     = 0;
+        let framesUnderBp     = 0;
         let lastLogUs = Date.now();
         let workBuf: Buffer = Buffer.alloc(0);
 
@@ -838,10 +852,26 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // drops the surplus before decode.
         const writeLatencies: number[] = [];
 
+        // Write a fully-framed buffer (header + jpeg already concatenated)
+        // and update accounting. Returns whatever sock.write() returned
+        // so the caller can flip the backpressure flag.
+        const writeFramed = (buf: Buffer): boolean => {
+            const t0 = Date.now();
+            const ok = sock.write(buf);
+            writeLatencies.push(Date.now() - t0);
+            if (writeLatencies.length > 200) writeLatencies.shift();
+            bytesSent += buf.length;
+            sentFrames++;
+            return ok;
+        };
+
         const openStreamSocket = () => {
             if (abort.signal.aborted) return;
             socketReady = false;
             socketBackpressured = false;
+            // Drop any frame held from the previous socket — it's stale
+            // and addressed to a dead connection.
+            if (pendingFrame) { droppedOldest++; pendingFrame = null; }
             this.console.log(`stream "${v.name}": socket connect requested +${since()}ms`);
             sock = net.createConnection({
                 host:    v.host,
@@ -852,7 +882,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 socketReady = true;
                 this.console.log(`stream "${v.name}": socket connect open +${since()}ms`);
             });
-            sock.on("drain", () => { socketBackpressured = false; });
+            sock.on("drain", () => {
+                socketBackpressured = false;
+                if (pendingFrame && socketReady) {
+                    const buf = pendingFrame;
+                    pendingFrame = null;
+                    const ok = writeFramed(buf);
+                    if (!ok) socketBackpressured = true;
+                }
+            });
             sock.on("error", (e: Error) => {
                 this.console.warn(`stream "${v.name}" socket: ${e.message}`);
                 socketReady = false;
@@ -932,20 +970,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                         continue;
                     }
 
-                    // Runaway-buffer guard. ffmpeg outpaces firmware
-                    // ingest by ~0.5 MB/s; Node's socket write queue
-                    // is unbounded by default and would grow to MB of
-                    // stale frames over a long stream. Each queued
-                    // byte is a frame the firmware hasn't seen yet, so
-                    // the buffer depth literally IS the steady-state
-                    // glass-to-glass lag.
-                    //
-                    // When the queue exceeds the per-viewport cap,
-                    // destroy the socket: the firmware's accept loop
-                    // picks up the next reconnect within ~500ms and
-                    // the pipeline restarts on a live frame. Trade a
-                    // sub-second reconnect gap for clearing seconds
-                    // of stale backlog.
+                    framesSampled++;
+                    if (socketBackpressured) framesUnderBp++;
+
+                    // Emergency safety net: if writableLength somehow
+                    // grows past the cap (e.g. a stuck connection that
+                    // never fires 'drain'), destroy the socket so the
+                    // reconnect path clears the backlog. Should be rare
+                    // with skip-oldest in place — steady-state writableLength
+                    // stays ~1 in-flight frame.
                     const queued = sock.writableLength ?? 0;
                     if (queued > v.maxNodeBufMb * 1024 * 1024) {
                         flushCount++;
@@ -953,39 +986,41 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                             `stream "${v.name}": buffer ${(queued / (1024 * 1024)).toFixed(1)}MB > ` +
                             `${v.maxNodeBufMb}MB cap — destroying socket to drop backlog (flush #${flushCount})`);
                         try { sock.destroy(); } catch {}
-                        // close event triggers openStreamSocket reconnect.
                         droppedFrames++;
                         continue;
                     }
                     seq++;
                     // 16-byte v1 header. Magic "VPRT" (0x56505254) lets
                     // the firmware autodetect old-vs-new clients during
-                    // the rollout window. event_us_low is stamped per
-                    // frame at emit time so /state's g2g = age of the
-                    // most recently painted frame (not time since wake).
+                    // the rollout window. event_us_low stamped at capture
+                    // time (here), not write time — so a frame held in
+                    // the pending slot keeps its true age and g2g reflects
+                    // any hold latency we added.
                     const header = Buffer.alloc(16);
                     header.writeUInt32BE(0x56505254, 0);   // "VPRT"
                     header.writeUInt32BE(frame.length, 4);
                     header.writeUInt32BE(seq, 8);
                     header.writeUInt32BE((Date.now() * 1000) >>> 0, 12);
-                    const t0 = Date.now();
-                    // Single combined write avoids splitting header
-                    // and body across two TCP packets — the firmware
-                    // sees them as one contiguous segment when possible.
-                    const ok = sock.write(Buffer.concat([header, frame]));
+                    // Single combined buffer so header + body hit the wire
+                    // as one TCP segment when possible.
+                    const framed = Buffer.concat([header, frame]);
+
+                    if (socketBackpressured) {
+                        // Skip-oldest: replace whatever's in the pending slot.
+                        // The in-flight frame (last one we called write() on)
+                        // is already past us — kernel/Node buffer is draining
+                        // it. We only ever hold the freshest "next to send".
+                        if (pendingFrame) droppedOldest++;
+                        pendingFrame = framed;
+                        continue;
+                    }
+
+                    const ok = writeFramed(framed);
                     if (!firstSocketWriteLogged) {
                         this.console.log(`stream "${v.name}": first socket.write +${since()}ms (jpeg=${(frame.length / 1024).toFixed(0)}KB)`);
                         firstSocketWriteLogged = true;
                     }
-                    writeLatencies.push(Date.now() - t0);
-                    if (writeLatencies.length > 200) writeLatencies.shift();
-                    bytesSent += header.length + frame.length;
-                    sentFrames++;
-                    // Track but don't gate on backpressure — the metric
-                    // is still useful as a "kernel buffer was full"
-                    // indicator for diagnostics.
                     if (!ok) socketBackpressured = true;
-                    else      socketBackpressured = false;
                 }
             });
 
@@ -1084,13 +1119,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             const nodeBufMs    = sentBps > 0 ? (nodeBufBytes / sentBps * 1000).toFixed(0) : "?";
             this.console.log(
                 `stream "${v.name}": sent=${sentRate.toFixed(1)}fps painted=${painted}fps ` +
-                `(fw-skipped=${skipped}fps, drops=${droppedFrames}, flushes=${flushCount}) ` +
+                `(fw-skipped=${skipped}fps, drop-oldest=${droppedOldest}, drops=${droppedFrames}, flushes=${flushCount}) ` +
                 `${mbPerSec.toFixed(2)}MB/s sent / ${paintedMb}MB/s painted | ` +
-                `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} ` +
+                `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} bp=${framesSampled > 0 ? ((framesUnderBp / framesSampled) * 100).toFixed(0) : "?"}% ` +
                 `node_buf=${(nodeBufBytes / 1024).toFixed(0)}KB≈${nodeBufMs}ms/${v.maxNodeBufMb}MB cap | ` +
                 `recv=${recvStr}us dec=${decStr}us paint=${paintStr}us idle=${idleStr}us | g2g=${g2g}`);
 
             droppedFrames = 0;
+            droppedOldest = 0;
+            framesSampled = 0;
+            framesUnderBp = 0;
             sentFrames    = 0;
             bytesSent     = 0;
             writeLatencies.length = 0;
