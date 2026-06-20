@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "439dadb";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -127,6 +127,22 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const parsed = v ? parseInt(v, 10) : NaN;
         return Number.isFinite(parsed) ? Math.max(1, Math.min(31, parsed)) : 1;
     }
+    // Hard cap on Node's TCP send buffer for the stream socket, in MB.
+    // ffmpeg pumps faster than firmware can ingest so socket.write
+    // returning false (kernel buffer full) causes Node to accumulate
+    // the surplus in its own internal queue — which is unbounded by
+    // default. Without this cap, a long-running stream's heap grows
+    // monotonically and every frame painted on the panel becomes
+    // progressively staler (the buffer depth = display lag). When the
+    // measured node_buf exceeds the cap, the demux loop drops new
+    // ffmpeg frames at source instead of queueing them. Lower =
+    // tighter latency + more drops under sustained backpressure;
+    // higher = more memory + worse latency but less visual choppiness.
+    get maxNodeBufMb(): number {
+        const v = this.storage.getItem("max_node_buf_mb");
+        const parsed = v ? parseInt(v, 10) : NaN;
+        return Number.isFinite(parsed) ? Math.max(1, Math.min(200, parsed)) : 20;
+    }
     // Which camera-event types wake this viewport. Empty = tap-only,
     // never woken by Scrypted. Default = all three (doorbell + motion +
     // person detection).
@@ -195,6 +211,14 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 description: "ffmpeg mjpeg encoder -q:v. 1 ≈ visually lossless (~140KB at panel-native), 5 ≈ good (~70KB), 10+ noticeably lossy. Default 1.",
                 type: "number",
                 value: this.jpegQuality,
+            } as any,
+            {
+                group: "Display",
+                key: "max_node_buf_mb",
+                title: "Max Scrypted-side buffer (MB)",
+                description: "Hard cap on Node's TCP send queue for the stream socket. When exceeded, the socket is destroyed and reconnected — drops the entire backlog so the next frame painted is fresh. Lower = tighter glass-to-glass at cost of brief reconnect gaps under sustained backpressure. Default 20.",
+                type: "number",
+                value: this.maxNodeBufMb,
             } as any,
             {
                 group: "Actions",
@@ -800,6 +824,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         let droppedFrames = 0;
         let sentFrames    = 0;
         let bytesSent     = 0;
+        let flushCount    = 0;   // socket destroy+reconnect count due to buffer cap
         let lastLogUs = Date.now();
         let workBuf: Buffer = Buffer.alloc(0);
 
@@ -898,14 +923,36 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     }
 
                     // Drop only when the socket isn't connected yet
-                    // (initial-open race) — once it's up we just keep
-                    // writing. Node buffers internally if the kernel
-                    // send buffer is full; under 16 MB/s ffmpeg output
-                    // and ~5-7 MB/s firmware ingest the buffer rarely
-                    // exceeds a frame or two. The firmware's FIONREAD-
-                    // skip ensures it always paints the LATEST queued
-                    // frame, so any backlog gets shed there for free.
+                    // (initial-open race) — once it's up we keep writing
+                    // through normal backpressure and let the firmware's
+                    // FIONREAD skip shed superseded frames before decode.
                     if (!socketReady) {
+                        droppedFrames++;
+                        continue;
+                    }
+
+                    // Runaway-buffer guard. ffmpeg outpaces firmware
+                    // ingest by ~0.5 MB/s; Node's socket write queue
+                    // is unbounded by default and would grow to MB of
+                    // stale frames over a long stream. Each queued
+                    // byte is a frame the firmware hasn't seen yet, so
+                    // the buffer depth literally IS the steady-state
+                    // glass-to-glass lag.
+                    //
+                    // When the queue exceeds the per-viewport cap,
+                    // destroy the socket: the firmware's accept loop
+                    // picks up the next reconnect within ~500ms and
+                    // the pipeline restarts on a live frame. Trade a
+                    // sub-second reconnect gap for clearing seconds
+                    // of stale backlog.
+                    const queued = sock.writableLength ?? 0;
+                    if (queued > v.maxNodeBufMb * 1024 * 1024) {
+                        flushCount++;
+                        this.console.log(
+                            `stream "${v.name}": buffer ${(queued / (1024 * 1024)).toFixed(1)}MB > ` +
+                            `${v.maxNodeBufMb}MB cap — destroying socket to drop backlog (flush #${flushCount})`);
+                        try { sock.destroy(); } catch {}
+                        // close event triggers openStreamSocket reconnect.
                         droppedFrames++;
                         continue;
                     }
@@ -1036,10 +1083,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             const nodeBufMs    = sentBps > 0 ? (nodeBufBytes / sentBps * 1000).toFixed(0) : "?";
             this.console.log(
                 `stream "${v.name}": sent=${sentRate.toFixed(1)}fps painted=${painted}fps ` +
-                `(fw-skipped=${skipped}fps, drops=${droppedFrames}) ` +
+                `(fw-skipped=${skipped}fps, drops=${droppedFrames}, flushes=${flushCount}) ` +
                 `${mbPerSec.toFixed(2)}MB/s sent / ${paintedMb}MB/s painted | ` +
                 `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} ` +
-                `node_buf=${(nodeBufBytes / 1024).toFixed(0)}KB≈${nodeBufMs}ms | ` +
+                `node_buf=${(nodeBufBytes / 1024).toFixed(0)}KB≈${nodeBufMs}ms/${v.maxNodeBufMb}MB cap | ` +
                 `recv=${recvStr}us dec=${decStr}us paint=${paintStr}us idle=${idleStr}us | g2g=${g2g}`);
 
             droppedFrames = 0;
