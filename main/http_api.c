@@ -499,6 +499,22 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
 
     state_machine_frame_painted();  // reset idle timer
 
+    // Server-Timing per-stage breakdown so the Scrypted side can build
+    // a unified end-to-end trace per frame (joined by X-Frame-Seq).
+    // Units are ms with 0.1ms precision — paint is sub-millisecond
+    // so the decimal matters there. Scrypted subtracts the sum from
+    // its own (fetch_start → Response_headers) measurement to derive
+    // the network up + handler-dispatch overhead it can't see directly.
+    char st_hdr[160];
+    snprintf(st_hdr, sizeof(st_hdr),
+             "recv;dur=%.1f, dec;dur=%.1f, paint;dur=%.1f, post;dur=%.1f, handle;dur=%.1f",
+             (t_recv   - t_first_byte) / 1000.0,
+             (t_decode - t_recv)       / 1000.0,
+             (t_paint  - t_decode)     / 1000.0,
+             (t_post   - t_paint)      / 1000.0,
+             (t_post   - t_entry)      / 1000.0);
+    httpd_resp_set_hdr(req, "Server-Timing", st_hdr);
+
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
 }

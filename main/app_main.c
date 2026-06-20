@@ -10,6 +10,7 @@
 #include "touch.h"
 #include "viewport_state.h"
 
+#include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -39,7 +40,12 @@ void app_main(void)
 
     viewport_state_init();
     nvs_config_load();  // apply persisted config over defaults (best-effort)
-    ESP_LOGI(TAG, "Scrypted Viewport boot (v%s)", VIEWPORT_VERSION);
+    // PROJECT_VER comes from CMakeLists.txt — git short hash + dirty
+    // marker. Logged in the very first line so any captured boot log
+    // tells us exactly which build is running.
+    const esp_app_desc_t *desc = esp_app_get_description();
+    ESP_LOGI(TAG, "Scrypted Viewport boot (v%s build=%s)",
+             VIEWPORT_VERSION, desc ? desc->version : "?");
 
     // ------------------------------------------------------------------
     // Networking. Driver starts even with no cable plugged in; we just

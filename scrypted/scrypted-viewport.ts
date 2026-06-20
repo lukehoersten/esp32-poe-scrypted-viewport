@@ -1,5 +1,13 @@
 // Scrypted Viewport — v1 Scripts-plugin script
 //
+// SCRIPT_VERSION is bumped on every commit that touches this file.
+// The boot log emits it so we can verify the user re-pasted the
+// latest version when reading the plugin console. Format is the
+// short git hash of the commit that added this constant — if the
+// hash in the log doesn't match the HEAD this file came from, the
+// Scrypted Script editor is still on stale code.
+const SCRIPT_VERSION = "pending";
+//
 // Architecture
 // ------------
 // One parent device (DeviceProvider + DeviceCreator + HttpRequestHandler)
@@ -353,7 +361,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // omitted nativeId falls back to the plugin's own endpoint.
         const raw = await endpointManager.getInsecurePublicLocalEndpoint(this.nativeId);
         this.scryptedBase = raw.replace(/\/$/, "");
-        this.console.log(`Scrypted Viewport up. Callback URL base: ${this.scryptedBase}`);
+        this.console.log(`Scrypted Viewport up (script=${SCRIPT_VERSION}). Callback URL base: ${this.scryptedBase}`);
 
         // Re-discover every known child so Scrypted reattaches its storage
         // to the nativeId. Without this, `new Viewport(...)` instantiates
@@ -918,19 +926,57 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // X-Frame-Drop responses from the firmware.
     private fetchCount = new Map<string, number>();
     private fetchSamples = new Map<string, {
-        emit: number[]; req: number[]; bread: number[]; wall: number[];
-        depths: { d0: number; d1: number; d2: number };
+        // Script-side wall-clock spans, ms.
+        emit:    number[];   // ffmpeg emit → fetch() call
+        wall:    number[];   // emit → fetch resolved (end-to-end)
+        req:     number[];   // fetch() → Response headers
+        bread:   number[];   // Response → body drained
+        // Firmware-side spans from Server-Timing (already ms).
+        fw_recv: number[];   // body bytes off the wire
+        fw_dec:  number[];   // hardware JPEG decode
+        fw_paint:number[];   // back buffer flip
+        fw_post: number[];   // state counters + unlock + resp headers
+        fw_tot:  number[];   // firmware total (recv + dec + paint + post)
+        // Derived: time fetch() spent in flight that firmware DIDN'T
+        // see. net_up = req - fw_tot ≈ TCP setup + body wire time
+        // + httpd dispatch.
+        net_up:  number[];
+        depths:  { d0: number; d1: number; d2: number };
         staleDrops: number;
     }>();
 
     private bucketsFor(nid: string) {
         let s = this.fetchSamples.get(nid);
         if (!s) {
-            s = { emit: [], req: [], bread: [], wall: [],
+            s = { emit: [], wall: [], req: [], bread: [],
+                  fw_recv: [], fw_dec: [], fw_paint: [], fw_post: [], fw_tot: [],
+                  net_up: [],
                   depths: { d0: 0, d1: 0, d2: 0 }, staleDrops: 0 };
             this.fetchSamples.set(nid, s);
         }
         return s;
+    }
+
+    // Parse a Server-Timing header like
+    //   recv;dur=12.3, dec;dur=4.5, paint;dur=0.1, post;dur=0.2, handle;dur=17.1
+    // into a record of name→duration_ms. Robust to whitespace and
+    // missing entries; returns {} on malformed input.
+    private parseServerTiming(h: string | null): Record<string, number> {
+        const out: Record<string, number> = {};
+        if (!h) return out;
+        for (const tok of h.split(",")) {
+            const parts = tok.trim().split(";");
+            const name  = parts[0]?.trim();
+            if (!name) continue;
+            for (let i = 1; i < parts.length; i++) {
+                const [k, v] = parts[i].trim().split("=");
+                if (k === "dur") {
+                    const n = Number(v);
+                    if (Number.isFinite(n)) out[name] = n;
+                }
+            }
+        }
+        return out;
     }
 
     // First-paint fast path. takePicture → quick ffmpeg one-shot to
@@ -1029,6 +1075,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const res = await fetch(`http://${v.host}/frame`, opts);
         const tHeaders = Date.now();
         const wasStale = res.headers.get("X-Frame-Drop") === "stale-seq";
+        const fwTiming = this.parseServerTiming(res.headers.get("Server-Timing"));
         // Drain body so the socket can be released back to the pool.
         // Body is empty for 200/204/409; reading is essentially free
         // but the await pins our body-read measurement.
@@ -1036,10 +1083,22 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const tDone = Date.now();
 
         const b = this.bucketsFor(v.nativeId!);
+        const req_ms  = tHeaders - tFetchStart;
+        const fw_tot  = fwTiming.handle ?? 0;
         b.emit.push (tFetchStart - emitMs);
-        b.req.push  (tHeaders    - tFetchStart);
+        b.req.push  (req_ms);
         b.bread.push(tDone       - tHeaders);
         b.wall.push (tDone       - emitMs);
+        if (fwTiming.recv  != null) b.fw_recv.push(fwTiming.recv);
+        if (fwTiming.dec   != null) b.fw_dec.push(fwTiming.dec);
+        if (fwTiming.paint != null) b.fw_paint.push(fwTiming.paint);
+        if (fwTiming.post  != null) b.fw_post.push(fwTiming.post);
+        if (fw_tot         >  0)    b.fw_tot.push(fw_tot);
+        // net_up = the slice of req that the firmware DIDN'T see —
+        // TCP handshake (when no keep-alive), body bytes on the wire,
+        // and httpd dispatch from socket-readable to handler entry.
+        // Can go slightly negative under clock skew; clamp at 0.
+        if (fw_tot > 0) b.net_up.push(Math.max(0, req_ms - fw_tot));
         if (depthAtQueue === 0) b.depths.d0++;
         else if (depthAtQueue === 1) b.depths.d1++;
         else b.depths.d2++;
@@ -1053,14 +1112,22 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 const sorted = arr.slice().sort((a, b) => a - b);
                 return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
             };
+            const fmt = (arr: number[]) => arr.length
+                ? `p50=${p(arr, 0.5).toFixed(1)}ms p95=${p(arr, 0.95).toFixed(1)}ms`
+                : `(no data)`;
             this.console.log(
-                `fetch "${v.name}" #${n} (jpeg=${(jpeg.length / 1024).toFixed(0)}KB) ` +
-                `wall p50=${p(b.wall, 0.5)}ms p95=${p(b.wall, 0.95)}ms | ` +
-                `emit→post p50=${p(b.emit, 0.5)}ms p95=${p(b.emit, 0.95)}ms | ` +
-                `req p50=${p(b.req, 0.5)}ms p95=${p(b.req, 0.95)}ms | ` +
-                `body-read p50=${p(b.bread, 0.5)}ms | ` +
-                `inflight d0=${b.depths.d0} d1=${b.depths.d1} d2=${b.depths.d2} | ` +
-                `stale-drops=${b.staleDrops}`);
+                `fetch "${v.name}" #${n} (jpeg=${(jpeg.length / 1024).toFixed(0)}KB)\n` +
+                `   wall      ${fmt(b.wall)}\n` +
+                `   emit→post ${fmt(b.emit)}   (queue wait before fetch() called)\n` +
+                `   req       ${fmt(b.req)}   (fetch start → Response headers)\n` +
+                `     net_up  ${fmt(b.net_up)}   (req − fw_total: TCP setup + body wire + dispatch)\n` +
+                `     fw_recv ${fmt(b.fw_recv)}   (firmware body read off the wire)\n` +
+                `     fw_dec  ${fmt(b.fw_dec)}   (hardware JPEG → BGR888)\n` +
+                `     fw_paint${fmt(b.fw_paint)}   (backbuffer flip)\n` +
+                `     fw_post ${fmt(b.fw_post)}   (state counters + unlock)\n` +
+                `   body-read ${fmt(b.bread)}   (Response → drained)\n` +
+                `   inflight  d0=${b.depths.d0} d1=${b.depths.d1} d2=${b.depths.d2}   (queue depth at fetch start)\n` +
+                `   stale-drops=${b.staleDrops}`);
             this.fetchSamples.delete(v.nativeId!);   // reset window
         }
         if (res.status === 409) {
