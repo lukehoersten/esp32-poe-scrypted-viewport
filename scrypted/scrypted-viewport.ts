@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "504360a";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -299,41 +299,78 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }>();
     private scryptedBase = "";
 
-    // Per-host undici Agent so /frame POSTs reuse the TCP connection
-    // and pipeline two-in-flight. Reusing the socket saves the SYN +
-    // SYN-ACK + ACK round-trip (~1ms on LAN, more painful on Wi-Fi),
-    // and the connections:2 cap lets us overlap upload of frame N+1
-    // with the firmware's decode-and-paint of frame N. pipelining:0
-    // because esp_http_server doesn't support HTTP/1.1 request
-    // pipelining on a single connection — we want two independent
-    // sockets, not two requests stacked on one.
-    private dispatchers = new Map<string, any>();
-    private undiciAvailable: boolean | undefined;
-    private dispatcherFor(host: string): any {
-        // Try undici exactly once per provider lifetime. Scrypted's
-        // plugin sandbox doesn't always expose it as a require()-able
-        // module — when that's the case we silently fall back to
-        // plain fetch (no socket pooling). Functionally still works,
-        // just costs the SYN+SYN-ACK+ACK round-trip per POST.
-        if (this.undiciAvailable === false) return undefined;
-        let d = this.dispatchers.get(host);
-        if (d !== undefined) return d;
-        try {
-            const { Agent } = require("undici");
-            d = new Agent({
-                keepAliveTimeout:    30_000,
-                keepAliveMaxTimeout: 60_000,
-                connections:         2,
-                pipelining:          0,
+    // Per-host node:http Agent with keep-alive. Replaces the previous
+    // undici dispatcher path — undici isn't reachable as a require()
+    // module from Scrypted's plugin sandbox, but node:http is always
+    // available. keepAlive: true reuses the underlying TCP connection
+    // across POSTs (skips SYN+SYN-ACK+ACK per frame, ~1ms saved on
+    // LAN and tail-spike-killer on Wi-Fi). maxSockets: 2 caps the
+    // pool at the same value as the firmware's pipelining capacity,
+    // so frame N+1 can begin uploading on socket B while frame N is
+    // still being decoded on the device via socket A.
+    private agents = new Map<string, any>();
+    private agentFor(host: string): any {
+        let a = this.agents.get(host);
+        if (!a) {
+            const http = require("http");
+            a = new http.Agent({
+                keepAlive:        true,
+                keepAliveMsecs:   30_000,
+                maxSockets:       2,
+                maxFreeSockets:   2,
+                timeout:          30_000,
             });
-            this.dispatchers.set(host, d);
-            this.undiciAvailable = true;
-            return d;
-        } catch {
-            this.undiciAvailable = false;
-            this.console.warn(`undici not available in this Scrypted runtime — falling back to per-POST sockets (no keep-alive, no 2-way pipelining at the TCP layer)`);
-            return undefined;
+            this.agents.set(host, a);
         }
+        return a;
+    }
+
+    // Raw http.request wrapper that gives us per-stage timing the
+    // built-in fetch hides. Returns { status, headers, tHeaders,
+    // tDone } so callers can compute req-time vs body-read separately.
+    private httpRequest(
+        opts: {
+            host: string; port: number; path: string; method: string;
+            headers: Record<string, string>;
+            body?: Buffer | string;
+            timeoutMs: number;
+            abort?: AbortSignal;
+        }
+    ): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; tHeaders: number; tDone: number; }> {
+        return new Promise((resolve, reject) => {
+            const http = require("http");
+            const req = http.request({
+                host:    opts.host,
+                port:    opts.port,
+                path:    opts.path,
+                method:  opts.method,
+                headers: opts.headers,
+                agent:   this.agentFor(opts.host),
+                timeout: opts.timeoutMs,
+            }, (res: any) => {
+                const tHeaders = Date.now();
+                // Drain body so the socket can return to the keep-alive
+                // pool. Empty body responses (204/200) still need this
+                // — the agent won't recycle the socket until 'end'.
+                res.on("data", () => {});
+                res.on("end", () => resolve({
+                    status:  res.statusCode || 0,
+                    headers: res.headers,
+                    tHeaders,
+                    tDone:   Date.now(),
+                }));
+                res.on("error", reject);
+            });
+            const onAbort = () => req.destroy(new Error("aborted"));
+            if (opts.abort) {
+                if (opts.abort.aborted) onAbort();
+                else opts.abort.addEventListener("abort", onAbort, { once: true });
+            }
+            req.on("timeout", () => req.destroy(new Error("request timeout")));
+            req.on("error", reject);
+            if (opts.body != null) req.write(opts.body);
+            req.end();
+        });
     }
 
     constructor(nativeId?: string) {
@@ -786,7 +823,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 // this, ffmpeg's output queue fills up and the displayed
                 // image lags further and further behind reality.
                 "-fps_mode", "drop",
-                "-c:v", "mjpeg", "-q:v", "2",
+                "-c:v", "mjpeg", "-q:v", "1",
                 "-f", "image2pipe", "-flush_packets", "1",
                 "pipe:1",
             ]);
@@ -1012,7 +1049,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 "-f", "image2pipe", "-i", "pipe:0",
                 "-vf", vf,
                 "-frames:v", "1",
-                "-c:v", "mjpeg", "-q:v", "2",
+                "-c:v", "mjpeg", "-q:v", "1",
                 "-f", "image2pipe", "pipe:1",
             ]);
             const chunks: Buffer[] = [];
@@ -1059,28 +1096,26 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const seq = (this.frameSeq.get(v.nativeId!) || 0) + 1;
         this.frameSeq.set(v.nativeId!, seq);
         const tFetchStart = Date.now();
-        const opts: any = {
-            method: "POST",
-            headers: { "Content-Type": "image/jpeg", "X-Frame-Seq": String(seq) },
+        const res = await this.httpRequest({
+            host: v.host, port: 80, path: "/frame", method: "POST",
+            headers: {
+                "Content-Type": "image/jpeg",
+                "X-Frame-Seq":  String(seq),
+                "Content-Length": String(jpeg.length),
+            },
             body: jpeg,
-            signal: abort.signal,
+            timeoutMs: 10_000,
+            abort: abort.signal,
+        });
+        const tHeaders = res.tHeaders;
+        const tDone    = res.tDone;
+        const status   = res.status;
+        const hdrGet   = (k: string) => {
+            const v = res.headers[k.toLowerCase()];
+            return Array.isArray(v) ? v[0] : v;
         };
-        // undici dispatcher: keep-alive + 2 connections per host so
-        // frame N+1 begins uploading on socket B while frame N is
-        // still being decoded/painted on the device via socket A.
-        // dispatcherFor returns undefined when undici isn't reachable
-        // from the Scrypted plugin sandbox.
-        const dispatcher = this.dispatcherFor(v.host);
-        if (dispatcher) opts.dispatcher = dispatcher;
-        const res = await fetch(`http://${v.host}/frame`, opts);
-        const tHeaders = Date.now();
-        const wasStale = res.headers.get("X-Frame-Drop") === "stale-seq";
-        const fwTiming = this.parseServerTiming(res.headers.get("Server-Timing"));
-        // Drain body so the socket can be released back to the pool.
-        // Body is empty for 200/204/409; reading is essentially free
-        // but the await pins our body-read measurement.
-        await res.text().catch(() => "");
-        const tDone = Date.now();
+        const wasStale = hdrGet("X-Frame-Drop") === "stale-seq";
+        const fwTiming = this.parseServerTiming(hdrGet("Server-Timing") ?? null);
 
         const b = this.bucketsFor(v.nativeId!);
         const req_ms  = tHeaders - tFetchStart;
@@ -1150,15 +1185,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 `   stale-drops=${b.staleDrops}`);
             this.fetchSamples.delete(v.nativeId!);   // reset window
         }
-        if (res.status === 409) {
+        if (status === 409) {
             this.console.log(`"${v.name}" returned 409 — device went to sleep, stopping stream`);
             this.stopStream(v.name, /*sendSleep=*/ false);
-        } else if (res.status === 400) {
+        } else if (status === 400) {
             // Body already drained; we lost the reason text. Log status
             // alone — repeat 400s in steady state should be rare.
             this.console.warn(`"${v.name}" /frame -> 400`);
-        } else if (!res.ok && !wasStale) {
-            this.console.warn(`"${v.name}" /frame -> ${res.status}`);
+        } else if ((status < 200 || status >= 300) && !wasStale) {
+            this.console.warn(`"${v.name}" /frame -> ${status}`);
         }
         // Do NOT reset the idle timer on successful paint. The timer is
         // anchored to the triggering CAMERA EVENT, not to "frames are
@@ -1235,20 +1270,26 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // ------------------------------------------------------------------------
 
     private async postJSON(url: string, body: any) {
-        const host = new URL(url).host.split(":")[0];
-        const opts: any = {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-        };
-        const dispatcher = this.dispatcherFor(host);
-        if (dispatcher) opts.dispatcher = dispatcher;
-        const res = await fetch(url, opts);
-        if (!res.ok && res.status !== 204) {
-            const text = await res.text().catch(() => "");
-            throw new Error(`POST ${url} -> ${res.status} ${text}`);
-        }
+        const u = new URL(url);
+        const payload = JSON.stringify(body);
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), HTTP_TIMEOUT_MS);
+        try {
+            const res = await this.httpRequest({
+                host: u.hostname, port: Number(u.port) || 80, path: u.pathname + u.search,
+                method: "POST",
+                headers: {
+                    "Content-Type":   "application/json",
+                    "Content-Length": String(Buffer.byteLength(payload)),
+                },
+                body: payload,
+                timeoutMs: HTTP_TIMEOUT_MS,
+                abort: ctrl.signal,
+            });
+            if ((res.status < 200 || res.status >= 300) && res.status !== 204) {
+                throw new Error(`POST ${url} -> ${res.status}`);
+            }
+        } finally { clearTimeout(to); }
     }
 }
 
