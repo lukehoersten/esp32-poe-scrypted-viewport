@@ -638,3 +638,94 @@ Run these once all milestones are implemented and individually verified. The poi
 ### G. Multi-viewport
 
 Once at least two physical units are configured: confirm each routes its callback to Scrypted with its own `viewport` name; confirm Scrypted's discovery map has both IPs; confirm a camera event on the wrong-named viewport is correctly ignored on the right one.
+
+## Performance review playbook
+
+Repeatable methodology for "is the device still hitting its baseline" and "where did the time go." Run after every commit that touches the data plane.
+
+### Per-session capture
+
+Three log streams, all timestamped:
+
+```sh
+# Firmware serial — 30-frame window summaries
+idf.py monitor | tee fw-$(date +%s).log &
+
+# /state poll — windowed stats + glass-to-glass anchor
+while true; do
+  curl -s http://VIEWPORT_IP/state
+  echo
+  sleep 1
+done | tee state-$(date +%s).log &
+
+# Scrypted plugin console — copy/paste from the web UI when done.
+```
+
+Trigger a wake event (motion or "Wake now" button). Let it run two minutes. Stop captures.
+
+### What the firmware serial says
+
+Every 30 painted frames:
+
+```
+30 frames over 1.8s: 16.5fps 2.95MB/s avg-jpeg=180KB |
+  lock min/avg/max=8/9/12us |
+  recv min/avg/max=21000/35000/48000us |
+  dec  min/avg/max=5100/5600/6200us |
+  paint min/avg/max=38/45/61us |
+  idle min/avg/max=120/8500/40000us
+```
+
+### What `/state` says (Phase 4 onward)
+
+```json
+{
+  "stream": {
+    "frames": 30, "bytes": 5400000, "window_us": 1800000,
+    "recv_min_us":21000,"recv_avg_us":35000,"recv_max_us":48000,
+    "dec_min_us":5100,"dec_avg_us":5600,"dec_max_us":6200,
+    "paint_min_us":38,"paint_avg_us":45,"paint_max_us":61,
+    "idle_min_us":120,"idle_avg_us":8500,"idle_max_us":40000,
+    "last_paint_event_us_low": 2148503712
+  }
+}
+```
+
+`last_paint_event_us_low` is the script's monotonic µs low 32 bits at the wake event that produced the most recent painted frame. Glass-to-glass is `(scripts_now_us_low - last_paint_event_us_low)` with 32-bit wrap.
+
+### What the Scrypted console says
+
+On wake:
+```
+event MotionSensor -> "kitchen": fired at +0ms (wake)
+stream "kitchen": start +0ms
+stream "kitchen": socket connect requested +1ms
+snapshot "kitchen": start +1ms
+snapshot "kitchen": takePicture +320ms
+stream "kitchen": socket connect open +24ms
+snapshot "kitchen": transform +458ms via sharp (217KB)
+snapshot "kitchen": post sent +459ms
+snapshot "kitchen": post acked +551ms ← first user-visible paint
+stream "kitchen": first ffmpeg frame +780ms (jpeg=210KB)
+stream "kitchen": first socket.write +781ms
+```
+
+Every 5s during an active stream:
+```
+firmware "kitchen": fps=16.7 2.99MB/s | recv=...us | dec=...us | paint=...us | idle=...us | g2g=140ms
+```
+
+### Investigation thresholds (alarms)
+
+| Symptom | Probable cause | First check |
+|---|---|---|
+| Painted fps sustained < 12 | Upstream starvation | `idle_avg_us` in firmware log — high = ffmpeg behind |
+| `decode_p95 > 8ms` | HW decoder pathology | Recent `decode_errors` delta; PSRAM cache pressure |
+| `paint_p95 > 200µs` | DPI or DMA stall | Look for `DSI` warnings in serial; PSRAM bandwidth |
+| `idle_avg > 50ms` | ffmpeg falling behind | Check Scrypted CPU; try lower-rate camera substream |
+| `g2g_p95 > 500ms` | User-facing regression | Bisect: is the gap in script-side or firmware-side? |
+| Any non-zero `decode_errors` delta | JPEG corruption | TCP retransmit storm or memory corruption |
+
+### Tools
+
+`grep`, `awk`, `gnuplot`. Anything beyond that is over-engineering for a single device's logs.

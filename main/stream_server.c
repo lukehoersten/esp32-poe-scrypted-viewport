@@ -18,6 +18,29 @@
 
 static const char *TAG = "stream";
 
+// Why TCP and not UDP.
+//
+// JPEGs at panel-native q:v 1 are ~180 KB → ~123 IP datagrams at 1500
+// MTU. On hardwired Gigabit LAN with a single managed switch, fabric
+// loss is < 1e-9/packet, so per-frame corruption is ≈1.2e-7 (~1 bad
+// frame every 95 days at 30 fps). UDP's theoretical wins don't apply
+// to this deployment:
+//
+//   - Nagle/SACK/window-scaling overhead: socket.write p50 < 1ms in
+//     steady state (see Scrypted-side log). TCP_NODELAY is on. No
+//     per-frame ACK round-trip exists in either direction.
+//   - "Latest wins" semantics: implemented for free above via the
+//     FIONREAD check below. UDP would have to reassemble fragments
+//     first before deciding to skip, defeating the latency win.
+//
+// UDP's costs would be real: 200-400 LOC of app-layer fragmentation
+// + reassembly + partial-frame timeout, loss of `nc localhost 81 |
+// xxd` for debug, and the FIONREAD-skip trick stops working because
+// UDP recvmsg counts fragments not whole messages.
+//
+// Revisit only if a Wi-Fi-only variant ships (loss rate 1e-3..1e-5
+// would make TCP retransmits painful enough to consider the rewrite).
+
 #define HEADER_V0_BYTES 8    // legacy: jpeg_len + seq
 #define HEADER_V1_BYTES 16   // current: magic + jpeg_len + seq + event_us_low
 #define HEADER_BYTES    HEADER_V0_BYTES   // used for FIONREAD threshold —
