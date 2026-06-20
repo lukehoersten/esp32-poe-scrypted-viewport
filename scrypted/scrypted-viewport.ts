@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "f982b88";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -452,7 +452,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // Periodic re-register so a device that rebooted or got a new IP
         // re-syncs without manual intervention.
-        setInterval(() => {
+        //
+        // Important: Scrypted's Scripts sandbox does NOT garbage-collect
+        // setInterval handles when the script is re-pasted/reloaded.
+        // Without the globalThis cancel below, every re-paste leaves an
+        // orphan interval still running against the previous Provider
+        // instance. After N reloads the user gets N rapid-fire
+        // "registered ..." log lines every 5 minutes.
+        const G = globalThis as any;
+        if (G.__viewportRegisterInterval) {
+            try { clearInterval(G.__viewportRegisterInterval); } catch {}
+        }
+        G.__viewportRegisterInterval = setInterval(() => {
             for (const v of this.viewports.values()) {
                 this.registerViewport(v).catch(() => {});
             }
@@ -509,6 +520,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 deviceFilter: `interfaces.includes('${ScryptedInterface.Camera}')`,
             },
             {
+                key: "triggers",
+                title: "Wake triggers",
+                description: "Which camera-event types automatically wake the viewport. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap to see the camera).",
+                choices: ["doorbell", "motion", "person"],
+                multiple: true,
+                value: ["doorbell", "motion", "person"],
+            } as any,
+            {
                 key: "orientation",
                 title: "Orientation",
                 choices: ["portrait", "landscape"],
@@ -543,6 +562,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         childStore.setItem("host",         String(settings.host || ""));
         childStore.setItem("cameraId",     String(settings.cameraId || ""));
         childStore.setItem("orientation",  String(settings.orientation || "portrait"));
+        // settings.triggers arrives as an array from the multi-select.
+        // JSON-encode to match how Viewport.putSetting stores it on
+        // subsequent edits.
+        const trigs = Array.isArray(settings.triggers)
+            ? settings.triggers
+            : ["doorbell", "motion", "person"];
+        childStore.setItem("triggers",     JSON.stringify(trigs));
 
         this.childIds = [...this.childIds, nativeId];
         this.console.log(`created viewport "${name}" (${nativeId})`);
