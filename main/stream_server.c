@@ -18,9 +18,21 @@
 
 static const char *TAG = "stream";
 
-#define HEADER_BYTES 8   // 4 jpeg_len + 4 seq
+#define HEADER_V0_BYTES 8    // legacy: jpeg_len + seq
+#define HEADER_V1_BYTES 16   // current: magic + jpeg_len + seq + event_us_low
+#define HEADER_BYTES    HEADER_V0_BYTES   // used for FIONREAD threshold —
+                                          // "another header may already
+                                          // be queued" check needs only
+                                          // the smaller of the two.
+#define MAGIC_V1        0x56505254u   // "VPRT" big-endian
 
 static uint16_t s_port;
+
+// Last-window stats snapshot, written by handle_client at window roll
+// and read by /state via stream_server_snapshot_stats. portMUX keeps
+// the writer atomic against a concurrent reader on the other core.
+static portMUX_TYPE          s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+static stream_server_stats_t s_stats;
 
 // recv() in a loop until n bytes are read or the connection drops.
 // Returns ESP_OK on full read, ESP_FAIL on EOF or socket error.
@@ -77,17 +89,46 @@ static void handle_client(int fd, const char *peer)
     int64_t  idle_min = INT64_MAX, idle_max = 0, idle_sum = 0;
     int64_t  lock_min = INT64_MAX, lock_max = 0, lock_sum = 0;
     uint64_t window_samples = 0;
+    uint32_t last_event_us_low = 0;   // captured from v1 headers
 
     while (1) {
-        uint8_t hdr[HEADER_BYTES];
-        if (read_n(fd, hdr, HEADER_BYTES) != ESP_OK) {
+        // Sniff the first 4 bytes — they're either the v1 magic
+        // "VPRT" or the v0 jpeg_len field. Decide once per frame.
+        uint8_t first4[4];
+        if (read_n(fd, first4, 4) != ESP_OK) {
             ESP_LOGI(TAG, "client %s disconnected (header read)", peer);
             return;
         }
-        uint32_t jpeg_len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16)
-                         | ((uint32_t)hdr[2] << 8)  |  (uint32_t)hdr[3];
-        uint32_t seq      = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16)
-                         | ((uint32_t)hdr[6] << 8)  |  (uint32_t)hdr[7];
+        uint32_t first_word = ((uint32_t)first4[0] << 24) | ((uint32_t)first4[1] << 16)
+                            | ((uint32_t)first4[2] << 8)  |  (uint32_t)first4[3];
+
+        uint32_t jpeg_len, seq, event_us_low;
+        if (first_word == MAGIC_V1) {
+            // v1: 16-byte header total, 12 more bytes after the magic.
+            uint8_t rest[HEADER_V1_BYTES - 4];
+            if (read_n(fd, rest, sizeof(rest)) != ESP_OK) {
+                ESP_LOGI(TAG, "client %s disconnected (v1 header read)", peer);
+                return;
+            }
+            jpeg_len     = ((uint32_t)rest[0]  << 24) | ((uint32_t)rest[1]  << 16)
+                         | ((uint32_t)rest[2]  << 8)  |  (uint32_t)rest[3];
+            seq          = ((uint32_t)rest[4]  << 24) | ((uint32_t)rest[5]  << 16)
+                         | ((uint32_t)rest[6]  << 8)  |  (uint32_t)rest[7];
+            event_us_low = ((uint32_t)rest[8]  << 24) | ((uint32_t)rest[9]  << 16)
+                         | ((uint32_t)rest[10] << 8)  |  (uint32_t)rest[11];
+        } else {
+            // v0: 8-byte header, 4 more bytes after the first word.
+            // first_word is jpeg_len; read seq.
+            uint8_t rest[HEADER_V0_BYTES - 4];
+            if (read_n(fd, rest, sizeof(rest)) != ESP_OK) {
+                ESP_LOGI(TAG, "client %s disconnected (v0 header read)", peer);
+                return;
+            }
+            jpeg_len     = first_word;
+            seq          = ((uint32_t)rest[0] << 24) | ((uint32_t)rest[1] << 16)
+                         | ((uint32_t)rest[2] << 8)  |  (uint32_t)rest[3];
+            event_us_low = 0;   // legacy clients don't supply it
+        }
 
         if (jpeg_len == 0 || jpeg_len > JPEG_DECODER_MAX_INPUT_BYTES) {
             ESP_LOGW(TAG, "bad frame length %u from %s — closing connection",
@@ -175,6 +216,7 @@ static void handle_client(int fd, const char *peer)
         viewport_state_unlock();
 
         last_painted_seq = seq;
+        if (event_us_low != 0) last_event_us_low = event_us_low;
         jpeg_decoder_unlock();
         state_machine_frame_painted();
         frames_decoded++;
@@ -232,6 +274,33 @@ static void handle_client(int fd, const char *peer)
                 (long long)(idle_min == INT64_MAX ? 0 : idle_min),
                 (long long)(idle_sum  / window_samples),
                 (long long)idle_max);
+
+            // Publish the just-closed window so /state can expose it.
+            // Skipped under portENTER_CRITICAL — handful of integer
+            // moves, completes in single-digit µs.
+            stream_server_stats_t snap = {
+                .frames        = window_samples,
+                .bytes         = bytes_in_window,
+                .window_us     = (uint64_t)(now - t_window_start),
+                .window_end_us = (uint64_t)now,
+                .recv_min_us   = (uint32_t)recv_min,
+                .recv_avg_us   = (uint32_t)(recv_sum / window_samples),
+                .recv_max_us   = (uint32_t)recv_max,
+                .dec_min_us    = (uint32_t)dec_min,
+                .dec_avg_us    = (uint32_t)(dec_sum  / window_samples),
+                .dec_max_us    = (uint32_t)dec_max,
+                .pnt_min_us    = (uint32_t)pnt_min,
+                .pnt_avg_us    = (uint32_t)(pnt_sum  / window_samples),
+                .pnt_max_us    = (uint32_t)pnt_max,
+                .idle_min_us   = (uint32_t)(idle_min == INT64_MAX ? 0 : idle_min),
+                .idle_avg_us   = (uint32_t)(idle_sum / window_samples),
+                .idle_max_us   = (uint32_t)idle_max,
+                .last_paint_event_us_low = last_event_us_low,
+            };
+            portENTER_CRITICAL(&s_stats_mux);
+            s_stats = snap;
+            portEXIT_CRITICAL(&s_stats_mux);
+
             t_window_start  = now;
             bytes_in_window = 0;
             recv_min = dec_min = pnt_min = idle_min = lock_min = INT64_MAX;
@@ -305,4 +374,12 @@ esp_err_t stream_server_start(uint16_t port)
     s_port = port;
     BaseType_t ok = xTaskCreate(accept_task, "stream", 8192, NULL, 5, NULL);
     return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
+}
+
+void stream_server_snapshot_stats(stream_server_stats_t *out)
+{
+    if (!out) return;
+    portENTER_CRITICAL(&s_stats_mux);
+    *out = s_stats;
+    portEXIT_CRITICAL(&s_stats_mux);
 }

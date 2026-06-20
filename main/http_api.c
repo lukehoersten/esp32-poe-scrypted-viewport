@@ -16,6 +16,7 @@
 #include "mdns_service.h"
 #include "net_eth.h"
 #include "nvs_config.h"
+#include "stream_server.h"
 #include "state_machine.h"
 #include "viewport_state.h"
 
@@ -66,6 +67,35 @@ static esp_err_t state_get_handler(httpd_req_t *req)
         (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     viewport_state_unlock();
+
+    // Most recent closed window of live-stream stats. Populated every
+    // 30 painted stream frames; zero before the first window rolls.
+    // last_paint_event_us_low is the low 32 bits of the Scrypted
+    // host monotonic µs at camera-event arrival, passed verbatim
+    // through the stream header. Script computes glass-to-glass as
+    //   (now_us_low - last_paint_event_us_low) with wrap.
+    stream_server_stats_t stream;
+    stream_server_snapshot_stats(&stream);
+    cJSON *s = cJSON_CreateObject();
+    cJSON_AddNumberToObject(s, "frames",        (double)stream.frames);
+    cJSON_AddNumberToObject(s, "bytes",         (double)stream.bytes);
+    cJSON_AddNumberToObject(s, "window_us",     (double)stream.window_us);
+    cJSON_AddNumberToObject(s, "window_end_us", (double)stream.window_end_us);
+    cJSON_AddNumberToObject(s, "recv_min_us",   (double)stream.recv_min_us);
+    cJSON_AddNumberToObject(s, "recv_avg_us",   (double)stream.recv_avg_us);
+    cJSON_AddNumberToObject(s, "recv_max_us",   (double)stream.recv_max_us);
+    cJSON_AddNumberToObject(s, "dec_min_us",    (double)stream.dec_min_us);
+    cJSON_AddNumberToObject(s, "dec_avg_us",    (double)stream.dec_avg_us);
+    cJSON_AddNumberToObject(s, "dec_max_us",    (double)stream.dec_max_us);
+    cJSON_AddNumberToObject(s, "paint_min_us",  (double)stream.pnt_min_us);
+    cJSON_AddNumberToObject(s, "paint_avg_us",  (double)stream.pnt_avg_us);
+    cJSON_AddNumberToObject(s, "paint_max_us",  (double)stream.pnt_max_us);
+    cJSON_AddNumberToObject(s, "idle_min_us",   (double)stream.idle_min_us);
+    cJSON_AddNumberToObject(s, "idle_avg_us",   (double)stream.idle_avg_us);
+    cJSON_AddNumberToObject(s, "idle_max_us",   (double)stream.idle_max_us);
+    cJSON_AddNumberToObject(s, "last_paint_event_us_low",
+                            (double)stream.last_paint_event_us_low);
+    cJSON_AddItemToObject(root, "stream", s);
 
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

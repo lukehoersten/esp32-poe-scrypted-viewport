@@ -6,7 +6,7 @@
 // short git hash of the commit that added this constant — if the
 // hash in the log doesn't match the HEAD this file came from, the
 // Scrypted Script editor is still on stale code.
-const SCRIPT_VERSION = "cdd1827";
+const SCRIPT_VERSION = "pending";
 //
 // Architecture
 // ------------
@@ -627,6 +627,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     async startStream(v: Viewport, tEvent: number = Date.now()) {
         const since = () => Date.now() - tEvent;
         this.console.log(`stream "${v.name}": start +${since()}ms`);
+        // event_us_low: low 32 bits of the Scrypted-host monotonic µs
+        // at camera-event arrival. The firmware stamps this on the
+        // most recently painted frame and echoes it back via /state,
+        // letting us compute glass-to-glass.
+        const eventUsLow = (tEvent * 1000) >>> 0;
 
         // Race rule: cancel pending operations on every callback before
         // beginning a fresh stream.
@@ -884,9 +889,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                         continue;
                     }
                     seq++;
-                    const header = Buffer.alloc(8);
-                    header.writeUInt32BE(frame.length, 0);
-                    header.writeUInt32BE(seq, 4);
+                    // 16-byte v1 header. Magic "VPRT" (0x56505254) lets
+                    // the firmware autodetect old-vs-new clients during
+                    // the rollout window.
+                    const header = Buffer.alloc(16);
+                    header.writeUInt32BE(0x56505254, 0);   // "VPRT"
+                    header.writeUInt32BE(frame.length, 4);
+                    header.writeUInt32BE(seq, 8);
+                    header.writeUInt32BE(eventUsLow, 12);
                     const t0 = Date.now();
                     // Single combined write avoids splitting header
                     // and body across two TCP packets — the firmware
@@ -898,7 +908,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     }
                     writeLatencies.push(Date.now() - t0);
                     if (writeLatencies.length > 200) writeLatencies.shift();
-                    bytesSent += 8 + frame.length;
+                    bytesSent += header.length + frame.length;
                     sentFrames++;
                     // Track but don't gate on backpressure — the metric
                     // is still useful as a "kernel buffer was full"
@@ -974,6 +984,38 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             }
         }, 10_000);
         abort.signal.addEventListener("abort", () => clearInterval(skipLogger));
+
+        // Periodic /state poll to surface firmware-side window stats +
+        // computed glass-to-glass. Runs every 5s while the stream is
+        // active. g2g = (nowUsLow - last_paint_event_us_low) with
+        // 32-bit wrap; clamped to a 30s sanity ceiling because event
+        // timestamps from before the stream started are stale and
+        // would yield gigantic apparent latencies.
+        const fwPoller = setInterval(async () => {
+            try {
+                const st: any = await fetch(`http://${v.host}/state`, {
+                    signal: AbortSignal.timeout(1500),
+                }).then(r => r.json());
+                const fs = st?.stream;
+                if (!fs || !fs.frames) return;
+                const fps = fs.window_us > 0 ? (fs.frames / (fs.window_us / 1e6)) : 0;
+                const mb  = fs.window_us > 0 ? ((fs.bytes  / (fs.window_us / 1e6)) / (1024 * 1024)) : 0;
+                let g2gMs = -1;
+                if (fs.last_paint_event_us_low) {
+                    const nowUsLow = (Date.now() * 1000) >>> 0;
+                    const diff = (nowUsLow - fs.last_paint_event_us_low) >>> 0;
+                    if (diff < 30_000_000) g2gMs = diff / 1000;
+                }
+                this.console.log(
+                    `firmware "${v.name}": fps=${fps.toFixed(1)} ${mb.toFixed(2)}MB/s | ` +
+                    `recv=${fs.recv_min_us}/${fs.recv_avg_us}/${fs.recv_max_us}us | ` +
+                    `dec=${fs.dec_min_us}/${fs.dec_avg_us}/${fs.dec_max_us}us | ` +
+                    `paint=${fs.paint_min_us}/${fs.paint_avg_us}/${fs.paint_max_us}us | ` +
+                    `idle=${fs.idle_min_us}/${fs.idle_avg_us}/${fs.idle_max_us}us | ` +
+                    `g2g=${g2gMs >= 0 ? g2gMs.toFixed(0) + "ms" : "(no event yet)"}`);
+            } catch { /* /state timeout is fine, try next tick */ }
+        }, 5_000);
+        abort.signal.addEventListener("abort", () => clearInterval(fwPoller));
 
         const timeoutMs = v.idleTimeoutMs > 0 ? v.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
         const timeout = setTimeout(() => {
