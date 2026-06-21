@@ -548,36 +548,37 @@ Every endpoint is idempotent; every failure leaves the device in a sane state.
 
 ## What's next
 
-M1 – M8 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg + the zero-copy `JPEG → BGR888 → DSI` hot path sustains **~22 fps at full quality** with the double-buffered panel.
+M1 – M8 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg + the zero-copy `JPEG → BGR888 → DSI` hot path now sustains **painted = sent = 24 fps** at the Unifi medium substream rate, sub-50 ms glass-to-glass, no source-side backpressure.
 
 ### Measured per-frame budget
 
-The firmware logs a `frame N: lock=… ttfb=… body=… dec=… paint=… post=… total=…ms` line every 10 frames. Steady-state on the bench (Waveshare ESP32-P4-ETH + Hosyond 5" panel, ~215 KB JPEGs at `-q:v 2`):
+The firmware streams over a long-lived raw TCP socket on port 81 (replacing the per-frame HTTP `POST /frame` pattern from the early milestones). The stream server runs `recv` on its own FreeRTOS task and hands frames off to a separate decode/paint task through a 3-buffer PSRAM ping-pong ring. Steady-state on the bench (Waveshare ESP32-P4-ETH + Hosyond 5" panel, Unifi medium substream → ~80–130 KB JPEGs at ffmpeg `-q:v 1`):
 
 | Phase | Time | Share | What it is |
 |---|---|---|---|
-| `lock` | 6–10 µs | < 0.1% | `jpeg_decoder_try_lock` mutex acquire |
-| `ttfb` | 300–650 µs | < 1% | First byte landing after lock — TCP handshake noise |
-| `body` | 37–44 ms | **~85%** | Wire time for the JPEG body (~215 KB at ~45 Mbit/s effective on 100 Mbit Ethernet) |
-| `dec` | ~6 ms | ~13% | Hardware JPEG decode → BGR888 (way faster than the textbook 50–80 ms guess) |
-| `paint` | 35–55 µs | < 0.1% | `esp_lcd_panel_draw_bitmap` — cache writeback + index swap thanks to `num_fbs = 2` and zero-copy decode into the back fb |
-| `post` | 20–30 µs | < 0.1% | State counter bookkeeping + unlock |
-| **total** | **43–49 ms** | | **Ceiling ~22 fps** |
+| `recv` | 14–18 ms | ~70% | Pure wire time for the body, measured on the recv-task (does NOT include decoder-lock acquisition any more) |
+| `dec` | ~5 ms | ~25% | Hardware JPEG decode → BGR888 |
+| `paint` | 16–35 µs | < 0.2% | `esp_lcd_panel_draw_bitmap` — cache writeback + index swap thanks to `num_fbs = 2` and zero-copy decode into the back fb |
+| `decode_idle` | **27–40 ms** | n/a | Time decode-task spent waiting on the recv→decode signal. Means the decode/paint stage is *idle* most of the time at the source rate — the wire is the cap. |
 
-Network body is now ~85% of every frame; everything else is at or near hardware floor.
+Scrypted side: `sent=24.0fps painted=24.0fps backpressured=false`, `g2g=31–41 ms`. No `fw-skipped`, no `drops`, no `flushes`.
+
+### The critical change that unlocked this
+
+For a long stretch the device painted ~17 fps against a 24 fps source. The single-task `recv → decode → paint` loop in `stream_server.c` blocked the socket recv for ~6 ms every frame during decode+paint, which forced the sender into a tight stop-go cycle against the IDF-default 5760-byte TCP window. Raising the window to 65535 made it *worse* — the sender could pump 45+ segments before stopping but the lwIP RX path couldn't drain that into the single task, so the kernel buffer accumulated stale frames and `g2g` grew unbounded (one experiment hit 17 *seconds* before we reverted).
+
+The fix wasn't a TCP knob, it was the task architecture. `d1c8d45` split `handle_client` into a **dedicated recv-task** (owns the socket, drains continuously) and a **decode-task** (waits on a binary semaphore), with a **3-buffer PSRAM ring**: recv-task fills one buffer, decode-task processes a second, the third is either free or holds a pending frame between them. The ring guarantees recv-task never blocks waiting on decode, and a 1-deep latest-frame slot lets the receiver skip-oldest if decode ever falls behind (mirror of the Scrypted-side skip-oldest in `e5acf93`). After the split, recv-task is busy ~30% of the time and decode-task is idle ~80% — the wire is now the only thing setting the rate, and at 24 fps source it is genuinely keeping up.
+
+The full instrumentation that drove the diagnosis (`queued_at_body_start`, `recv_calls`, `recv_chunk_min/avg/max`, `recv_dropped_oldest`, `decode_idle_*`, `so_rcvbuf`) is still in `/state` and the windowed log.
 
 ### Current backlog, in rough priority order
 
-1. **Network body shrink** — *the only remaining big lever*. The firmware reads ~215 KB JPEGs at ~45 Mbit/s effective on a 100 Mbit Ethernet link (~45% of theoretical). Routes ranked by what we've actually tried:
-   - **HTTP keep-alive on the Scrypted side** (untried, recommended next). Currently Scrypted's `fetch` opens a fresh TCP socket per frame; the ~1 ms of slow-start at each connect is more impactful than the receive-window setting.
-   - **Per-viewport JPEG quality** (`-q:v` on the ffmpeg side): -q:v 5 halves file size at modest visual cost. `body` halves with it.
-   - ~~TCP window tuning (`CONFIG_LWIP_TCP_WND_DEFAULT` etc.)~~ — *tried and reverted*. Bumping WND/SND_BUF to 32 KB regressed `ttfb` from ~350 µs to ~1.2 ms and added periodic 250 ms stalls. The per-frame fresh-socket pattern makes larger windows actually slow things down via slow-start. Revisit only after keep-alive lands.
-2. **OTA firmware updates** — *low effort, gateway to fleet ops*. Partition table already has `ota_0` / `ota_1`. Add `esp_https_ota` (or a one-shot `POST /firmware` using `esp_ota_*`) so reflashing doesn't require USB. Critical once you have more than one viewport in production.
+1. **(was) Network body shrink — done.** The receiver now drains at line rate without blocking decode. Source rate (Unifi substream `medium-resolution` ≈ 24 fps) is the cap. The ffmpeg `-q:v` knob still works if you want smaller frames for non-streaming reasons; bumping the TCP window is now safe (3-buffer ring + skip-oldest backstop) but won't add fps until source rate goes up.
+2. **(was) OTA firmware updates — done.** `POST /firmware` ships in `175dd50`, ota_0/ota_1 alternation with `BOOTLOADER_APP_ROLLBACK_ENABLE` for first-boot revert. `curl --data-binary @build/scrypted-viewport.bin http://<viewport>/firmware` reboots into the new image.
 3. **Task watchdog + crash counters** — *low effort*. Enable the ESP-IDF task watchdog, surface its bite count in `/state` alongside the existing `decode_errors` / `state_post_failures`. Good hygiene.
 4. **Multi-camera per viewport** — *medium effort*. Let one viewport listen to events from N cameras, picking which one to stream based on which fired. Useful for "show whichever doorbell rang" or zone monitoring.
-5. **MJPEG-over-WebSocket** instead of `POST /frame` per JPEG — *medium effort, marginal win*. Skip unless we find a use case the per-frame path can't cover.
-6. **Boot info-screen flash polish** — *low effort*. Keep the brief wake-on-boot (the FT5426 needs it to start reporting touches) but smoothen the ~600 ms flash so it doesn't visibly flicker on power-up.
-7. **Production sealing** — *eventual*. Configurable LAN scope (cross-VLAN, mDNS-via-Unicast), Scrypted-side mutual auth, replay protection for `/state` callbacks.
+5. **Boot info-screen flash polish** — *low effort*. Keep the brief wake-on-boot (the FT5426 needs it to start reporting touches) but smoothen the ~600 ms flash so it doesn't visibly flicker on power-up.
+6. **Production sealing** — *eventual*. Configurable LAN scope (cross-VLAN, mDNS-via-Unicast), Scrypted-side mutual auth, replay protection for `/state` callbacks.
 
 ## Philosophy
 
