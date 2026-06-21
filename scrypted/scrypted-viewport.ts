@@ -663,6 +663,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         if (pending) clearTimeout(pending);
         this.bindingDebounce.set(nid, setTimeout(() => {
             this.bindingDebounce.delete(nid);
+            const tag = v.name || v.storage.getItem("display_name") || nid;
+            this.console.log(`onBindingChanged "${tag}": re-attach (host=${v.host || "?"} cameraId=${v.cameraId || "?"})`);
             this.detachListener(nid);
             // Any active stream for this viewport is now stale (camera
             // or orientation may have changed). Stop cleanly; if it
