@@ -239,12 +239,31 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         // in-flight stream-socket cap-flush reconnect). 3s timeout is
         // generous but not so long that an offline device feels
         // unresponsive in the UI.
+        //
+        // One automatic retry on failure: "fetch failed" at the socket
+        // level usually means the firmware's httpd worker pool was
+        // briefly saturated (the stream connection plus an /state poll
+        // can starve a third request on max_open_sockets=2). A 250 ms
+        // pause then try again before giving up — eliminates the
+        // sporadic "offline / unreachable" the Settings page would
+        // otherwise show during normal streaming.
+        const fetchJsonRetry = async (url: string): Promise<any> => {
+            let lastErr: any;
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const r = await fetch(url, { signal: AbortSignal.timeout(3000) });
+                    return await r.json();
+                } catch (e) {
+                    lastErr = e;
+                    if (attempt === 0) await new Promise(res => setTimeout(res, 250));
+                }
+            }
+            throw lastErr;
+        };
         if (this.host) {
             try {
-                const stateRes = await fetch(`http://${this.host}/state`,
-                    { signal: AbortSignal.timeout(3000) }).then(r => r.json());
-                const configRes = await fetch(`http://${this.host}/config`,
-                    { signal: AbortSignal.timeout(3000) }).then(r => r.json());
+                const stateRes  = await fetchJsonRetry(`http://${this.host}/state`);
+                const configRes = await fetchJsonRetry(`http://${this.host}/config`);
                 settings.push(
                     { group: "Status (live)", key: "_st_name",   title: "name",                value: stateRes.name,                                                 readonly: true } as any,
                     { group: "Status (live)", key: "_st_mac",    title: "mac",                 value: stateRes.mac,                                                  readonly: true } as any,
