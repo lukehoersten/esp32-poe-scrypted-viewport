@@ -727,7 +727,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             // callback per event source.
             pushShutdownCleaner(() => { try { reg.removeListener(); } catch {} });
         }
-        const targetNames = [cam.name || cam.id];
+        const targetNames = [`${cam.name || cam.id} (${ifaces.join("+")})`];
         this.listeners.set(v.nativeId!, regs);
         this.console.log(`viewport "${tag}": subscribed to [${targetNames.join(", ")}]`);
     }
