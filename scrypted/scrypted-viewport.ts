@@ -450,6 +450,37 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.scryptedBase = raw.replace(/\/$/, "");
         this.console.log(`Scrypted Viewport up (script=${SCRIPT_VERSION}). Callback URL base: ${this.scryptedBase}`);
 
+        // Override the device type that the @scrypted/core Scripts plugin
+        // hardcodes (`ScryptedDeviceType.Unknown` at plugins/core/src/
+        // script.ts:65) so the UI displays a meaningful label above the
+        // Status and Controls panel instead of "Unknown". This Provider
+        // semantically bridges multiple child viewport devices, so Bridge
+        // fits. The call happens after Scripts plugin's postRunScript-
+        // driven discovery, so this update wins.
+        //
+        // We pass the full interface set explicitly: passing a partial
+        // list would drop interfaces the auto-detection found. Order
+        // mirrors the class's implements clause.
+        try {
+            await deviceManager.onDeviceDiscovered({
+                providerNativeId: "scriptcore",
+                nativeId: this.nativeId,
+                name: this.name || this.providedName,
+                type: ScryptedDeviceType.Bridge,
+                interfaces: [
+                    ScryptedInterface.Scriptable,
+                    ScryptedInterface.Program,
+                    ScryptedInterface.Settings,
+                    ScryptedInterface.DeviceProvider,
+                    ScryptedInterface.DeviceCreator,
+                    ScryptedInterface.HttpRequestHandler,
+                    ScryptedInterface.StartStop,
+                ],
+            });
+        } catch (e) {
+            this.console.warn(`type override failed: ${(e as Error).message}`);
+        }
+
         // Re-discover every known child so Scrypted reattaches its storage
         // to the nativeId. Without this, `new Viewport(...)` instantiates
         // with `this.storage === undefined` and every storage-backed getter
