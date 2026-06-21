@@ -655,9 +655,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     };
 
     private attachListener(v: Viewport) {
-        if (!v.cameraId) return;
-        const cam = systemManager.getDeviceById(v.cameraId);
         const tag = v.name || v.storage.getItem("display_name") || v.nativeId;
+        if (!v.cameraId) {
+            this.console.warn(`viewport "${tag}": no camera assigned — open Settings and pick a camera; subscription skipped`);
+            return;
+        }
+        const cam = systemManager.getDeviceById(v.cameraId);
         if (!cam) {
             this.console.warn(`viewport "${tag}": camera ${v.cameraId} not found`);
             return;
