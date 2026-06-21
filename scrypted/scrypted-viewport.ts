@@ -313,7 +313,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     implements DeviceProvider, DeviceCreator, HttpRequestHandler, Settings {
 
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
-    private listeners = new Map<string, EventListenerRegister>(); // nativeId -> camera event listener
+    private listeners = new Map<string, EventListenerRegister[]>(); // nativeId -> all event listeners for this viewport (camera + child devices)
     streams = new Map<string, {                                   // viewport name -> stream control (accessed by Viewport.putSetting for manual wake/sleep)
         timeout:   NodeJS.Timeout;
         abort:     AbortController;       // also tears down the ffmpeg child via its listener
@@ -567,27 +567,49 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             ScryptedInterface.MotionSensor,    // motion
             ScryptedInterface.ObjectDetector,  // person / etc
         ];
-        const reg = cam.listen(ifaces, (source, details, data) => {
-            this.handleCameraEvent(v, details, data);
-        });
-        this.listeners.set(v.nativeId!, reg);
-        // Track on globalThis so script reload can remove this
-        // listener from the camera plugin. Without that, every
-        // re-paste leaves a dead callback subscribed to the camera
-        // and every motion/doorbell event triggers handleCameraEvent
-        // N times for N stacked reloads — observable as duplicate
-        // "stream start" log lines + two simultaneous pushSnapshots
-        // racing for the firmware decoder lock.
+        // Unifi doorbell cameras expose the bell-press as a *child
+        // device* of the camera (the bell button has its own nativeId
+        // and BinarySensor interface), not as a property of the camera
+        // itself. cam.listen() on the parent only sees motion + object
+        // events; without subscribing on the children we miss the bell
+        // press entirely. Symptom: HomeKit gets the doorbell event
+        // (Scrypted auto-syncs child devices to the bridge) but our
+        // handleCameraEvent never fires. Walk providerId to find
+        // children of this camera and listen on each too. Safe to send
+        // the same iface list to every target — listen() no-ops on
+        // ifaces the device doesn't expose.
+        const targets: any[] = [cam];
+        const ids = (systemManager as any).getDeviceIds?.() ?? [];
+        for (const id of ids) {
+            if (id === cam.id) continue;
+            const d: any = systemManager.getDeviceById(id);
+            if (d?.providerId === cam.id) targets.push(d);
+        }
+
         const G = globalThis as any;
         if (!G.__viewportListenerCleaners) G.__viewportListenerCleaners = [];
-        G.__viewportListenerCleaners.push(() => { try { reg.removeListener(); } catch {} });
-        this.console.log(`viewport "${tag}": subscribed to "${cam.name}"`);
+        const regs: EventListenerRegister[] = [];
+        const targetNames: string[] = [];
+        for (const t of targets) {
+            const reg = t.listen(ifaces, (source: any, details: any, data: any) => {
+                this.handleCameraEvent(v, details, data);
+            });
+            regs.push(reg);
+            targetNames.push(t.name || t.id);
+            // Track on globalThis so script reload can remove every
+            // listener from the camera/child plugins. Without that,
+            // every re-paste leaves dead callbacks subscribed and each
+            // event triggers handleCameraEvent N times for N reloads.
+            G.__viewportListenerCleaners.push(() => { try { reg.removeListener(); } catch {} });
+        }
+        this.listeners.set(v.nativeId!, regs);
+        this.console.log(`viewport "${tag}": subscribed to [${targetNames.join(", ")}]`);
     }
 
     private detachListener(nativeId: string) {
-        const reg = this.listeners.get(nativeId);
-        if (reg) {
-            try { reg.removeListener(); } catch {}
+        const regs = this.listeners.get(nativeId);
+        if (regs) {
+            for (const r of regs) { try { r.removeListener(); } catch {} }
             this.listeners.delete(nativeId);
         }
     }
