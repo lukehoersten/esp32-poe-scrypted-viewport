@@ -29,17 +29,17 @@ CONFIG_LWIP_IPV4=y
 CONFIG_LWIP_IPV6=y
 CONFIG_MDNS_MAX_INTERFACES=1
 
-# TCP receive-window + buffer tuning. Earlier attempt under HTTP
-# regressed because every /frame opened a fresh socket and we ate
-# the slow-start cost repeatedly. Under the streaming pivot the
-# socket is long-lived: slow-start happens once, then we run with
-# the full window for the rest of the session — which is exactly
-# the workload these knobs are designed for. Larger WND lets the
-# sender keep more bytes in flight per ACK and pushes our recv
-# throughput ceiling up from ~5.3 MB/s.
-CONFIG_LWIP_TCP_WND_DEFAULT=65535
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+# TCP receive-window kept at IDF defaults (4 × MSS = 5760). An
+# attempt to raise WND to 65535 regressed g2g from ~100ms to 17s
+# growing unbounded — the bigger window let Scrypted bury the ESP32
+# in queued bytes faster than the single recv→decode→paint task
+# can drain them, with no way to skip-oldest on the kernel queue.
+# The real bottleneck is task serialization, not window size; raise
+# this only once the recv path is on its own FreeRTOS task with a
+# 1-deep latest-frame slot to the decode/paint task.
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
 CONFIG_LWIP_TCP_SACK_OUT=y
 
 # HTTP server
