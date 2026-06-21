@@ -715,11 +715,36 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // ifaces the device doesn't expose.
         const targets: any[] = [cam];
         const ids = (systemManager as any).getDeviceIds?.() ?? [];
+        const camAny = cam as any;
         for (const id of ids) {
             if (id === cam.id) continue;
             const d: any = systemManager.getDeviceById(id);
-            if (d?.providerId === cam.id) targets.push(d);
+            if (!d) continue;
+            // True child of the camera.
+            const isChild = d.providerId === cam.id;
+            // Sibling under the same provider that exposes BinarySensor
+            // (Unifi exposes the doorbell button this way on some models).
+            const isSiblingBell =
+                camAny.providerId &&
+                d.providerId === camAny.providerId &&
+                Array.isArray(d.interfaces) &&
+                d.interfaces.includes(ScryptedInterface.BinarySensor);
+            if (isChild || isSiblingBell) targets.push(d);
         }
+        // One-shot diagnostic: log every device whose name *looks* related
+        // to the camera so we can see what's there if the traversal still
+        // misses the button.
+        const camNameLower = (cam.name || "").toLowerCase();
+        const related: string[] = [];
+        for (const id of ids) {
+            const d: any = systemManager.getDeviceById(id);
+            if (!d || d.id === cam.id) continue;
+            const nm = (d.name || "").toLowerCase();
+            if (camNameLower && nm.includes(camNameLower.split(" ")[0])) {
+                related.push(`${d.name} [id=${d.id} provider=${d.providerId} ifaces=${(d.interfaces || []).join(",")}]`);
+            }
+        }
+        if (related.length) this.console.log(`viewport "${tag}": name-related devices: ${related.join(" | ")}`);
 
         const regs: EventListenerRegister[] = [];
         const targetNames: string[] = [];
