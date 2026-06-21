@@ -699,69 +699,35 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.warn(`viewport "${tag}": camera ${v.cameraId} not found`);
             return;
         }
+        // Scrypted's ScryptedDevice.listen(event, cb) takes a SINGLE
+        // interface (or EventListenerOptions {event}), never an array.
+        // Confirmed in sdk/types/src/types.input.ts:21. Passing an array
+        // stringifies to "BinarySensor,MotionSensor,..." which matches
+        // nothing — events leak through with broken filtering. One
+        // listen() per interface is the right shape.
+        //
+        // For Unifi doorbells the bell-press lives on the camera device
+        // itself (unifi-protect/src/main.ts pushes BinarySensor onto the
+        // camera's interfaces when isDoorbell). So listening on `cam`
+        // for BinarySensor is all that's needed — no child traversal.
         const ifaces = [
-            ScryptedInterface.BinarySensor,    // doorbell
+            ScryptedInterface.BinarySensor,    // doorbell ring
             ScryptedInterface.MotionSensor,    // motion
             ScryptedInterface.ObjectDetector,  // person / etc
         ];
-        // Unifi doorbell cameras expose the bell-press as a *child
-        // device* of the camera (the bell button has its own nativeId
-        // and BinarySensor interface), not as a property of the camera
-        // itself. cam.listen() on the parent only sees motion + object
-        // events; without subscribing on the children we miss the bell
-        // press entirely. Symptom: HomeKit gets the doorbell event
-        // (Scrypted auto-syncs child devices to the bridge) but our
-        // handleCameraEvent never fires. Walk providerId to find
-        // children of this camera and listen on each too. Safe to send
-        // the same iface list to every target — listen() no-ops on
-        // ifaces the device doesn't expose.
-        const targets: any[] = [cam];
-        const ids = (systemManager as any).getDeviceIds?.() ?? [];
-        const camAny = cam as any;
-        for (const id of ids) {
-            if (id === cam.id) continue;
-            const d: any = systemManager.getDeviceById(id);
-            if (!d) continue;
-            // True child of the camera.
-            const isChild = d.providerId === cam.id;
-            // Sibling under the same provider that exposes BinarySensor
-            // (Unifi exposes the doorbell button this way on some models).
-            const isSiblingBell =
-                camAny.providerId &&
-                d.providerId === camAny.providerId &&
-                Array.isArray(d.interfaces) &&
-                d.interfaces.includes(ScryptedInterface.BinarySensor);
-            if (isChild || isSiblingBell) targets.push(d);
-        }
-        // Diagnostic: list every BinarySensor device in the system so we
-        // can see which one is the doorbell button and what its
-        // provider/relationship to the camera looks like.
-        const camAny2 = cam as any;
-        const bells: string[] = [];
-        for (const id of ids) {
-            const d: any = systemManager.getDeviceById(id);
-            if (!d) continue;
-            if (Array.isArray(d.interfaces) && d.interfaces.includes(ScryptedInterface.BinarySensor)) {
-                bells.push(`${d.name} [id=${d.id} provider=${d.providerId} type=${d.type}]`);
-            }
-        }
-        this.console.log(`viewport "${tag}": camera id=${cam.id} provider=${camAny2.providerId} type=${camAny2.type}`);
-        this.console.log(`viewport "${tag}": BinarySensor devices in system: ${bells.length ? bells.join(" | ") : "(none)"}`);
 
         const regs: EventListenerRegister[] = [];
-        const targetNames: string[] = [];
-        for (const t of targets) {
-            const reg = t.listen(ifaces, (source: any, details: any, data: any) => {
+        for (const iface of ifaces) {
+            const reg = (cam as any).listen(iface, (source: any, details: any, data: any) => {
                 this.handleCameraEvent(v, details, data);
             });
             regs.push(reg);
-            targetNames.push(t.name || t.id);
             // Register for cross-reload cleanup so a re-paste removes
-            // every camera/child listener. Without this each re-paste
-            // stacks an extra callback per event source and each event
-            // triggers handleCameraEvent N times for N reloads.
+            // every listener. Without this each re-paste stacks an extra
+            // callback per event source.
             pushShutdownCleaner(() => { try { reg.removeListener(); } catch {} });
         }
+        const targetNames = [cam.name || cam.id];
         this.listeners.set(v.nativeId!, regs);
         this.console.log(`viewport "${tag}": subscribed to [${targetNames.join(", ")}]`);
     }
