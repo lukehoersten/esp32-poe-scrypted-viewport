@@ -733,20 +733,20 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 d.interfaces.includes(ScryptedInterface.BinarySensor);
             if (isChild || isSiblingBell) targets.push(d);
         }
-        // One-shot diagnostic: log every device whose name *looks* related
-        // to the camera so we can see what's there if the traversal still
-        // misses the button.
-        const camNameLower = (cam.name || "").toLowerCase();
-        const related: string[] = [];
+        // Diagnostic: list every BinarySensor device in the system so we
+        // can see which one is the doorbell button and what its
+        // provider/relationship to the camera looks like.
+        const camAny2 = cam as any;
+        const bells: string[] = [];
         for (const id of ids) {
             const d: any = systemManager.getDeviceById(id);
-            if (!d || d.id === cam.id) continue;
-            const nm = (d.name || "").toLowerCase();
-            if (camNameLower && nm.includes(camNameLower.split(" ")[0])) {
-                related.push(`${d.name} [id=${d.id} provider=${d.providerId} ifaces=${(d.interfaces || []).join(",")}]`);
+            if (!d) continue;
+            if (Array.isArray(d.interfaces) && d.interfaces.includes(ScryptedInterface.BinarySensor)) {
+                bells.push(`${d.name} [id=${d.id} provider=${d.providerId} type=${d.type}]`);
             }
         }
-        if (related.length) this.console.log(`viewport "${tag}": name-related devices: ${related.join(" | ")}`);
+        this.console.log(`viewport "${tag}": camera id=${cam.id} provider=${camAny2.providerId} type=${camAny2.type}`);
+        this.console.log(`viewport "${tag}": BinarySensor devices in system: ${bells.length ? bells.join(" | ") : "(none)"}`);
 
         const regs: EventListenerRegister[] = [];
         const targetNames: string[] = [];
