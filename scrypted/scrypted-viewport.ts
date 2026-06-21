@@ -83,6 +83,7 @@ type Setting                 = any;
 type Settings                = any;
 type SettingValue            = any;
 type StartStop               = any;
+type OnOff                   = any;
 
 // ---------------------------------------------------------------------------
 // Cross-reload shutdown cleaners.
@@ -372,7 +373,7 @@ class Viewport extends ScryptedDeviceBase implements Settings {
 // ============================================================================
 
 class ScryptedViewportProvider extends ScryptedDeviceBase
-    implements DeviceProvider, DeviceCreator, HttpRequestHandler, Settings, StartStop {
+    implements DeviceProvider, DeviceCreator, HttpRequestHandler, Settings, StartStop, OnOff {
 
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister[]>(); // nativeId -> all event listeners for this viewport (camera + child devices)
@@ -385,46 +386,69 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     constructor(nativeId?: string) {
         super(nativeId);
-        // Auto-start on script load. StartStop.start() is idempotent — if the
-        // user later clicks STOP in the Scripts UI, .stop() drains everything
+        // Initialise both lifecycle-interface state fields synchronously
+        // so the device record has values for them at registration time.
+        // Without this Scrypted's "Status and Controls" panel reads
+        // undefined and renders 'Unknown' regardless of what our async
+        // bootstrap eventually sets.
+        this.running = false;
+        this.on      = false;
+        // Auto-start on script load. start() is idempotent — if the user
+        // later clicks STOP in the Scripts UI, stop() drains everything
         // and start() doesn't re-fire until they click START. Across a
-        // script re-paste the constructor runs again, .start() drains any
+        // script re-paste the constructor runs again, start() drains any
         // prior load's resources first and re-bootstraps cleanly.
         this.start().catch(e => this.console.error("start failed", e));
     }
 
     // ------------------------------------------------------------------------
-    // StartStop — public lifecycle controls exposed to the Scrypted UI
+    // Lifecycle interfaces (StartStop + OnOff) — both bound to bootstrap/drain
     // ------------------------------------------------------------------------
     //
-    // Scrypted renders this device's "Status and Controls" panel from the
-    // StartStop interface: `running` drives the displayed status and the
-    // STOP / START buttons call .stop() / .start() respectively.
+    // Scrypted renders this device's "Status and Controls" panel from a
+    // lifecycle interface. Which one — StartStop, OnOff, both, or
+    // something Scripts-plugin-specific — varies across versions, so we
+    // expose both and keep them in lockstep. Whichever the UI calls,
+    // the user's STOP button drains resources and START re-bootstraps.
     //
-    // Semantics:
-    //   start():  drain any leftover resources, then bootstrap. Idempotent
-    //             (no-op if already running). Auto-called from the
-    //             constructor on script load.
-    //   stop():   drain every resource (streams, listeners, intervals) the
-    //             provider holds. No-op if already stopped.
+    // Semantics (shared):
+    //   start() / turnOn():  drain any leftover resources, then bootstrap.
+    //                        Idempotent (no-op if already running).
+    //                        Auto-called from the constructor.
+    //   stop()  / turnOff(): drain every resource (streams, listeners,
+    //                        intervals) and clear in-memory maps. No-op
+    //                        if already stopped.
     //
-    // The "Unknown" status seen before this commit was Scrypted's fallback
-    // for a device that exposes no lifecycle interface. With StartStop in
-    // place the UI shows Running / Stopped accurately.
+    // Every call logs so we can confirm from the Scrypted console which
+    // method the Status panel actually wires to. Once one is confirmed
+    // we can drop the other (and the logging).
 
     async start() {
+        this.console.log(`lifecycle: start() called (running=${this.running})`);
         if (this.running) return;
         await this.bootstrap();
         this.running = true;
+        this.on      = true;
     }
 
     async stop() {
+        this.console.log(`lifecycle: stop() called (running=${this.running})`);
         if (!this.running) return;
         drainShutdownCleaners(this.console, "stop");
         this.viewports.clear();
         this.listeners.clear();
         this.streams.clear();
         this.running = false;
+        this.on      = false;
+    }
+
+    async turnOn()  {
+        this.console.log(`lifecycle: turnOn() called (on=${this.on})`);
+        return this.start();
+    }
+    async turnOff() {
+        this.console.log(`lifecycle: turnOff() called (on=${this.on})`);
+        return this.stop();
     }
 
     // ------------------------------------------------------------------------
