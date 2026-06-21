@@ -424,15 +424,21 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // we can drop the other (and the logging).
 
     async start() {
-        this.console.log(`lifecycle: start() called (running=${this.running})`);
+        this.console.log(`lifecycle: start() called (running=${this.running}, on=${this.on})`);
         if (this.running) return;
-        await this.bootstrap();
+        try {
+            await this.bootstrap();
+        } catch (e) {
+            this.console.error(`lifecycle: bootstrap threw:`, (e as Error).message);
+            throw e;
+        }
         this.running = true;
         this.on      = true;
+        this.console.log(`lifecycle: start() complete — running=${this.running}, on=${this.on}, nativeId=${this.nativeId}`);
     }
 
     async stop() {
-        this.console.log(`lifecycle: stop() called (running=${this.running})`);
+        this.console.log(`lifecycle: stop() called (running=${this.running}, on=${this.on})`);
         if (!this.running) return;
         drainShutdownCleaners(this.console, "stop");
         this.viewports.clear();
@@ -440,6 +446,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.streams.clear();
         this.running = false;
         this.on      = false;
+        this.console.log(`lifecycle: stop() complete — running=${this.running}, on=${this.on}`);
     }
 
     async turnOn()  {
