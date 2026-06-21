@@ -82,6 +82,7 @@ type HttpResponse            = any;
 type Setting                 = any;
 type Settings                = any;
 type SettingValue            = any;
+type StartStop               = any;
 
 // ---------------------------------------------------------------------------
 // Cross-reload shutdown cleaners.
@@ -96,7 +97,12 @@ type SettingValue            = any;
 // One unified array keeps the cleanup semantics simple: register the closure
 // that knows how to release the resource (clearInterval / abort.abort() /
 // reg.removeListener()), and we walk and call them on the next reload.
-function registerShutdownCleaners(console: any) {
+// Drain and run every registered cleanup, leaving the array empty so the
+// next phase can start populating it again. Called from two paths:
+//   - script load: tears down resources left over from a previous Provider
+//     instance the Scrypted sandbox didn't release
+//   - StartStop.stop(): explicit user-driven cleanup via the Scripts UI
+function drainShutdownCleaners(console: any, reason: string) {
     const G = globalThis as any;
     if (Array.isArray(G.__viewportShutdownCleaners) && G.__viewportShutdownCleaners.length > 0) {
         // Snapshot + reset BEFORE walking — some cleanups (stream
@@ -104,7 +110,7 @@ function registerShutdownCleaners(console: any) {
         // the array, which would skip elements if we iterated directly.
         const prior = G.__viewportShutdownCleaners.slice();
         G.__viewportShutdownCleaners = [];
-        console.log(`tearing down ${prior.length} resources from previous script load`);
+        console.log(`${reason}: tearing down ${prior.length} resources`);
         for (const cleanup of prior) {
             try { cleanup(); } catch (e) {
                 try { console.warn("shutdown cleanup failed:", (e as Error).message); } catch {}
@@ -366,7 +372,7 @@ class Viewport extends ScryptedDeviceBase implements Settings {
 // ============================================================================
 
 class ScryptedViewportProvider extends ScryptedDeviceBase
-    implements DeviceProvider, DeviceCreator, HttpRequestHandler, Settings {
+    implements DeviceProvider, DeviceCreator, HttpRequestHandler, Settings, StartStop {
 
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister[]>(); // nativeId -> all event listeners for this viewport (camera + child devices)
@@ -379,7 +385,46 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     constructor(nativeId?: string) {
         super(nativeId);
+        // Auto-start on script load. StartStop.start() is idempotent — if the
+        // user later clicks STOP in the Scripts UI, .stop() drains everything
+        // and start() doesn't re-fire until they click START. Across a
+        // script re-paste the constructor runs again, .start() drains any
+        // prior load's resources first and re-bootstraps cleanly.
         this.start().catch(e => this.console.error("start failed", e));
+    }
+
+    // ------------------------------------------------------------------------
+    // StartStop — public lifecycle controls exposed to the Scrypted UI
+    // ------------------------------------------------------------------------
+    //
+    // Scrypted renders this device's "Status and Controls" panel from the
+    // StartStop interface: `running` drives the displayed status and the
+    // STOP / START buttons call .stop() / .start() respectively.
+    //
+    // Semantics:
+    //   start():  drain any leftover resources, then bootstrap. Idempotent
+    //             (no-op if already running). Auto-called from the
+    //             constructor on script load.
+    //   stop():   drain every resource (streams, listeners, intervals) the
+    //             provider holds. No-op if already stopped.
+    //
+    // The "Unknown" status seen before this commit was Scrypted's fallback
+    // for a device that exposes no lifecycle interface. With StartStop in
+    // place the UI shows Running / Stopped accurately.
+
+    async start() {
+        if (this.running) return;
+        await this.bootstrap();
+        this.running = true;
+    }
+
+    async stop() {
+        if (!this.running) return;
+        drainShutdownCleaners(this.console, "stop");
+        this.viewports.clear();
+        this.listeners.clear();
+        this.streams.clear();
+        this.running = false;
     }
 
     // ------------------------------------------------------------------------
@@ -395,7 +440,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
 
-    private async start() {
+    private async bootstrap() {
         // endpointManager.getInsecurePublicLocalEndpoint() takes a nativeId
         // (string) — passing this.id (numeric Scrypted DB ID) throws
         // "invalid nativeId N". this.nativeId is the right key, and an
@@ -451,7 +496,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // down via the closure that knows how (clearInterval / abort /
         // removeListener). The new load then starts with an empty
         // resource set.
-        registerShutdownCleaners(this.console);
+        drainShutdownCleaners(this.console, "start");
         const reregisterHandle = setInterval(() => {
             for (const v of this.viewports.values()) {
                 this.registerViewport(v).catch(() => {});
