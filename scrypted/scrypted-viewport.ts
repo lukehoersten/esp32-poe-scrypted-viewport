@@ -83,6 +83,43 @@ type Setting                 = any;
 type Settings                = any;
 type SettingValue            = any;
 
+// ---------------------------------------------------------------------------
+// Cross-reload shutdown cleaners.
+//
+// Scrypted's Scripts sandbox doesn't release prior-load resources before
+// constructing a new instance, so anything long-lived (setInterval, sockets,
+// ffmpeg children, AbortControllers, camera event registrations) leaks across
+// every re-paste of the script unless we explicitly tear it down. Every such
+// resource pushes a cleanup closure here; the constructor drains the list at
+// the very start of `start()` so the new load begins with empty state.
+//
+// One unified array keeps the cleanup semantics simple: register the closure
+// that knows how to release the resource (clearInterval / abort.abort() /
+// reg.removeListener()), and we walk and call them on the next reload.
+function registerShutdownCleaners(console: any) {
+    const G = globalThis as any;
+    if (Array.isArray(G.__viewportShutdownCleaners) && G.__viewportShutdownCleaners.length > 0) {
+        // Snapshot + reset BEFORE walking — some cleanups (stream
+        // aborts) fire abort listeners that splice themselves out of
+        // the array, which would skip elements if we iterated directly.
+        const prior = G.__viewportShutdownCleaners.slice();
+        G.__viewportShutdownCleaners = [];
+        console.log(`tearing down ${prior.length} resources from previous script load`);
+        for (const cleanup of prior) {
+            try { cleanup(); } catch (e) {
+                try { console.warn("shutdown cleanup failed:", (e as Error).message); } catch {}
+            }
+        }
+    } else {
+        G.__viewportShutdownCleaners = [];
+    }
+}
+function pushShutdownCleaner(cleanup: () => void) {
+    const G = globalThis as any;
+    if (!Array.isArray(G.__viewportShutdownCleaners)) G.__viewportShutdownCleaners = [];
+    G.__viewportShutdownCleaners.push(cleanup);
+}
+
 // Tuning constants.
 // Stream rate is paced by camera + TCP backpressure; no app-level fps
 // cap, no per-frame pipelining semaphore.
@@ -392,36 +429,35 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             catch (e) { this.console.warn(`load child ${nativeId} failed:`, (e as Error).message); }
         }
 
-        // Periodic re-register so a device that rebooted or got a new IP
-        // re-syncs without manual intervention.
+        // Unified script-reload cleanup.
         //
-        // Important: Scrypted's Scripts sandbox does NOT garbage-collect
-        // setInterval handles when the script is re-pasted/reloaded.
-        // Without the globalThis cancel below, every re-paste leaves an
-        // orphan interval still running against the previous Provider
-        // instance. After N reloads the user gets N rapid-fire
-        // "registered ..." log lines every 5 minutes.
-        const G = globalThis as any;
-        if (G.__viewportRegisterInterval) {
-            try { clearInterval(G.__viewportRegisterInterval); } catch {}
-        }
-        // Tear down any camera event listeners left over from a
-        // previous script load (same Scripts-sandbox lifecycle gap as
-        // the setInterval handle). Without this every re-paste stacks
-        // an extra callback on the camera, producing duplicate stream
-        // starts + concurrent snapshot transforms that race for the
-        // firmware decoder lock and visibly degrade quality.
-        if (Array.isArray(G.__viewportListenerCleaners)) {
-            for (const remove of G.__viewportListenerCleaners) {
-                try { remove(); } catch {}
-            }
-        }
-        G.__viewportListenerCleaners = [];
-        G.__viewportRegisterInterval = setInterval(() => {
+        // Scrypted's Scripts sandbox does NOT release a previous load's
+        // resources before constructing a new instance. setInterval
+        // handles, TCP sockets, ffmpeg children, AbortControllers, and
+        // camera event registrations all survive a script re-paste and
+        // accumulate over time. Observable symptoms:
+        //   - duplicate "registered ..." log lines every 5 minutes
+        //     after N reloads
+        //   - duplicate stream-start log lines (and the racing
+        //     pushSnapshots that degrade panel image quality) because
+        //     the old instance's event listener is still subscribed
+        //   - orphaned ffmpeg processes + half-open TCP sockets to the
+        //     firmware after a reload during an active stream
+        //
+        // We solve all of these uniformly: every long-lived resource
+        // pushes a cleanup closure onto a single globalThis-anchored
+        // array. The next constructor drains that array first, which
+        // walks every resource the previous load created and tears it
+        // down via the closure that knows how (clearInterval / abort /
+        // removeListener). The new load then starts with an empty
+        // resource set.
+        registerShutdownCleaners(this.console);
+        const reregisterHandle = setInterval(() => {
             for (const v of this.viewports.values()) {
                 this.registerViewport(v).catch(() => {});
             }
         }, REREGISTER_INTERVAL_MS);
+        pushShutdownCleaner(() => clearInterval(reregisterHandle));
     }
 
     // ------------------------------------------------------------------------
@@ -605,8 +641,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             if (d?.providerId === cam.id) targets.push(d);
         }
 
-        const G = globalThis as any;
-        if (!G.__viewportListenerCleaners) G.__viewportListenerCleaners = [];
         const regs: EventListenerRegister[] = [];
         const targetNames: string[] = [];
         for (const t of targets) {
@@ -615,11 +649,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             });
             regs.push(reg);
             targetNames.push(t.name || t.id);
-            // Track on globalThis so script reload can remove every
-            // listener from the camera/child plugins. Without that,
-            // every re-paste leaves dead callbacks subscribed and each
-            // event triggers handleCameraEvent N times for N reloads.
-            G.__viewportListenerCleaners.push(() => { try { reg.removeListener(); } catch {} });
+            // Register for cross-reload cleanup so a re-paste removes
+            // every camera/child listener. Without this each re-paste
+            // stacks an extra callback per event source and each event
+            // triggers handleCameraEvent N times for N reloads.
+            pushShutdownCleaner(() => { try { reg.removeListener(); } catch {} });
         }
         this.listeners.set(v.nativeId!, regs);
         this.console.log(`viewport "${tag}": subscribed to [${targetNames.join(", ")}]`);
@@ -847,6 +881,25 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             "ffmpeg";
 
         const abort = new AbortController();
+        // Register with the cross-reload cleanup so a script re-paste
+        // during an active stream tears down ffmpeg + the firmware
+        // socket + the stats interval via the abort listeners below
+        // — instead of orphaning them against a stale Provider.
+        const releaseShutdownCleanup = (() => {
+            const cleanup = () => { try { abort.abort(); } catch {} };
+            pushShutdownCleaner(cleanup);
+            // Once the stream ends normally (timeout / stopStream), drop
+            // its cleanup so it doesn't run later against a long-dead
+            // AbortController. We splice rather than mark-dead so the
+            // cleanup list stays compact across many stream cycles.
+            return () => {
+                const G = globalThis as any;
+                if (!Array.isArray(G.__viewportShutdownCleaners)) return;
+                const i = G.__viewportShutdownCleaners.indexOf(cleanup);
+                if (i >= 0) G.__viewportShutdownCleaners.splice(i, 1);
+            };
+        })();
+        abort.signal.addEventListener("abort", releaseShutdownCleanup);
 
         // ── DATA PLANE: raw TCP socket to firmware port 81 ────────────
         // Replaces per-frame HTTP POSTs. One socket per stream session.
