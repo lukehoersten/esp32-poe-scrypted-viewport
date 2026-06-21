@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
@@ -24,41 +25,108 @@ static const char *TAG = "stream";
 // MTU. On hardwired Gigabit LAN with a single managed switch, fabric
 // loss is < 1e-9/packet, so per-frame corruption is ≈1.2e-7 (~1 bad
 // frame every 95 days at 30 fps). UDP's theoretical wins don't apply
-// to this deployment:
-//
-//   - Nagle/SACK/window-scaling overhead: socket.write p50 < 1ms in
-//     steady state (see Scrypted-side log). TCP_NODELAY is on. No
-//     per-frame ACK round-trip exists in either direction.
-//   - "Latest wins" semantics: implemented for free above via the
-//     FIONREAD check below. UDP would have to reassemble fragments
-//     first before deciding to skip, defeating the latency win.
-//
-// UDP's costs would be real: 200-400 LOC of app-layer fragmentation
-// + reassembly + partial-frame timeout, loss of `nc localhost 81 |
-// xxd` for debug, and the FIONREAD-skip trick stops working because
-// UDP recvmsg counts fragments not whole messages.
-//
-// Revisit only if a Wi-Fi-only variant ships (loss rate 1e-3..1e-5
-// would make TCP retransmits painful enough to consider the rewrite).
+// to this deployment.
 
 #define HEADER_V0_BYTES 8    // legacy: jpeg_len + seq
 #define HEADER_V1_BYTES 16   // current: magic + jpeg_len + seq + event_us_low
-#define HEADER_BYTES    HEADER_V0_BYTES   // used for FIONREAD threshold —
+#define HEADER_BYTES    HEADER_V0_BYTES   // FIONREAD threshold for
                                           // "another header may already
-                                          // be queued" check needs only
-                                          // the smaller of the two.
+                                          // be queued" check.
 #define MAGIC_V1        0x56505254u   // "VPRT" big-endian
+#define NUM_BODY_BUFS   3             // ping-pong ring: 1 recv + 1 pending
+                                      // + 1 decode → recv never blocks.
+
+// ─── Architecture ────────────────────────────────────────────────────────────
+//
+// Two FreeRTOS tasks share the body data plane through a 3-buffer ring:
+//
+//   recv-task:  owns the TCP socket. Reads header + body into s_bufs[recv_idx].
+//               When a body completes, atomically installs it as the latest
+//               pending frame and grabs a fresh buffer for the next recv.
+//               If pending already held a frame (decode is slow), the older
+//               pending is overwritten in place — receiver-side skip-oldest,
+//               mirror of what the Scrypted plugin does at the source.
+//
+//   decode-task: waits on a binary semaphore. When signaled, claims the
+//                pending frame, then decodes + paints without holding any
+//                shared lock. Frees its prior buffer only by overwriting
+//                s_decode_idx on the next claim — so recv-task always sees
+//                an accurate "buffer in use by decode" via the indices.
+//
+// Invariant: {s_recv_idx, s_pending_idx, s_decode_idx} are pairwise distinct
+// modulo the -1 sentinel for "unused." With 3 buffers and at most 3 roles,
+// pick_free() always finds a buffer outside the used set.
+//
+// This removes the recv-blocking-on-decode coupling that made the older
+// 5760-byte window the only working window: even with the kernel buffer
+// near-empty during decode+paint (6ms), recv-task is concurrently draining
+// the socket and the sender never sees window-zero advertised. Window-size
+// tuning becomes meaningful again (separate iteration).
 
 static uint16_t s_port;
 
-// Last-window stats snapshot, written by handle_client at window roll
-// and read by /state via stream_server_snapshot_stats. portMUX keeps
-// the writer atomic against a concurrent reader on the other core.
+// Last-window stats snapshot, written by decode-task at window roll and
+// read by /state via stream_server_snapshot_stats.
 static portMUX_TYPE          s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 static stream_server_stats_t s_stats;
 
+// 3-buffer ring + 1-slot handoff. All index manipulation under s_slot_mux.
+static uint8_t          *s_bufs[NUM_BODY_BUFS];
+static size_t            s_buf_cap;
+static int               s_recv_idx    = 0;
+static int               s_decode_idx  = -1;   // -1 = decoder hasn't claimed yet
+static int               s_pending_idx = -1;   // -1 = no frame waiting
+static portMUX_TYPE      s_slot_mux    = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t s_decode_signal;      // binary semaphore recv → decode
+static uint32_t          s_recv_dropped_oldest_window = 0;   // reset on window roll
+static uint32_t          s_conn_id     = 0;                  // bumped on each new client
+
+// Metadata for the latest pending frame. Written by recv-task before
+// signaling; read by decode-task after taking the signal.
+typedef struct {
+    uint32_t jpeg_len;
+    uint32_t seq;
+    uint32_t event_us_low;
+    uint32_t conn_id;
+    // recv diagnostics captured at recv time (aggregated by decode-task
+    // into the windowed stats since decode-task owns the window).
+    uint32_t queued_at_body;
+    uint32_t recv_calls;
+    uint32_t recv_chunk_min;
+    uint32_t recv_chunk_max;
+    int64_t  recv_us;           // body-recv duration on the recv-task side
+} slot_meta_t;
+static slot_meta_t s_pending_meta;
+
+// Pick a buffer index not currently used by any role. Caller holds s_slot_mux.
+// With NUM_BODY_BUFS=3 and at most 2 indices "in use" (recv + decode, since
+// pending was just consumed or just installed), there's always exactly one
+// free buffer.
+static int pick_free_locked(int avoid_a, int avoid_b)
+{
+    for (int i = 0; i < NUM_BODY_BUFS; i++) {
+        if (i != avoid_a && i != avoid_b) return i;
+    }
+    return -1;   // unreachable with NUM_BODY_BUFS >= 3
+}
+
+static esp_err_t alloc_body_bufs(void)
+{
+    for (int i = 0; i < NUM_BODY_BUFS; i++) {
+        size_t cap = 0;
+        s_bufs[i] = jpeg_decoder_alloc_input_buffer(&cap);
+        if (!s_bufs[i]) {
+            ESP_LOGE(TAG, "body buf %d alloc failed", i);
+            return ESP_ERR_NO_MEM;
+        }
+        if (i == 0) s_buf_cap = cap;
+    }
+    ESP_LOGI(TAG, "stream body ring: %d × %u bytes PSRAM", NUM_BODY_BUFS, (unsigned)s_buf_cap);
+    return ESP_OK;
+}
+
 // recv() in a loop until n bytes are read or the connection drops.
-// Returns ESP_OK on full read, ESP_FAIL on EOF or socket error.
+// Used for short fixed-size reads (header bytes).
 static esp_err_t read_n(int fd, void *buf, size_t n)
 {
     uint8_t *p = (uint8_t *)buf;
@@ -71,36 +139,67 @@ static esp_err_t read_n(int fd, void *buf, size_t n)
     return ESP_OK;
 }
 
-// Read and discard exactly n bytes — used to stay framed when we
-// have to skip a frame (decoder busy, asleep, etc) without dropping
-// the connection.
-static esp_err_t drain_n(int fd, size_t n)
+// ───────────────────────── recv-task ─────────────────────────────────────────
+
+// Per-frame body read with instrumentation: count recv() syscalls and track
+// chunk size distribution. Returns ESP_OK on full body; ESP_FAIL on EOF/error.
+static esp_err_t read_body_instrumented(int fd, void *buf, size_t n,
+                                        uint32_t *out_calls,
+                                        uint32_t *out_chunk_min,
+                                        uint32_t *out_chunk_max)
 {
-    uint8_t  scratch[256];
-    while (n > 0) {
-        size_t  want = n > sizeof(scratch) ? sizeof(scratch) : n;
-        ssize_t r    = recv(fd, scratch, want, 0);
+    uint8_t *p = (uint8_t *)buf;
+    size_t   got = 0;
+    *out_calls     = 0;
+    *out_chunk_min = UINT32_MAX;
+    *out_chunk_max = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, p + got, n - got, 0);
         if (r <= 0) return ESP_FAIL;
-        n -= (size_t)r;
+        uint32_t rb = (uint32_t)r;
+        (*out_calls)++;
+        if (rb < *out_chunk_min) *out_chunk_min = rb;
+        if (rb > *out_chunk_max) *out_chunk_max = rb;
+        got += (size_t)r;
     }
     return ESP_OK;
 }
 
-// One client owns the decoder for the lifetime of the connection.
-// Loops: header → body → (decode + paint OR skip) → repeat.
-static void handle_client(int fd, const char *peer)
+// Install a just-received frame into the pending slot and rotate the recv
+// target to a fresh buffer. If pending already held a frame, the older one
+// is overwritten in place (drop-oldest at the receiver).
+static void publish_frame(const slot_meta_t *meta)
 {
-    // NODELAY on the accepted socket so our outbound (response-less)
-    // ACKs flow immediately. There's no app-layer "response" in this
-    // protocol so we have to make sure TCP doesn't withhold ACKs
-    // waiting to piggyback on data we'll never send.
+    portENTER_CRITICAL(&s_slot_mux);
+    if (s_pending_idx >= 0) {
+        // Drop-oldest: swap recv_idx with pending_idx so the just-filled
+        // buffer becomes the new pending; the old pending (overwritten)
+        // becomes the next recv target.
+        int tmp = s_pending_idx;
+        s_pending_idx = s_recv_idx;
+        s_recv_idx    = tmp;
+        s_recv_dropped_oldest_window++;
+    } else {
+        // No prior pending: install just-filled as pending and pick a
+        // free buffer for the next recv. Free = the one not in use by
+        // recv or decode.
+        s_pending_idx = s_recv_idx;
+        s_recv_idx    = pick_free_locked(s_pending_idx, s_decode_idx);
+    }
+    s_pending_meta = *meta;
+    portEXIT_CRITICAL(&s_slot_mux);
+    xSemaphoreGive(s_decode_signal);
+}
+
+static void handle_client_recv(int fd, const char *peer)
+{
+    // NODELAY on the accepted socket so our outbound (response-less) ACKs
+    // flow immediately. There's no app-layer "response" in this protocol
+    // so we must prevent TCP withholding ACKs to piggyback.
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     // One-shot probe of the kernel recv buffer this connection got.
-    // Stash in s_stats and log so we can confirm sdkconfig values
-    // actually reached the build — TCP_WND_DEFAULT discrepancies are
-    // invisible from source alone.
     int       so_rcvbuf     = 0;
     socklen_t so_rcvbuf_len = sizeof(so_rcvbuf);
     if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &so_rcvbuf, &so_rcvbuf_len) == 0) {
@@ -110,30 +209,14 @@ static void handle_client(int fd, const char *peer)
         portEXIT_CRITICAL(&s_stats_mux);
     }
 
-    // Sequence counter is per-connection — Scrypted resets to 1 on
-    // each new socket so we follow.
-    uint32_t last_painted_seq = 0;
-    uint64_t frames_decoded   = 0;
-    int64_t  t_window_start   = esp_timer_get_time();
-    uint64_t bytes_in_window  = 0;
-    int64_t  t_prev_paint_done = 0;        // for idle-gap measurement
-
-    // Per-window min/max accumulators (microseconds).
-    int64_t  recv_min = INT64_MAX, recv_max = 0, recv_sum = 0;
-    int64_t  dec_min  = INT64_MAX, dec_max  = 0, dec_sum  = 0;
-    int64_t  pnt_min  = INT64_MAX, pnt_max  = 0, pnt_sum  = 0;
-    int64_t  idle_min = INT64_MAX, idle_max = 0, idle_sum = 0;
-    int64_t  lock_min = INT64_MAX, lock_max = 0, lock_sum = 0;
-    // Recv-throughput diagnostics (see stream_server.h for meaning).
-    uint32_t queued_min     = UINT32_MAX, queued_max     = 0; uint64_t queued_sum     = 0;
-    uint32_t calls_min      = UINT32_MAX, calls_max      = 0; uint64_t calls_sum      = 0;
-    uint32_t chunk_min      = UINT32_MAX, chunk_max      = 0; uint64_t chunk_total_calls = 0;
-    uint64_t window_samples = 0;
-    uint32_t last_event_us_low = 0;   // captured from v1 headers
+    // Bump the connection id so decode-task can reset its per-connection
+    // seq tracking when frames from this conn start arriving.
+    uint32_t conn_id;
+    portENTER_CRITICAL(&s_slot_mux);
+    conn_id = ++s_conn_id;
+    portEXIT_CRITICAL(&s_slot_mux);
 
     while (1) {
-        // Sniff the first 4 bytes — they're either the v1 magic
-        // "VPRT" or the v0 jpeg_len field. Decide once per frame.
         uint8_t first4[4];
         if (read_n(fd, first4, 4) != ESP_OK) {
             ESP_LOGI(TAG, "client %s disconnected (header read)", peer);
@@ -144,7 +227,6 @@ static void handle_client(int fd, const char *peer)
 
         uint32_t jpeg_len, seq, event_us_low;
         if (first_word == MAGIC_V1) {
-            // v1: 16-byte header total, 12 more bytes after the magic.
             uint8_t rest[HEADER_V1_BYTES - 4];
             if (read_n(fd, rest, sizeof(rest)) != ESP_OK) {
                 ESP_LOGI(TAG, "client %s disconnected (v1 header read)", peer);
@@ -157,8 +239,6 @@ static void handle_client(int fd, const char *peer)
             event_us_low = ((uint32_t)rest[8]  << 24) | ((uint32_t)rest[9]  << 16)
                          | ((uint32_t)rest[10] << 8)  |  (uint32_t)rest[11];
         } else {
-            // v0: 8-byte header, 4 more bytes after the first word.
-            // first_word is jpeg_len; read seq.
             uint8_t rest[HEADER_V0_BYTES - 4];
             if (read_n(fd, rest, sizeof(rest)) != ESP_OK) {
                 ESP_LOGI(TAG, "client %s disconnected (v0 header read)", peer);
@@ -167,261 +247,50 @@ static void handle_client(int fd, const char *peer)
             jpeg_len     = first_word;
             seq          = ((uint32_t)rest[0] << 24) | ((uint32_t)rest[1] << 16)
                          | ((uint32_t)rest[2] << 8)  |  (uint32_t)rest[3];
-            event_us_low = 0;   // legacy clients don't supply it
+            event_us_low = 0;
         }
 
-        if (jpeg_len == 0 || jpeg_len > JPEG_DECODER_MAX_INPUT_BYTES) {
+        if (jpeg_len == 0 || jpeg_len > s_buf_cap) {
             ESP_LOGW(TAG, "bad frame length %u from %s — closing connection",
                      (unsigned)jpeg_len, peer);
             return;
         }
 
-        int64_t t_entry = esp_timer_get_time();
-        // Idle gap: time between the previous paint completing and
-        // this header landing. Large idle = ffmpeg/network is the
-        // bottleneck; near-zero idle = we're the bottleneck, source
-        // is queued up waiting.
-        int64_t idle_us = t_prev_paint_done ? (t_entry - t_prev_paint_done) : 0;
-
-        if (!jpeg_decoder_try_lock(2000)) {
-            ESP_LOGW(TAG, "decoder busy 2s — skipping seq %u", (unsigned)seq);
-            if (drain_n(fd, jpeg_len) != ESP_OK) return;
-            continue;
-        }
-        int64_t t_lock_done = esp_timer_get_time();
-
-        // Sample how much of the body the kernel has already absorbed.
-        // Large value (close to jpeg_len) = wire delivered the whole
-        // frame during the previous decode+paint; we're decode/paint-
-        // bound. Small value = wire is throttled (window/buffer too
-        // small to absorb a full frame in our paint window).
+        // Sample how much of the body the kernel has already absorbed
+        // before we drain it. Close to jpeg_len → wire delivered the
+        // whole frame during the previous decode+paint (we're decode-
+        // bound). Small → wire is slow (window or buffer too small).
         int queued_at_body = 0;
         (void)ioctl(fd, FIONREAD, &queued_at_body);
 
-        uint8_t *in = jpeg_decoder_input_buffer();
-        // Instrumented body read. Counts recv() syscalls and tracks
-        // min/max chunk size to characterize how the wire delivered
-        // this frame.
-        uint32_t frame_calls       = 0;
-        uint32_t frame_chunk_min   = UINT32_MAX;
-        uint32_t frame_chunk_max   = 0;
-        {
-            size_t got = 0;
-            while (got < jpeg_len) {
-                ssize_t r = recv(fd, in + got, jpeg_len - got, 0);
-                if (r <= 0) {
-                    jpeg_decoder_unlock();
-                    ESP_LOGI(TAG, "client %s disconnected (body read)", peer);
-                    return;
-                }
-                uint32_t rb = (uint32_t)r;
-                frame_calls++;
-                if (rb < frame_chunk_min) frame_chunk_min = rb;
-                if (rb > frame_chunk_max) frame_chunk_max = rb;
-                got += (size_t)r;
-            }
+        // Read into the current recv buffer. recv-task is the only writer
+        // of s_recv_idx so we can read it without the mutex.
+        uint8_t *body = s_bufs[s_recv_idx];
+        int64_t  t0   = esp_timer_get_time();
+        uint32_t calls = 0, chunk_min = 0, chunk_max = 0;
+        if (read_body_instrumented(fd, body, jpeg_len,
+                                   &calls, &chunk_min, &chunk_max) != ESP_OK) {
+            ESP_LOGI(TAG, "client %s disconnected (body read)", peer);
+            return;
         }
-        int64_t t_recv = esp_timer_get_time();
-        bytes_in_window += jpeg_len;
+        int64_t recv_us = esp_timer_get_time() - t0;
 
-        // While asleep we still drain frames (to stay in sync) but
-        // skip the decode + paint. The state machine will wake on a
-        // POST /state {wake} from the control plane.
-        if (state_machine_current() != VIEWPORT_STATE_AWAKE) {
-            jpeg_decoder_unlock();
-            continue;
-        }
-
-        // Stale-seq guard. Each socket starts at 0 so the first
-        // frame (seq=1) always paints.
-        if (seq != 0 && seq <= last_painted_seq) {
-            jpeg_decoder_unlock();
-            continue;
-        }
-
-        // If the kernel already has another header queued, this frame
-        // is no longer the freshest; skip decode + paint, loop back to
-        // the head-of-queue header.
-        int queued = 0;
-        if (ioctl(fd, FIONREAD, &queued) == 0 && queued >= HEADER_BYTES) {
-            jpeg_decoder_unlock();
-            continue;
-        }
-
-        size_t   back_size = 0;
-        void    *back      = display_back_buffer(&back_size);
-        uint16_t w = 0, h = 0;
-        if (jpeg_decoder_decode(jpeg_len, back, back_size, &w, &h) != ESP_OK) {
-            viewport_state_lock();
-            viewport_state_get()->decode_errors++;
-            viewport_state_unlock();
-            jpeg_decoder_unlock();
-            continue;
-        }
-        if (w != VIEWPORT_PANEL_WIDTH || h != VIEWPORT_PANEL_HEIGHT) {
-            viewport_state_lock();
-            viewport_state_get()->decode_errors++;
-            viewport_state_unlock();
-            jpeg_decoder_unlock();
-            ESP_LOGW(TAG, "dim mismatch seq=%u: expected %ux%u got %ux%u",
-                     (unsigned)seq, VIEWPORT_PANEL_WIDTH, VIEWPORT_PANEL_HEIGHT, w, h);
-            continue;
-        }
-        int64_t t_decode = esp_timer_get_time();
-        if (display_flip_back_buffer() != ESP_OK) {
-            jpeg_decoder_unlock();
-            continue;
-        }
-        int64_t t_paint = esp_timer_get_time();
-
-        viewport_state_lock();
-        viewport_state_t *st = viewport_state_get();
-        st->frames_received++;
-        st->last_frame_us = esp_timer_get_time();
-        viewport_state_unlock();
-
-        last_painted_seq = seq;
-        if (event_us_low != 0) {
-            last_event_us_low = event_us_low;
-            // Live update: /state needs this fresh on every painted
-            // frame so the script's g2g reflects the actual age of
-            // the currently-displayed frame, not the age at last
-            // window roll (which can be up to ~1.5s stale). The
-            // other window stats stay at roll cadence — they
-            // genuinely need a full window to compute.
-            portENTER_CRITICAL(&s_stats_mux);
-            s_stats.last_paint_event_us_low = event_us_low;
-            portEXIT_CRITICAL(&s_stats_mux);
-        }
-        jpeg_decoder_unlock();
-        state_machine_frame_painted();
-        frames_decoded++;
-
-        // Stage timings for this frame, in microseconds.
-        int64_t lock_us = t_lock_done - t_entry;
-        int64_t recv_us = t_recv      - t_lock_done;
-        int64_t dec_us  = t_decode    - t_recv;
-        int64_t pnt_us  = t_paint     - t_decode;
-
-        if (lock_us < lock_min) lock_min = lock_us;
-        if (lock_us > lock_max) lock_max = lock_us;
-        lock_sum += lock_us;
-        if (recv_us < recv_min) recv_min = recv_us;
-        if (recv_us > recv_max) recv_max = recv_us;
-        recv_sum += recv_us;
-        if (dec_us  < dec_min)  dec_min  = dec_us;
-        if (dec_us  > dec_max)  dec_max  = dec_us;
-        dec_sum  += dec_us;
-        if (pnt_us  < pnt_min)  pnt_min  = pnt_us;
-        if (pnt_us  > pnt_max)  pnt_max  = pnt_us;
-        pnt_sum  += pnt_us;
-        if (idle_us > 0) {
-            if (idle_us < idle_min) idle_min = idle_us;
-            if (idle_us > idle_max) idle_max = idle_us;
-            idle_sum += idle_us;
-        }
-        // Recv-throughput diagnostics: aggregate this frame's samples.
-        if ((uint32_t)queued_at_body < queued_min) queued_min = (uint32_t)queued_at_body;
-        if ((uint32_t)queued_at_body > queued_max) queued_max = (uint32_t)queued_at_body;
-        queued_sum += (uint32_t)queued_at_body;
-        if (frame_calls < calls_min) calls_min = frame_calls;
-        if (frame_calls > calls_max) calls_max = frame_calls;
-        calls_sum += frame_calls;
-        if (frame_chunk_min != UINT32_MAX && frame_chunk_min < chunk_min) chunk_min = frame_chunk_min;
-        if (frame_chunk_max > chunk_max) chunk_max = frame_chunk_max;
-        chunk_total_calls += frame_calls;
-        window_samples++;
-        t_prev_paint_done = t_paint;
-
-        // Every 30 frames log a windowed min/avg/max breakdown +
-        // sustained throughput. Idle = gap between previous paint
-        // and next header arriving (= upstream slack). lock = mutex
-        // acquire (should be ~0 with single client). recv = body
-        // bytes off the wire. dec = HW JPEG. paint = backbuffer flip.
-        if (frames_decoded % 30 == 0 && window_samples > 0) {
-            int64_t now      = esp_timer_get_time();
-            double  win_s    = (now - t_window_start) / 1.0e6;
-            double  mb_per_s = (win_s > 0)
-                ? ((double)bytes_in_window / win_s) / (1024.0 * 1024.0) : 0.0;
-            double  fps      = (win_s > 0) ? (double)window_samples / win_s : 0.0;
-            uint32_t queued_avg = (uint32_t)(queued_sum / window_samples);
-            uint32_t calls_avg  = (uint32_t)(calls_sum  / window_samples);
-            uint32_t chunk_avg  = chunk_total_calls > 0
-                ? (uint32_t)(bytes_in_window / chunk_total_calls) : 0;
-            ESP_LOGI(TAG,
-                "%llu frames over %.1fs: %.1ffps %.2fMB/s avg-jpeg=%uKB | "
-                "lock min/avg/max=%lld/%lld/%lldus | "
-                "recv min/avg/max=%lld/%lld/%lldus | "
-                "dec  min/avg/max=%lld/%lld/%lldus | "
-                "paint min/avg/max=%lld/%lld/%lldus | "
-                "idle min/avg/max=%lld/%lld/%lldus | "
-                "queued min/avg/max=%u/%u/%uB | "
-                "recv_calls min/avg/max=%u/%u/%u | "
-                "recv_chunk min/avg/max=%u/%u/%uB",
-                (unsigned long long)window_samples, win_s, fps, mb_per_s,
-                (unsigned)((bytes_in_window / window_samples) / 1024),
-                (long long)lock_min, (long long)(lock_sum / window_samples), (long long)lock_max,
-                (long long)recv_min, (long long)(recv_sum / window_samples), (long long)recv_max,
-                (long long)dec_min,  (long long)(dec_sum  / window_samples), (long long)dec_max,
-                (long long)pnt_min,  (long long)(pnt_sum  / window_samples), (long long)pnt_max,
-                (long long)(idle_min == INT64_MAX ? 0 : idle_min),
-                (long long)(idle_sum  / window_samples),
-                (long long)idle_max,
-                (unsigned)(queued_min == UINT32_MAX ? 0 : queued_min), (unsigned)queued_avg, (unsigned)queued_max,
-                (unsigned)(calls_min  == UINT32_MAX ? 0 : calls_min),  (unsigned)calls_avg,  (unsigned)calls_max,
-                (unsigned)(chunk_min  == UINT32_MAX ? 0 : chunk_min),  (unsigned)chunk_avg,  (unsigned)chunk_max);
-
-            // Publish the just-closed window so /state can expose it.
-            // Skipped under portENTER_CRITICAL — handful of integer
-            // moves, completes in single-digit µs.
-            stream_server_stats_t snap = {
-                .frames        = window_samples,
-                .bytes         = bytes_in_window,
-                .window_us     = (uint64_t)(now - t_window_start),
-                .window_end_us = (uint64_t)now,
-                .recv_min_us   = (uint32_t)recv_min,
-                .recv_avg_us   = (uint32_t)(recv_sum / window_samples),
-                .recv_max_us   = (uint32_t)recv_max,
-                .dec_min_us    = (uint32_t)dec_min,
-                .dec_avg_us    = (uint32_t)(dec_sum  / window_samples),
-                .dec_max_us    = (uint32_t)dec_max,
-                .pnt_min_us    = (uint32_t)pnt_min,
-                .pnt_avg_us    = (uint32_t)(pnt_sum  / window_samples),
-                .pnt_max_us    = (uint32_t)pnt_max,
-                .idle_min_us   = (uint32_t)(idle_min == INT64_MAX ? 0 : idle_min),
-                .idle_avg_us   = (uint32_t)(idle_sum / window_samples),
-                .idle_max_us   = (uint32_t)idle_max,
-                .queued_min      = (queued_min == UINT32_MAX ? 0 : queued_min),
-                .queued_avg      = queued_avg,
-                .queued_max      = queued_max,
-                .recv_calls_min  = (calls_min  == UINT32_MAX ? 0 : calls_min),
-                .recv_calls_avg  = calls_avg,
-                .recv_calls_max  = calls_max,
-                .recv_chunk_min  = (chunk_min  == UINT32_MAX ? 0 : chunk_min),
-                .recv_chunk_avg  = chunk_avg,
-                .recv_chunk_max  = chunk_max,
-                // so_rcvbuf is set at accept time; preserve across window rolls.
-                .so_rcvbuf       = s_stats.so_rcvbuf,
-                .last_paint_event_us_low = last_event_us_low,
-            };
-            portENTER_CRITICAL(&s_stats_mux);
-            s_stats = snap;
-            portEXIT_CRITICAL(&s_stats_mux);
-
-            t_window_start  = now;
-            bytes_in_window = 0;
-            recv_min = dec_min = pnt_min = idle_min = lock_min = INT64_MAX;
-            recv_max = dec_max = pnt_max = idle_max = lock_max = 0;
-            recv_sum = dec_sum = pnt_sum = idle_sum = lock_sum = 0;
-            queued_min = calls_min = chunk_min = UINT32_MAX;
-            queued_max = calls_max = chunk_max = 0;
-            queued_sum = calls_sum = chunk_total_calls = 0;
-            window_samples = 0;
-        }
+        slot_meta_t meta = {
+            .jpeg_len       = jpeg_len,
+            .seq            = seq,
+            .event_us_low   = event_us_low,
+            .conn_id        = conn_id,
+            .queued_at_body = (uint32_t)queued_at_body,
+            .recv_calls     = calls,
+            .recv_chunk_min = (chunk_min == UINT32_MAX ? 0 : chunk_min),
+            .recv_chunk_max = chunk_max,
+            .recv_us        = recv_us,
+        };
+        publish_frame(&meta);
     }
 }
 
-static void accept_task(void *arg)
+static void recv_task(void *arg)
 {
     (void)arg;
     int listen_sock = -1;
@@ -436,7 +305,6 @@ static void accept_task(void *arg)
             }
             int reuse = 1;
             setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
             struct sockaddr_in addr = {
                 .sin_family      = AF_INET,
                 .sin_addr.s_addr = htonl(INADDR_ANY),
@@ -473,17 +341,281 @@ static void accept_task(void *arg)
         ESP_LOGI(TAG, "client connected from %s:%u",
                  ip, (unsigned)ntohs(client.sin_port));
 
-        handle_client(fd, ip);
+        handle_client_recv(fd, ip);
         shutdown(fd, SHUT_RDWR);
         close(fd);
+    }
+}
+
+// ───────────────────────── decode-task ───────────────────────────────────────
+
+// Claim the latest pending frame and rotate decode's owned buffer. Caller
+// gets the buffer pointer + metadata to process. Returns false if there's
+// no pending frame (spurious signal — safe to loop and re-wait).
+static bool claim_pending(uint8_t **out_buf, slot_meta_t *out_meta)
+{
+    portENTER_CRITICAL(&s_slot_mux);
+    if (s_pending_idx < 0) {
+        portEXIT_CRITICAL(&s_slot_mux);
+        return false;
+    }
+    s_decode_idx  = s_pending_idx;   // hand-off + implicit free of prior decode_idx
+    s_pending_idx = -1;
+    *out_meta     = s_pending_meta;
+    portEXIT_CRITICAL(&s_slot_mux);
+    *out_buf = s_bufs[s_decode_idx];
+    return true;
+}
+
+static void decode_task(void *arg)
+{
+    (void)arg;
+
+    uint32_t last_painted_seq  = 0;
+    uint32_t last_conn_id      = 0;
+    uint64_t frames_decoded    = 0;
+    int64_t  t_window_start    = esp_timer_get_time();
+    uint64_t bytes_in_window   = 0;
+    int64_t  t_prev_paint_done = 0;
+    uint32_t last_event_us_low = 0;
+
+    // Per-window accumulators (microseconds).
+    int64_t  recv_min = INT64_MAX, recv_max = 0, recv_sum = 0;
+    int64_t  dec_min  = INT64_MAX, dec_max  = 0, dec_sum  = 0;
+    int64_t  pnt_min  = INT64_MAX, pnt_max  = 0, pnt_sum  = 0;
+    int64_t  idle_min = INT64_MAX, idle_max = 0, idle_sum = 0;
+    int64_t  dwait_min = INT64_MAX, dwait_max = 0, dwait_sum = 0;
+    uint32_t queued_min = UINT32_MAX, queued_max = 0; uint64_t queued_sum = 0;
+    uint32_t calls_min  = UINT32_MAX, calls_max  = 0; uint64_t calls_sum  = 0;
+    uint32_t chunk_min  = UINT32_MAX, chunk_max  = 0; uint64_t chunk_total_calls = 0;
+    uint64_t window_samples = 0;
+
+    while (1) {
+        // Wait for recv-task to publish a frame.
+        int64_t t_wait_start = esp_timer_get_time();
+        if (xSemaphoreTake(s_decode_signal, portMAX_DELAY) != pdTRUE) continue;
+        int64_t t_signal = esp_timer_get_time();
+
+        uint8_t    *body;
+        slot_meta_t meta;
+        if (!claim_pending(&body, &meta)) continue;
+
+        int64_t t_entry = esp_timer_get_time();
+
+        // Idle = previous paint completion → next frame becoming available.
+        // dwait = time spent in xSemaphoreTake (sleep waiting for signal),
+        // a strict subset of idle minus claim overhead.
+        int64_t idle_us  = t_prev_paint_done ? (t_entry - t_prev_paint_done) : 0;
+        int64_t dwait_us = t_signal - t_wait_start;
+
+        bytes_in_window += meta.jpeg_len;
+
+        // New connection? Reset stale-seq tracking. recv-task bumped
+        // conn_id at accept; if we observe a different one here, we're
+        // starting fresh and seq=1 should paint.
+        if (meta.conn_id != last_conn_id) {
+            last_conn_id     = meta.conn_id;
+            last_painted_seq = 0;
+        }
+
+        // While asleep we just discard the frame. The state-machine wake
+        // happens via POST /state from the control plane.
+        if (state_machine_current() != VIEWPORT_STATE_AWAKE) continue;
+
+        // Stale-seq guard.
+        if (meta.seq != 0 && meta.seq <= last_painted_seq) continue;
+
+        // Decoder hardware is shared with http_api.c snapshot path; mutex
+        // serializes against concurrent /frame POSTs. Stream owns its own
+        // body buffer (no contention there); only decode + paint need it.
+        if (!jpeg_decoder_try_lock(2000)) {
+            ESP_LOGW(TAG, "decoder busy 2s — skipping seq %u", (unsigned)meta.seq);
+            continue;
+        }
+
+        size_t   back_size = 0;
+        void    *back      = display_back_buffer(&back_size);
+        uint16_t w = 0, h = 0;
+        if (jpeg_decoder_decode(body, meta.jpeg_len, back, back_size, &w, &h) != ESP_OK) {
+            viewport_state_lock();
+            viewport_state_get()->decode_errors++;
+            viewport_state_unlock();
+            jpeg_decoder_unlock();
+            continue;
+        }
+        if (w != VIEWPORT_PANEL_WIDTH || h != VIEWPORT_PANEL_HEIGHT) {
+            viewport_state_lock();
+            viewport_state_get()->decode_errors++;
+            viewport_state_unlock();
+            jpeg_decoder_unlock();
+            ESP_LOGW(TAG, "dim mismatch seq=%u: expected %ux%u got %ux%u",
+                     (unsigned)meta.seq, VIEWPORT_PANEL_WIDTH, VIEWPORT_PANEL_HEIGHT, w, h);
+            continue;
+        }
+        int64_t t_decode = esp_timer_get_time();
+        if (display_flip_back_buffer() != ESP_OK) {
+            jpeg_decoder_unlock();
+            continue;
+        }
+        int64_t t_paint = esp_timer_get_time();
+
+        viewport_state_lock();
+        viewport_state_t *st = viewport_state_get();
+        st->frames_received++;
+        st->last_frame_us = esp_timer_get_time();
+        viewport_state_unlock();
+
+        last_painted_seq = meta.seq;
+        if (meta.event_us_low != 0) {
+            last_event_us_low = meta.event_us_low;
+            // Live update: /state needs this fresh on every painted frame
+            // so the script's g2g reflects the actual age of the
+            // currently-displayed frame, not the age at last window roll.
+            portENTER_CRITICAL(&s_stats_mux);
+            s_stats.last_paint_event_us_low = meta.event_us_low;
+            portEXIT_CRITICAL(&s_stats_mux);
+        }
+        jpeg_decoder_unlock();
+        state_machine_frame_painted();
+        frames_decoded++;
+
+        int64_t dec_us = t_decode - t_entry;
+        int64_t pnt_us = t_paint  - t_decode;
+        int64_t recv_us = meta.recv_us;
+
+        if (recv_us < recv_min) recv_min = recv_us;
+        if (recv_us > recv_max) recv_max = recv_us;
+        recv_sum += recv_us;
+        if (dec_us  < dec_min)  dec_min  = dec_us;
+        if (dec_us  > dec_max)  dec_max  = dec_us;
+        dec_sum  += dec_us;
+        if (pnt_us  < pnt_min)  pnt_min  = pnt_us;
+        if (pnt_us  > pnt_max)  pnt_max  = pnt_us;
+        pnt_sum  += pnt_us;
+        if (idle_us > 0) {
+            if (idle_us < idle_min) idle_min = idle_us;
+            if (idle_us > idle_max) idle_max = idle_us;
+            idle_sum += idle_us;
+        }
+        if (dwait_us > 0) {
+            if (dwait_us < dwait_min) dwait_min = dwait_us;
+            if (dwait_us > dwait_max) dwait_max = dwait_us;
+            dwait_sum += dwait_us;
+        }
+        if (meta.queued_at_body < queued_min) queued_min = meta.queued_at_body;
+        if (meta.queued_at_body > queued_max) queued_max = meta.queued_at_body;
+        queued_sum += meta.queued_at_body;
+        if (meta.recv_calls < calls_min) calls_min = meta.recv_calls;
+        if (meta.recv_calls > calls_max) calls_max = meta.recv_calls;
+        calls_sum += meta.recv_calls;
+        if (meta.recv_chunk_min < chunk_min) chunk_min = meta.recv_chunk_min;
+        if (meta.recv_chunk_max > chunk_max) chunk_max = meta.recv_chunk_max;
+        chunk_total_calls += meta.recv_calls;
+        window_samples++;
+        t_prev_paint_done = t_paint;
+
+        if (frames_decoded % 30 == 0 && window_samples > 0) {
+            int64_t now      = esp_timer_get_time();
+            double  win_s    = (now - t_window_start) / 1.0e6;
+            double  mb_per_s = (win_s > 0)
+                ? ((double)bytes_in_window / win_s) / (1024.0 * 1024.0) : 0.0;
+            double  fps      = (win_s > 0) ? (double)window_samples / win_s : 0.0;
+            uint32_t queued_avg = (uint32_t)(queued_sum / window_samples);
+            uint32_t calls_avg  = (uint32_t)(calls_sum  / window_samples);
+            uint32_t chunk_avg  = chunk_total_calls > 0
+                ? (uint32_t)(bytes_in_window / chunk_total_calls) : 0;
+
+            // Snapshot + reset drop-oldest counter for this window.
+            portENTER_CRITICAL(&s_slot_mux);
+            uint32_t dropped_oldest = s_recv_dropped_oldest_window;
+            s_recv_dropped_oldest_window = 0;
+            portEXIT_CRITICAL(&s_slot_mux);
+
+            ESP_LOGI(TAG,
+                "%llu frames over %.1fs: %.1ffps %.2fMB/s avg-jpeg=%uKB drop-oldest=%u | "
+                "recv min/avg/max=%lld/%lld/%lldus | "
+                "dec  min/avg/max=%lld/%lld/%lldus | "
+                "paint min/avg/max=%lld/%lld/%lldus | "
+                "idle min/avg/max=%lld/%lld/%lldus | "
+                "decode_wait min/avg/max=%lld/%lld/%lldus | "
+                "queued min/avg/max=%u/%u/%uB | "
+                "recv_calls min/avg/max=%u/%u/%u | "
+                "recv_chunk min/avg/max=%u/%u/%uB",
+                (unsigned long long)window_samples, win_s, fps, mb_per_s,
+                (unsigned)((bytes_in_window / window_samples) / 1024),
+                (unsigned)dropped_oldest,
+                (long long)recv_min, (long long)(recv_sum / window_samples), (long long)recv_max,
+                (long long)dec_min,  (long long)(dec_sum  / window_samples), (long long)dec_max,
+                (long long)pnt_min,  (long long)(pnt_sum  / window_samples), (long long)pnt_max,
+                (long long)(idle_min == INT64_MAX ? 0 : idle_min),
+                (long long)(idle_sum  / window_samples),
+                (long long)idle_max,
+                (long long)(dwait_min == INT64_MAX ? 0 : dwait_min),
+                (long long)(dwait_sum / window_samples),
+                (long long)dwait_max,
+                (unsigned)(queued_min == UINT32_MAX ? 0 : queued_min), (unsigned)queued_avg, (unsigned)queued_max,
+                (unsigned)(calls_min  == UINT32_MAX ? 0 : calls_min),  (unsigned)calls_avg,  (unsigned)calls_max,
+                (unsigned)(chunk_min  == UINT32_MAX ? 0 : chunk_min),  (unsigned)chunk_avg,  (unsigned)chunk_max);
+
+            stream_server_stats_t snap = {
+                .frames        = window_samples,
+                .bytes         = bytes_in_window,
+                .window_us     = (uint64_t)(now - t_window_start),
+                .window_end_us = (uint64_t)now,
+                .recv_min_us   = (uint32_t)recv_min,
+                .recv_avg_us   = (uint32_t)(recv_sum / window_samples),
+                .recv_max_us   = (uint32_t)recv_max,
+                .dec_min_us    = (uint32_t)dec_min,
+                .dec_avg_us    = (uint32_t)(dec_sum  / window_samples),
+                .dec_max_us    = (uint32_t)dec_max,
+                .pnt_min_us    = (uint32_t)pnt_min,
+                .pnt_avg_us    = (uint32_t)(pnt_sum  / window_samples),
+                .pnt_max_us    = (uint32_t)pnt_max,
+                .idle_min_us   = (uint32_t)(idle_min == INT64_MAX ? 0 : idle_min),
+                .idle_avg_us   = (uint32_t)(idle_sum / window_samples),
+                .idle_max_us   = (uint32_t)idle_max,
+                .queued_min      = (queued_min == UINT32_MAX ? 0 : queued_min),
+                .queued_avg      = queued_avg,
+                .queued_max      = queued_max,
+                .recv_calls_min  = (calls_min  == UINT32_MAX ? 0 : calls_min),
+                .recv_calls_avg  = calls_avg,
+                .recv_calls_max  = calls_max,
+                .recv_chunk_min  = (chunk_min  == UINT32_MAX ? 0 : chunk_min),
+                .recv_chunk_avg  = chunk_avg,
+                .recv_chunk_max  = chunk_max,
+                .so_rcvbuf       = s_stats.so_rcvbuf,
+                .recv_dropped_oldest = dropped_oldest,
+                .decode_idle_min_us  = (uint32_t)(dwait_min == INT64_MAX ? 0 : dwait_min),
+                .decode_idle_avg_us  = (uint32_t)(dwait_sum / window_samples),
+                .decode_idle_max_us  = (uint32_t)dwait_max,
+                .last_paint_event_us_low = last_event_us_low,
+            };
+            portENTER_CRITICAL(&s_stats_mux);
+            s_stats = snap;
+            portEXIT_CRITICAL(&s_stats_mux);
+
+            t_window_start  = now;
+            bytes_in_window = 0;
+            recv_min = dec_min = pnt_min = idle_min = dwait_min = INT64_MAX;
+            recv_max = dec_max = pnt_max = idle_max = dwait_max = 0;
+            recv_sum = dec_sum = pnt_sum = idle_sum = dwait_sum = 0;
+            queued_min = calls_min = chunk_min = UINT32_MAX;
+            queued_max = calls_max = chunk_max = 0;
+            queued_sum = calls_sum = chunk_total_calls = 0;
+            window_samples = 0;
+        }
     }
 }
 
 esp_err_t stream_server_start(uint16_t port)
 {
     s_port = port;
-    BaseType_t ok = xTaskCreate(accept_task, "stream", 8192, NULL, 5, NULL);
-    return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
+    if (alloc_body_bufs() != ESP_OK) return ESP_FAIL;
+    s_decode_signal = xSemaphoreCreateBinary();
+    if (!s_decode_signal) return ESP_ERR_NO_MEM;
+    if (xTaskCreate(decode_task, "stream_dec", 8192, NULL, 5, NULL) != pdPASS) return ESP_FAIL;
+    if (xTaskCreate(recv_task,   "stream_rcv", 8192, NULL, 5, NULL) != pdPASS) return ESP_FAIL;
+    return ESP_OK;
 }
 
 void stream_server_snapshot_stats(stream_server_stats_t *out)

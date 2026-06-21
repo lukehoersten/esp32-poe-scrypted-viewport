@@ -112,6 +112,10 @@ static esp_err_t state_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(s, "recv_chunk_avg",  (double)stream.recv_chunk_avg);
     cJSON_AddNumberToObject(s, "recv_chunk_max",  (double)stream.recv_chunk_max);
     cJSON_AddNumberToObject(s, "so_rcvbuf",       (double)stream.so_rcvbuf);
+    cJSON_AddNumberToObject(s, "recv_dropped_oldest", (double)stream.recv_dropped_oldest);
+    cJSON_AddNumberToObject(s, "decode_idle_min_us",  (double)stream.decode_idle_min_us);
+    cJSON_AddNumberToObject(s, "decode_idle_avg_us",  (double)stream.decode_idle_avg_us);
+    cJSON_AddNumberToObject(s, "decode_idle_max_us",  (double)stream.decode_idle_max_us);
     cJSON_AddNumberToObject(s, "last_paint_event_us_low",
                             (double)stream.last_paint_event_us_low);
     cJSON_AddItemToObject(root, "stream", s);
@@ -424,7 +428,7 @@ static esp_err_t frame_post_handler(httpd_req_t *req)
     size_t back_size = 0;
     void *back = display_back_buffer(&back_size);
     uint16_t w = 0, h = 0;
-    esp_err_t dec_err = jpeg_decoder_decode(got, back, back_size, &w, &h);
+    esp_err_t dec_err = jpeg_decoder_decode(in, got, back, back_size, &w, &h);
     int64_t t_decode = esp_timer_get_time();
     if (dec_err != ESP_OK) {
         viewport_state_lock();

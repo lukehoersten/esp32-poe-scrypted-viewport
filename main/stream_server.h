@@ -62,6 +62,14 @@ typedef struct {
     uint32_t recv_calls_min, recv_calls_avg, recv_calls_max; // syscalls per frame body
     uint32_t recv_chunk_min, recv_chunk_avg, recv_chunk_max; // bytes per recv() return
     uint32_t so_rcvbuf;                                      // SO_RCVBUF observed at accept (0 = unknown)
+    // Receiver-side skip-oldest. Counts frames where recv-task finished
+    // a body but the previous frame was still sitting in the pending
+    // slot (decode-task hadn't taken it yet). The older pending frame
+    // gets overwritten by the just-received fresher one; the counter
+    // captures how often the recv loop outran decode in this window.
+    uint32_t recv_dropped_oldest;
+    uint32_t decode_idle_min_us, decode_idle_avg_us, decode_idle_max_us;
+    // Time decode-task spent waiting on the slot signal between frames.
     uint32_t last_paint_event_us_low;   // last v1 frame's event_us_low,
                                         // 0 if none seen yet on this
                                         // boot or last frame was v0
