@@ -101,6 +101,17 @@ static esp_err_t state_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(s, "idle_min_us",   (double)stream.idle_min_us);
     cJSON_AddNumberToObject(s, "idle_avg_us",   (double)stream.idle_avg_us);
     cJSON_AddNumberToObject(s, "idle_max_us",   (double)stream.idle_max_us);
+    // Recv-throughput diagnostics. See stream_server.h for semantics.
+    cJSON_AddNumberToObject(s, "queued_min",      (double)stream.queued_min);
+    cJSON_AddNumberToObject(s, "queued_avg",      (double)stream.queued_avg);
+    cJSON_AddNumberToObject(s, "queued_max",      (double)stream.queued_max);
+    cJSON_AddNumberToObject(s, "recv_calls_min",  (double)stream.recv_calls_min);
+    cJSON_AddNumberToObject(s, "recv_calls_avg",  (double)stream.recv_calls_avg);
+    cJSON_AddNumberToObject(s, "recv_calls_max",  (double)stream.recv_calls_max);
+    cJSON_AddNumberToObject(s, "recv_chunk_min",  (double)stream.recv_chunk_min);
+    cJSON_AddNumberToObject(s, "recv_chunk_avg",  (double)stream.recv_chunk_avg);
+    cJSON_AddNumberToObject(s, "recv_chunk_max",  (double)stream.recv_chunk_max);
+    cJSON_AddNumberToObject(s, "so_rcvbuf",       (double)stream.so_rcvbuf);
     cJSON_AddNumberToObject(s, "last_paint_event_us_low",
                             (double)stream.last_paint_event_us_low);
     cJSON_AddItemToObject(root, "stream", s);

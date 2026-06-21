@@ -51,6 +51,17 @@ typedef struct {
     uint32_t dec_min_us,  dec_avg_us,  dec_max_us;
     uint32_t pnt_min_us,  pnt_avg_us,  pnt_max_us;
     uint32_t idle_min_us, idle_avg_us, idle_max_us;
+    // Recv-throughput diagnostics. Per-frame samples aggregated over the
+    // window. queued_at_body_start = FIONREAD just before the body recv
+    // loop runs; if it's close to jpeg_len the wire delivered the whole
+    // frame while we were decoding the previous one (we're not the bottleneck).
+    // recv_calls = number of recv() syscalls the body read needed (high →
+    // many small chunks → window-throttled sender). recv_chunk = body
+    // bytes returned per single recv() call within the window.
+    uint32_t queued_min, queued_avg, queued_max;            // bytes
+    uint32_t recv_calls_min, recv_calls_avg, recv_calls_max; // syscalls per frame body
+    uint32_t recv_chunk_min, recv_chunk_avg, recv_chunk_max; // bytes per recv() return
+    uint32_t so_rcvbuf;                                      // SO_RCVBUF observed at accept (0 = unknown)
     uint32_t last_paint_event_us_low;   // last v1 frame's event_us_low,
                                         // 0 if none seen yet on this
                                         // boot or last frame was v0

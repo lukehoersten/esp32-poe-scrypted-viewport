@@ -97,6 +97,19 @@ static void handle_client(int fd, const char *peer)
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    // One-shot probe of the kernel recv buffer this connection got.
+    // Stash in s_stats and log so we can confirm sdkconfig values
+    // actually reached the build — TCP_WND_DEFAULT discrepancies are
+    // invisible from source alone.
+    int       so_rcvbuf     = 0;
+    socklen_t so_rcvbuf_len = sizeof(so_rcvbuf);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &so_rcvbuf, &so_rcvbuf_len) == 0) {
+        ESP_LOGI(TAG, "client %s SO_RCVBUF=%d", peer, so_rcvbuf);
+        portENTER_CRITICAL(&s_stats_mux);
+        s_stats.so_rcvbuf = (uint32_t)so_rcvbuf;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
+
     // Sequence counter is per-connection — Scrypted resets to 1 on
     // each new socket so we follow.
     uint32_t last_painted_seq = 0;
@@ -111,6 +124,10 @@ static void handle_client(int fd, const char *peer)
     int64_t  pnt_min  = INT64_MAX, pnt_max  = 0, pnt_sum  = 0;
     int64_t  idle_min = INT64_MAX, idle_max = 0, idle_sum = 0;
     int64_t  lock_min = INT64_MAX, lock_max = 0, lock_sum = 0;
+    // Recv-throughput diagnostics (see stream_server.h for meaning).
+    uint32_t queued_min     = UINT32_MAX, queued_max     = 0; uint64_t queued_sum     = 0;
+    uint32_t calls_min      = UINT32_MAX, calls_max      = 0; uint64_t calls_sum      = 0;
+    uint32_t chunk_min      = UINT32_MAX, chunk_max      = 0; uint64_t chunk_total_calls = 0;
     uint64_t window_samples = 0;
     uint32_t last_event_us_low = 0;   // captured from v1 headers
 
@@ -173,11 +190,36 @@ static void handle_client(int fd, const char *peer)
         }
         int64_t t_lock_done = esp_timer_get_time();
 
+        // Sample how much of the body the kernel has already absorbed.
+        // Large value (close to jpeg_len) = wire delivered the whole
+        // frame during the previous decode+paint; we're decode/paint-
+        // bound. Small value = wire is throttled (window/buffer too
+        // small to absorb a full frame in our paint window).
+        int queued_at_body = 0;
+        (void)ioctl(fd, FIONREAD, &queued_at_body);
+
         uint8_t *in = jpeg_decoder_input_buffer();
-        if (read_n(fd, in, jpeg_len) != ESP_OK) {
-            jpeg_decoder_unlock();
-            ESP_LOGI(TAG, "client %s disconnected (body read)", peer);
-            return;
+        // Instrumented body read. Counts recv() syscalls and tracks
+        // min/max chunk size to characterize how the wire delivered
+        // this frame.
+        uint32_t frame_calls       = 0;
+        uint32_t frame_chunk_min   = UINT32_MAX;
+        uint32_t frame_chunk_max   = 0;
+        {
+            size_t got = 0;
+            while (got < jpeg_len) {
+                ssize_t r = recv(fd, in + got, jpeg_len - got, 0);
+                if (r <= 0) {
+                    jpeg_decoder_unlock();
+                    ESP_LOGI(TAG, "client %s disconnected (body read)", peer);
+                    return;
+                }
+                uint32_t rb = (uint32_t)r;
+                frame_calls++;
+                if (rb < frame_chunk_min) frame_chunk_min = rb;
+                if (rb > frame_chunk_max) frame_chunk_max = rb;
+                got += (size_t)r;
+            }
         }
         int64_t t_recv = esp_timer_get_time();
         bytes_in_window += jpeg_len;
@@ -278,6 +320,16 @@ static void handle_client(int fd, const char *peer)
             if (idle_us > idle_max) idle_max = idle_us;
             idle_sum += idle_us;
         }
+        // Recv-throughput diagnostics: aggregate this frame's samples.
+        if ((uint32_t)queued_at_body < queued_min) queued_min = (uint32_t)queued_at_body;
+        if ((uint32_t)queued_at_body > queued_max) queued_max = (uint32_t)queued_at_body;
+        queued_sum += (uint32_t)queued_at_body;
+        if (frame_calls < calls_min) calls_min = frame_calls;
+        if (frame_calls > calls_max) calls_max = frame_calls;
+        calls_sum += frame_calls;
+        if (frame_chunk_min != UINT32_MAX && frame_chunk_min < chunk_min) chunk_min = frame_chunk_min;
+        if (frame_chunk_max > chunk_max) chunk_max = frame_chunk_max;
+        chunk_total_calls += frame_calls;
         window_samples++;
         t_prev_paint_done = t_paint;
 
@@ -292,13 +344,20 @@ static void handle_client(int fd, const char *peer)
             double  mb_per_s = (win_s > 0)
                 ? ((double)bytes_in_window / win_s) / (1024.0 * 1024.0) : 0.0;
             double  fps      = (win_s > 0) ? (double)window_samples / win_s : 0.0;
+            uint32_t queued_avg = (uint32_t)(queued_sum / window_samples);
+            uint32_t calls_avg  = (uint32_t)(calls_sum  / window_samples);
+            uint32_t chunk_avg  = chunk_total_calls > 0
+                ? (uint32_t)(bytes_in_window / chunk_total_calls) : 0;
             ESP_LOGI(TAG,
                 "%llu frames over %.1fs: %.1ffps %.2fMB/s avg-jpeg=%uKB | "
                 "lock min/avg/max=%lld/%lld/%lldus | "
                 "recv min/avg/max=%lld/%lld/%lldus | "
                 "dec  min/avg/max=%lld/%lld/%lldus | "
                 "paint min/avg/max=%lld/%lld/%lldus | "
-                "idle min/avg/max=%lld/%lld/%lldus",
+                "idle min/avg/max=%lld/%lld/%lldus | "
+                "queued min/avg/max=%u/%u/%uB | "
+                "recv_calls min/avg/max=%u/%u/%u | "
+                "recv_chunk min/avg/max=%u/%u/%uB",
                 (unsigned long long)window_samples, win_s, fps, mb_per_s,
                 (unsigned)((bytes_in_window / window_samples) / 1024),
                 (long long)lock_min, (long long)(lock_sum / window_samples), (long long)lock_max,
@@ -307,7 +366,10 @@ static void handle_client(int fd, const char *peer)
                 (long long)pnt_min,  (long long)(pnt_sum  / window_samples), (long long)pnt_max,
                 (long long)(idle_min == INT64_MAX ? 0 : idle_min),
                 (long long)(idle_sum  / window_samples),
-                (long long)idle_max);
+                (long long)idle_max,
+                (unsigned)(queued_min == UINT32_MAX ? 0 : queued_min), (unsigned)queued_avg, (unsigned)queued_max,
+                (unsigned)(calls_min  == UINT32_MAX ? 0 : calls_min),  (unsigned)calls_avg,  (unsigned)calls_max,
+                (unsigned)(chunk_min  == UINT32_MAX ? 0 : chunk_min),  (unsigned)chunk_avg,  (unsigned)chunk_max);
 
             // Publish the just-closed window so /state can expose it.
             // Skipped under portENTER_CRITICAL — handful of integer
@@ -329,6 +391,17 @@ static void handle_client(int fd, const char *peer)
                 .idle_min_us   = (uint32_t)(idle_min == INT64_MAX ? 0 : idle_min),
                 .idle_avg_us   = (uint32_t)(idle_sum / window_samples),
                 .idle_max_us   = (uint32_t)idle_max,
+                .queued_min      = (queued_min == UINT32_MAX ? 0 : queued_min),
+                .queued_avg      = queued_avg,
+                .queued_max      = queued_max,
+                .recv_calls_min  = (calls_min  == UINT32_MAX ? 0 : calls_min),
+                .recv_calls_avg  = calls_avg,
+                .recv_calls_max  = calls_max,
+                .recv_chunk_min  = (chunk_min  == UINT32_MAX ? 0 : chunk_min),
+                .recv_chunk_avg  = chunk_avg,
+                .recv_chunk_max  = chunk_max,
+                // so_rcvbuf is set at accept time; preserve across window rolls.
+                .so_rcvbuf       = s_stats.so_rcvbuf,
                 .last_paint_event_us_low = last_event_us_low,
             };
             portENTER_CRITICAL(&s_stats_mux);
@@ -340,6 +413,9 @@ static void handle_client(int fd, const char *peer)
             recv_min = dec_min = pnt_min = idle_min = lock_min = INT64_MAX;
             recv_max = dec_max = pnt_max = idle_max = lock_max = 0;
             recv_sum = dec_sum = pnt_sum = idle_sum = lock_sum = 0;
+            queued_min = calls_min = chunk_min = UINT32_MAX;
+            queued_max = calls_max = chunk_max = 0;
+            queued_sum = calls_sum = chunk_total_calls = 0;
             window_samples = 0;
         }
     }
