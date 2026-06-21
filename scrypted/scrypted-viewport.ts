@@ -640,6 +640,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private handleCameraEvent(v: Viewport, details: any, data: any) {
         const iface = details.eventInterface;
+        // TRACE: every event the camera emits on the interfaces we
+        // listen to. Use to diagnose doorbell/motion/person plumbing.
+        // Remove once root cause is confirmed.
+        this.console.log(
+            `trace "${v.name}": iface=${iface} typeof=${typeof data} ` +
+            `data=${typeof data === "object" ? JSON.stringify(data) : String(data)} ` +
+            `details=${JSON.stringify(details)}`);
         const allowed = v.triggers;
         let trigger = false;
         if (allowed.has("doorbell") && iface === ScryptedInterface.BinarySensor && data === true) trigger = true;
