@@ -972,9 +972,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
         if (!trigger) return;
         // Capture the wall-clock at event arrival so every downstream
-        // log line can rebase onto it (+Xms since event). This is the
-        // anchor for measuring glass-to-glass and confirming that
-        // snapshot + stream start truly in parallel.
+        // log line can rebase onto it (+Xms since event) — the anchor for the
+        // cold-start stamps (spawned / first byte / first frame).
         const tEvent = Date.now();
         this.console.log(`event ${iface} -> "${v.name}": fired at +0ms (wake)`);
         this.streamStarting.add(v.nativeId!);
@@ -1002,18 +1001,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const cam: any = systemManager.getDeviceById(v.cameraId);
         if (!cam) return;
 
-        // Snapshot-then-stream: fire takePicture in parallel with the
-        // main ffmpeg spawn below. takePicture often hits a cached
-        // image and resolves in 50–300ms, vs. the ~5s before the first
-        // ffmpeg-emitted frame lands. The snapshot fills the gap so the panel
-        // shows the camera near-instantly on tap/event. Fire-and-forget —
-        // runs in parallel with stream socket bring-up. Flipped true by the
-        // ffmpeg first-frame handler below; the snapshot's final POST is gated
-        // on !firstStreamFrameSeen so a slow snapshot can't overpaint live
-        // video with a staler still once the stream is already painting.
-        // Errors are silent so a missing snapshot path doesn't break start.
-        let firstStreamFrameSeen = false;
-        this.pushSnapshot(v, cam, tEvent, () => !firstStreamFrameSeen).catch(() => {});
+        // No pre-stream snapshot: the prebuffered stream now paints in ~0.7s
+        // (see the prebuffer selection below), so the old takePicture→POST
+        // first-paint bridge was slower than the stream it was covering and
+        // just added camera load + a stale-overpaint risk. On the slow paths
+        // (no/cold prebuffer) the panel simply shows its prior frame until the
+        // stream's first frame lands.
 
         // Fetch the panel's native dimensions from the firmware and
         // cache them on the viewport's storage. Falls back to 800x480
@@ -1370,9 +1363,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     if (!firstFfmpegFrameLogged) {
                         this.console.log(`stream "${v.name}": first ffmpeg frame +${since()}ms (jpeg=${(frame.length / 1024).toFixed(0)}KB)`);
                         firstFfmpegFrameLogged = true;
-                        // Live video is now painting — suppress a late snapshot
-                        // POST so it can't overpaint fresh frames with a still.
-                        firstStreamFrameSeen = true;
                     }
 
                     // Drop only when the socket isn't connected yet
@@ -1581,145 +1571,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
     }
 
-    // First-paint fast path. takePicture → resize/rotate to panel
-    // native → POST /frame. Tries three transforms in order of cost:
-    //   1. sharp   — libvips bindings, ~5-15ms per image, handles
-    //                resize + rotate in one call. Not always present
-    //                in Scrypted's plugin sandbox.
-    //   2. mediaManager.convertMediaObjectToBuffer with size hint —
-    //                Scrypted's native converter (often vips-backed).
-    //                Resize-capable; rotation support varies. We only
-    //                use it for landscape (no rotate needed).
-    //   3. ffmpeg one-shot — old slow path, ~500-700ms cold start.
-    //                Always works; the safety net.
-    // shouldPaint gates the final POST: the snapshot races the live stream
-    // and now usually LOSES (prebuffered video paints in ~0.7s). If the stream
-    // already produced a frame by the time our snapshot is ready, posting it
-    // would overpaint fresh video with a staler still — so we skip. The
-    // snapshot stays valuable only as a gap-filler when the stream is slow
-    // (live-edge fallback / cold prebuffer), where shouldPaint() is still true.
-    private async pushSnapshot(v: Viewport, cam: any, tEvent: number = Date.now(), shouldPaint: () => boolean = () => true) {
-        const since = () => Date.now() - tEvent;
-        this.console.log(`snapshot "${v.name}": start +${since()}ms`);
-        let mo: any;
-        try { mo = await cam.takePicture({ reason: "event" }); }
-        catch (e) { return; }                 // camera doesn't support snapshots
-        if (!mo) return;
-
-        const srcJpeg: Buffer = await mediaManager.convertMediaObjectToBuffer(mo, "image/jpeg");
-        if (!srcJpeg || srcJpeg.length < 4) return;
-        this.console.log(`snapshot "${v.name}": takePicture +${since()}ms`);
-
-        // Cached dims from prior /state read; falls back to 800x480.
-        const panelW = parseInt(v.storage.getItem("panel_w") || "0", 10) || 800;
-        const panelH = parseInt(v.storage.getItem("panel_h") || "0", 10) || 480;
-        const needsRotate = v.orientation === "portrait";
-
-        let transformed: Buffer = Buffer.alloc(0);
-        let path = "";
-
-        // Path 1: sharp. require()-fail caught at the boundary so a
-        // missing native module just falls through.
-        //
-        // Quality math: ffmpeg's mjpeg -q:v 1 corresponds to sharp JPEG
-        // quality ~99-100. At jpegQuality=1 emit 100; at 10 emit ~82;
-        // at 31 emit ~40. chromaSubsampling 4:4:4 at the top end (≤2)
-        // so colored edges don't smear — sharp's default 4:2:0 is
-        // half-rate chroma and was the dominant visible artifact at
-        // panel-native resolution.
-        //
-        // mozjpeg: false intentionally. mozjpeg gave us ~3-4× slower
-        // encode (sharp transform 1.6s vs 400ms) for a maybe-5% file
-        // size win that we can't perceive at 800x480. libjpeg-turbo
-        // default is the right call when first-paint latency matters.
-        if (!transformed.length) {
-            try {
-                const sharp = require("sharp");
-                let img = sharp(srcJpeg, { failOnError: false });
-                if (needsRotate) img = img.rotate(90);
-                const sharpQuality = Math.min(100, 102 - v.jpegQuality * 2);
-                const chroma = v.jpegQuality <= 2 ? "4:4:4" : "4:2:0";
-                transformed = await img
-                    .resize(panelW, panelH, { fit: "fill", kernel: "lanczos3" })
-                    .jpeg({ quality: sharpQuality, chromaSubsampling: chroma })
-                    .toBuffer();
-                path = "sharp";
-            } catch { /* fall through */ }
-        }
-
-        // Path 2: Scrypted's native converter. Only used for landscape
-        // because the mime-parameter spec has no documented rotation
-        // and most implementations don't support it.
-        if (!transformed.length && !needsRotate) {
-            try {
-                transformed = await mediaManager.convertMediaObjectToBuffer(
-                    mo, `image/jpeg;width=${panelW};height=${panelH}`);
-                if (transformed?.length) path = "media-mgr";
-            } catch { /* fall through */ }
-        }
-
-        // Path 3: ffmpeg fallback. The slow ~500ms cold-start path.
-        if (!transformed.length) {
-            const vf = this.buildVf(v.orientation, panelW, panelH);
-            const { spawn } = require("child_process");
-            const ffmpegPath =
-                (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
-                "ffmpeg";
-            transformed = await new Promise<Buffer>((resolve, reject) => {
-                const p = spawn(ffmpegPath, [
-                    "-hide_banner", "-loglevel", "error",
-                    "-f", "image2pipe", "-i", "pipe:0",
-                    "-vf", vf,
-                    "-frames:v", "1",
-                    "-c:v", "mjpeg", "-q:v", String(v.jpegQuality),
-                    "-f", "image2pipe", "pipe:1",
-                ]);
-                const chunks: Buffer[] = [];
-                p.stdout.on("data", (c: Buffer) => chunks.push(c));
-                p.on("close", (code: number) => {
-                    if (code !== 0) reject(new Error(`ffmpeg snapshot exit ${code}`));
-                    else resolve(Buffer.concat(chunks));
-                });
-                p.on("error", reject);
-                p.stdin.on("error", () => {});
-                p.stdin.end(srcJpeg);
-                setTimeout(() => { try { p.kill("SIGTERM"); } catch {} }, 2000);
-            }).catch(() => Buffer.alloc(0));
-            if (transformed.length) path = "ffmpeg";
-        }
-
-        if (transformed.length < 4) return;
-        this.console.log(`snapshot "${v.name}": transform +${since()}ms via ${path} (${(transformed.length / 1024).toFixed(0)}KB)`);
-
-        // Last check before painting: if the live stream already produced a
-        // frame, don't overpaint it with this (now staler) snapshot.
-        if (!shouldPaint()) {
-            this.console.log(`snapshot "${v.name}": skipped post +${since()}ms — live stream already painting`);
-            return;
-        }
-
-        try {
-            this.console.log(`snapshot "${v.name}": post sent +${since()}ms`);
-            const res = await fetch(`http://${v.host}/frame`, {
-                method: "POST",
-                headers: { "Content-Type": "image/jpeg" },
-                body: transformed,
-                signal: AbortSignal.timeout(2000),
-            });
-            await res.text().catch(() => "");
-            // post_acked is the snapshot's true glass-to-glass — /frame
-            // returns after display_flip_back_buffer, so the firmware
-            // has the new pixels queued for the DPI scanout by then.
-            this.console.log(`snapshot "${v.name}": post acked +${since()}ms ← first user-visible paint`);
-        } catch { /* stream is starting anyway */ }
-    }
-
     // ffmpeg -vf filter chain producing panel-native 800x480 BGR888.
-    // Used by both startStream (live) and pushSnapshot (one-shot
-    // ffmpeg fallback). Rotation goes FIRST so the final mjpeg encoder
-    // sees the exact target dimensions — earlier we observed mjpeg
-    // writing pre-rotation dims into the JPEG SOF marker when scale
-    // came first, breaking the firmware's strict dim check.
+    // Rotation goes FIRST so the final mjpeg encoder sees the exact target
+    // dimensions — earlier we observed mjpeg writing pre-rotation dims into
+    // the JPEG SOF marker when scale came first, breaking the firmware's
+    // strict dim check.
     private buildVf(orientation: string, panelW: number, panelH: number): string {
         return orientation === "portrait"
             ? `transpose=1,scale=${panelW}:${panelH}:flags=lanczos,setsar=1`
