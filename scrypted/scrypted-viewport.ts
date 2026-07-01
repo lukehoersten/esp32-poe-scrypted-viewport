@@ -1007,11 +1007,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // image and resolves in 50–300ms, vs. the ~5s before the first
         // ffmpeg-emitted frame lands. The snapshot fills the gap so the panel
         // shows the camera near-instantly on tap/event. Fire-and-forget —
-        // runs in parallel with stream socket bring-up. If the stream's first
-        // frame arrives before the snapshot finishes, the snapshot just
-        // overpaints stale data on top of a fresher frame for ~1 paint cycle.
+        // runs in parallel with stream socket bring-up. Flipped true by the
+        // ffmpeg first-frame handler below; the snapshot's final POST is gated
+        // on !firstStreamFrameSeen so a slow snapshot can't overpaint live
+        // video with a staler still once the stream is already painting.
         // Errors are silent so a missing snapshot path doesn't break start.
-        this.pushSnapshot(v, cam, tEvent).catch(() => {});
+        let firstStreamFrameSeen = false;
+        this.pushSnapshot(v, cam, tEvent, () => !firstStreamFrameSeen).catch(() => {});
 
         // Fetch the panel's native dimensions from the firmware and
         // cache them on the viewport's storage. Falls back to 800x480
@@ -1368,6 +1370,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     if (!firstFfmpegFrameLogged) {
                         this.console.log(`stream "${v.name}": first ffmpeg frame +${since()}ms (jpeg=${(frame.length / 1024).toFixed(0)}KB)`);
                         firstFfmpegFrameLogged = true;
+                        // Live video is now painting — suppress a late snapshot
+                        // POST so it can't overpaint fresh frames with a still.
+                        firstStreamFrameSeen = true;
                     }
 
                     // Drop only when the socket isn't connected yet
@@ -1587,7 +1592,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     //                use it for landscape (no rotate needed).
     //   3. ffmpeg one-shot — old slow path, ~500-700ms cold start.
     //                Always works; the safety net.
-    private async pushSnapshot(v: Viewport, cam: any, tEvent: number = Date.now()) {
+    // shouldPaint gates the final POST: the snapshot races the live stream
+    // and now usually LOSES (prebuffered video paints in ~0.7s). If the stream
+    // already produced a frame by the time our snapshot is ready, posting it
+    // would overpaint fresh video with a staler still — so we skip. The
+    // snapshot stays valuable only as a gap-filler when the stream is slow
+    // (live-edge fallback / cold prebuffer), where shouldPaint() is still true.
+    private async pushSnapshot(v: Viewport, cam: any, tEvent: number = Date.now(), shouldPaint: () => boolean = () => true) {
         const since = () => Date.now() - tEvent;
         this.console.log(`snapshot "${v.name}": start +${since()}ms`);
         let mo: any;
@@ -1679,6 +1690,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         if (transformed.length < 4) return;
         this.console.log(`snapshot "${v.name}": transform +${since()}ms via ${path} (${(transformed.length / 1024).toFixed(0)}KB)`);
+
+        // Last check before painting: if the live stream already produced a
+        // frame, don't overpaint it with this (now staler) snapshot.
+        if (!shouldPaint()) {
+            this.console.log(`snapshot "${v.name}": skipped post +${since()}ms — live stream already painting`);
+            return;
+        }
 
         try {
             this.console.log(`snapshot "${v.name}": post sent +${since()}ms`);
