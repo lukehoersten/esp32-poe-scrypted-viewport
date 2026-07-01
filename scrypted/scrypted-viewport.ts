@@ -494,7 +494,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     //            and clear in-memory maps. Idempotent.
 
     async start() {
-        this.console.log(`StartStop.start() invoked (running=${this.running})`);
         if (this.running) return;
         await this.bootstrap();
         this.running = true;
@@ -510,7 +509,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // or bootstrap() is mid-await) while subprocesses are still alive.
         // The old `if (!this.running) return` short-circuited those teardowns
         // and orphaned ffmpeg/sockets — the "Stop does nothing" symptom.
-        this.console.log(`StartStop.stop() invoked (running=${this.running})`);
         // 1. Drain the global cleaner array: aborts every stream (→ ffmpeg
         //    SIGTERM, socket destroy, streamLogger + idle-timeout clear),
         //    removes every camera + system event listener, clears the
@@ -654,42 +652,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             }
         }, REREGISTER_INTERVAL_MS);
         pushShutdownCleaner(() => clearInterval(reregisterHandle));
-
-        // DIAGNOSTIC (doorbell/motion plumbing). The per-camera listener
-        // logs nothing on a real doorbell ring, yet HomeKit receives the
-        // event — so the event fires on a device and/or interface we
-        // aren't subscribed to. systemManager.listen with no filter sees
-        // EVERY event from EVERY device. We log only the sensor interfaces
-        // we care about, with the SOURCE device id + name, so a single
-        // ring reveals exactly which device id emits BinarySensor — then
-        // we compare that to each viewport's selected cameraId. Remove
-        // once the source device is confirmed. Cleaned up on re-paste.
-        try {
-            // Literal strings (not ScryptedInterface.*) so this diagnostic
-            // still works even if the injected ScryptedInterface global is
-            // itself the bug — that global is the suspect, so don't trust it.
-            const SENSOR_IFACES = ["BinarySensor", "MotionSensor", "ObjectDetector"];
-            const diagReg = (systemManager as any).listen((source: any, details: any, data: any) => {
-                const iface = details?.eventInterface;
-                if (SENSOR_IFACES.includes(iface)) {
-                    this.console.log(
-                        `evtscan: iface=${iface} srcId=${source?.id} srcName="${source?.name}" ` +
-                        `prop=${details?.property} data=${typeof data === "object" ? JSON.stringify(data) : String(data)}`);
-                }
-            });
-            pushShutdownCleaner(() => { try { diagReg.removeListener(); } catch {} });
-            // Confirm the injected ScryptedInterface global resolves the
-            // names our real listener filters on. If any print as
-            // "undefined", that global is broken and the real listen()
-            // filter matches nothing — explaining the silence directly.
-            this.console.log(
-                `evtscan: armed. ScryptedInterface resolves: ` +
-                `BinarySensor=${ScryptedInterface?.BinarySensor} ` +
-                `MotionSensor=${ScryptedInterface?.MotionSensor} ` +
-                `ObjectDetector=${ScryptedInterface?.ObjectDetector}`);
-        } catch (e) {
-            this.console.warn(`evtscan arm failed: ${(e as Error).message}`);
-        }
     }
 
     // ------------------------------------------------------------------------
@@ -890,15 +852,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.warn(`viewport "${tag}": camera ${v.cameraId} not found`);
             return;
         }
-        // DIAGNOSTIC: dump the selected camera's id + advertised interface
-        // list. If BinarySensor/MotionSensor/ObjectDetector are NOT present
-        // here, the doorbell/motion events live on a different Scrypted
-        // device than the one picked — and our listen() can never fire.
-        // Cross-reference srcId from the evtscan log on a real ring.
-        this.console.log(
-            `attach "${tag}": cameraId=${v.cameraId} cam.id=${(cam as any).id} ` +
-            `cam.name="${(cam as any).name}" type=${(cam as any).type} ` +
-            `interfaces=[${((cam as any).interfaces || []).join(", ")}]`);
         // Scrypted's ScryptedDevice.listen(event, cb) takes a SINGLE
         // interface (or EventListenerOptions {event}), never an array.
         // Confirmed in sdk/types/src/types.input.ts:21. Passing an array
@@ -1005,19 +958,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // subsequent events (motion re-asserts every ~500ms, person detect
         // fires repeatedly, the doorbell ring lands mid-motion) must not
         // queue, relaunch, or extend it. Cheapest possible early-out — before
-        // trigger evaluation and before any logging — so a live stream sees
-        // zero per-event work or log noise. (The system-wide evtscan listener
-        // still records everything for diagnostics, independent of this.)
+        // trigger evaluation — so a live stream sees zero per-event work.
         if (this.streams.has(v.name) || this.streamStarting.has(v.nativeId!)) return;
 
         const iface = details.eventInterface;
-        // TRACE: every event the camera emits on the interfaces we
-        // listen to. Use to diagnose doorbell/motion/person plumbing.
-        // Remove once root cause is confirmed.
-        this.console.log(
-            `trace "${v.name}": iface=${iface} typeof=${typeof data} ` +
-            `data=${typeof data === "object" ? JSON.stringify(data) : String(data)} ` +
-            `details=${JSON.stringify(details)}`);
         const allowed = v.triggers;
         let trigger = false;
         if (allowed.has("doorbell") && iface === ScryptedInterface.BinarySensor && data === true) trigger = true;
@@ -1165,12 +1109,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         let streamOptsList: any[] = [];
         try {
             streamOptsList = (await cam.getVideoStreamOptions?.()) || [];
-            for (const o of streamOptsList) {
-                this.console.log(
-                    `streamopt "${v.name}": id=${o.id} name=${o.name} prebuffer=${o.prebuffer ?? "-"} ` +
-                    `container=${o.container ?? "-"} ${o.video?.width ?? "?"}x${o.video?.height ?? "?"}@${o.video?.fps ?? "?"} ` +
-                    `dest=${JSON.stringify(o.destinations ?? o.destination ?? "-")}`);
-            }
             // Among streams that carry a maintained prebuffer, pick the SMALLEST
             // one that still covers the panel — minimizes Scrypted-side decode
             // cost (we downscale to 800x480 regardless). Picking the largest
@@ -1222,30 +1160,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.warn(`"${v.name}" no usable video stream for ffmpeg — skipping`);
             return;
         }
-        // DIAGNOSTIC (cold-start). prebuffer=3000 didn't move first-byte, so
-        // determine what source we actually got. A rebroadcast/prebuffer feed
-        // is a hot localhost socket (tcp://127.0.0.1:PORT) and starts in ms;
-        // a direct camera RTSP connect (rtsp://<cam-ip>) is the slow ~6s path.
-        // Log the input URL (credentials stripped) + the returned stream
-        // options so we can see whether prebuffer engaged.
-        try {
-            const args: string[] = ffmpegInput.inputArguments || [];
-            const i = args.indexOf("-i");
-            const rawUrl = i >= 0 && i + 1 < args.length ? String(args[i + 1]) : "(no -i)";
-            const safeUrl = rawUrl.replace(/\/\/[^@/]*@/, "//***@");   // strip user:pass@
-            const mso = ffmpegInput.mediaStreamOptions || {};
-            this.console.log(
-                `stream "${v.name}": src container=${ffmpegInput.container} url=${safeUrl} ` +
-                `msoId=${mso.id} msoName=${mso.name} mso.prebuffer=${mso.prebuffer} ` +
-                `mso.refreshAt=${mso.refreshAt ?? "-"} tool=${ffmpegInput.mediaStreamOptions?.tool ?? "-"}`);
-            // Full input args (credentials stripped) — reveals rtsp_transport,
-            // probe flags, and any source-side latency knobs Scrypted set.
-            const safeArgs = args.map(a => a.replace(/\/\/[^@/]*@/, "//***@"));
-            this.console.log(`stream "${v.name}": inputArgs=${JSON.stringify(safeArgs)}`);
-        } catch (e) {
-            this.console.warn(`stream "${v.name}": src introspection failed: ${(e as Error).message}`);
-        }
-
         const { spawn } = require("child_process");
         const ffmpegPath =
             (mediaManager.getFFmpegPath ? await mediaManager.getFFmpegPath() : undefined) ||
@@ -1392,14 +1306,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             if (abort.signal.aborted) return;
             workBuf = Buffer.alloc(0);   // reset framer state on each respawn
             const p = spawn(ffmpegPath, [
-                // DIAGNOSTIC: "info" (was "error") surfaces ffmpeg's RTSP
-                // connect/parse milestones (Input #0, stream mapping, first
-                // swscaler line) which our stderr handler stamps with since()
-                // — that's how we located the ~6s as ~1.1s RTSP + ~4.2s
-                // keyframe wait. "-nostats" suppresses the per-~500ms frame=
-                // progress flood while keeping those milestone lines. Revert
-                // to "error" (and drop -nostats) once done diagnosing.
-                "-hide_banner", "-loglevel", "info", "-nostats",
+                "-hide_banner", "-loglevel", "error",
                 // INPUT flags depend on the source path:
                 //  • live-edge: aggressive low-latency tuning — no input
                 //    buffering, unbuffered direct I/O, minimal probe — so a
@@ -1435,16 +1342,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 "pipe:1",
             ]);
             currentProc = p;
-            // Cold-start latency breakdown. The user-visible gap is
-            // "first ffmpeg frame" (~5s observed), masked by the snapshot.
-            // To attribute it we stamp three points:
-            //   spawned     — process created (ffmpeg startup cost begins)
-            //   first byte  — first stdout byte = RTSP connect + first
-            //                 keyframe decoded + first re-encoded JPEG
-            //                 started flushing. The spawned→first-byte gap
-            //                 is the keyframe/GOP wait we're chasing.
-            //   first frame — first complete JPEG framed out (≈ first byte
-            //                 + one frame's worth of pipe drain)
+            // Cold-start latency stamps (spawned → first stdout byte → first
+            // framed JPEG). One-shot per stream; a regression in wake-to-video
+            // shows up here immediately. With the prebuffered path these land
+            // ~0.7s after spawn; live-edge waits a full GOP (~5s) for a keyframe.
             this.console.log(`stream "${v.name}": ffmpeg spawned +${since()}ms (substream=${pickedDest})`);
 
             let firstFfmpegFrameLogged = false;
@@ -1537,11 +1438,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 const text = chunk.toString("utf8").trim();
                 if (!text) return;
                 if (text.includes("Immediate exit requested")) return;
-                // Prefix with the since() clock so each ffmpeg milestone
-                // (Opening, SDP, Input #0, first frame) is placed on the
-                // same timeline as spawned/first-byte — that's how we locate
-                // the ~6s. Multi-line stderr chunks get one stamp.
-                this.console.warn(`ffmpeg "${v.name}" +${since()}ms: ${text.replace(/\n/g, " | ")}`);
+                this.console.warn(`ffmpeg "${v.name}": ${text}`);
             });
             p.on("error", (e: any) => {
                 if (!abort.signal.aborted) this.console.warn(`ffmpeg "${v.name}" spawn error:`, e.message);
