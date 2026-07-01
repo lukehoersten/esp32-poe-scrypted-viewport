@@ -30,8 +30,8 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 
 | Layer | Where we are | What's pending |
 | --- | --- | --- |
-| Firmware (`main/`) | M1–M8 implemented; binary ~870 KB; builds clean against ESP-IDF 5.4 for `esp32p4`. **M1 + M2 ✅ verified on hardware** (2026-06-14, Ethernet + `GET /state` + mDNS browse). | M9 (`POST /stream`) not started. M3–M8 still 🟡 (panel not yet attached). |
-| Scrypted side (`scrypted/`) | v1 Script — DeviceProvider with per-viewport child devices, camera picker, mDNS auto-resolve. | v2 plugin (packaged + FFmpeg streaming to `/stream`) not started. Script unverified end-to-end. |
+| Firmware (`main/`) | Full path ✅ on hardware: Ethernet, panel, streaming, OTA. Painted = sent = 24 fps at the Unifi medium substream, sub-50 ms glass-to-glass over a raw TCP data socket (:81). Binary ~900 KB, ESP-IDF 5.4 / `esp32p4`. See [What's next](#whats-next) for the measured budget. | Backlog only (task-watchdog counters, multi-camera per viewport, production sealing). |
+| Scrypted side (`scrypted/`) | v1 Script — DeviceProvider with per-viewport child devices, camera picker, and live ffmpeg MJPEG streaming over the TCP data socket with prebuffer fast-start (~0.7 s wake-to-video). Verified end-to-end. | v2: repackage the single-file script as an installable plugin. |
 | Hardware | Ethernet pin map confirmed (Waveshare wiki + ESPHome). Hosyond panel architecture confirmed (Pi 7"-style, TC358762 bridge + ATTINY MCU at I²C `0x45`). Jumper wiring documented. | Schematic confirmation needed for DSI FPC pin count, I²C GPIO mapping, BOOT button GPIO, flash size. All gated by [`TESTING.md`'s Hardware prerequisites](TESTING.md#hardware-prerequisites). |
 
 See [`TESTING.md`](TESTING.md) for the full milestone-by-milestone status and the bench-order playbook.
@@ -359,7 +359,7 @@ Idempotency does the rest — `POST /state` on either side and `POST /frame` (re
 
 ## Idle
 
-After `idle_timeout_ms` (default 60s) with no `/frame`, the device sleeps and POSTs `state=sleep`. Scrypted should use the same timeout so its per-stream cutoff matches, but they run independently — either side can end the session, whichever notices first.
+After `idle_timeout_ms` (default 60s) with no painted frame (a streamed frame over the data socket, or a `/frame` POST), the device sleeps and POSTs `state=sleep`. Scrypted should use the same timeout so its per-stream cutoff matches, but they run independently — either side can end the session, whichever notices first.
 
 ## Idempotency
 
@@ -404,8 +404,9 @@ Both use a small embedded bitmap font — full lowercase a–z, digits, period, 
 
 The Scrypted side is **code, not configuration** — Scrypted has no built-in concept of a network framebuffer. The code is small and lives inside Scrypted:
 
-- **v1** (in this repo at [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts), install instructions in [`scrypted/README.md`](scrypted/README.md)): a Scrypted Script (in the Scripts plugin) — listens for camera events, calls `takePicture()`, POSTs the JPEG to `/frame`. Exposes a `POST /state` handler at the plugin's endpoint root (e.g. `http://scrypted.local:11080/endpoint/scrypted-viewport/state`) via the EndpointManager. ~250 lines of TypeScript, no package install.
-- **Next milestone after v1 (`/stream`)**: add `POST /stream` with `multipart/x-mixed-replace` chunked body for live frame rates. Scrypted side becomes a small custom plugin using FFmpeg via `MediaManager` to pipe MJPEG. `/frame` stays for snapshots and debug.
+- **v1** (in this repo at [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts), install instructions in [`scrypted/README.md`](scrypted/README.md)): a Scrypted Script (in the Scripts plugin) — listens for camera events and, on wake, spawns one `ffmpeg` child (via `MediaManager`) that pulls the camera's substream, scales/rotates to panel-native 800×480, and streams MJPEG frames to the firmware over a **raw TCP data socket (port 81)** at ~24 fps. It also exposes a `POST /state` handler at the plugin's endpoint root (e.g. `http://scrypted.local:11080/endpoint/scrypted-viewport/state`) via the EndpointManager. Single-file TypeScript, no package install.
+- **Fast start via prebuffer**: the script requests the camera's prebuffered substream so ffmpeg opens on an already-buffered keyframe, cutting wake-to-first-frame from ~5–6 s to ~0.7 s. Requires a rebroadcast prebuffer on the streamed substream — see [`scrypted/README.md`](scrypted/README.md#fast-wake--camera-prebuffer-required).
+- **Next (v2)**: repackage the single-file script as a proper installable plugin. The streaming path itself (ffmpeg → framed MJPEG over the TCP data socket) is already in place; the firmware's `POST /frame` remains for one-shot snapshots and debug.
 
 Either way, no Scrypted core changes and no external service.
 
@@ -424,26 +425,26 @@ await fetch(`${v.url}/config`, {
     scrypted: SCRYPTED_BASE,
     idle_timeout_ms: 60000,
     orientation: "portrait",
-    brightness: 80
+    brightness: 100
   })
 });
 ```
 
-To start a session (camera event like doorbell, motion, person):
+To start a session (camera event like doorbell, motion, person): POST `wake`, then open the TCP data socket and pipe MJPEG frames straight to it — no per-frame HTTP.
 
 ```ts
 await fetch(`${v.url}/state`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ state: "wake" })
-});  // device shows loading
+});  // device shows the Loading screen until the first frame lands
 
-// then stream frames:
-await fetch(`${v.url}/frame`, {
-  method: "POST",
-  headers: { "Content-Type": "image/jpeg" },
-  body: jpegBuffer  // baseline JPEG at the viewport's effective resolution, <1 MB
-});
+// then stream: one ffmpeg child → framed MJPEG over a raw TCP socket to :81.
+// Each frame is [ "VPRT" | jpeg_len | seq | event_us_low ] + JPEG body, at
+// panel-native 800x480. See scrypted-viewport.ts (startStream) for the framer
+// and the skip-oldest backpressure handling.
+const sock = net.createConnection({ host: v.host, port: 81, noDelay: true });
+sock.write(framed);  // header + JPEG, one write per frame
 ```
 
 Expose `POST /state` at `<SCRYPTED_BASE>/state` (peer of the device's `/state`). Body is `{viewport, state}`:
@@ -466,7 +467,7 @@ res.status(204).end();
 
 Both are idempotent. Don't track viewport state across requests; act on each and forget.
 
-Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its own per-stream cutoff. The two timers run independently — either side can cut a session, whichever notices first. If the device's outbound `sleep` POST is lost, the Scrypted-side timeout still ends the stream; the next `/frame` posted after the device idle-slept simply returns `409` and Scrypted stops.
+Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its own per-stream cutoff. The two timers run independently — either side can cut a session, whichever notices first. When the device idle-sleeps itself it POSTs `{state: "sleep"}` back, and Scrypted tears down the stream; if that callback is lost, the Scrypted-side safety timer ends the stream anyway.
 
 ## Ops
 
