@@ -14,6 +14,7 @@
 
 #include "display.h"
 #include "jpeg_decoder.h"
+#include "local_screens.h"
 #include "state_machine.h"
 #include "viewport_state.h"
 
@@ -215,6 +216,20 @@ static void handle_client_recv(int fd, const char *peer)
     portENTER_CRITICAL(&s_slot_mux);
     conn_id = ++s_conn_id;
     portEXIT_CRITICAL(&s_slot_mux);
+
+    // Clear any stale prior frame to the "Loading..." screen at the start of
+    // every stream session, so the panel doesn't sit on an old image during
+    // the connect→first-frame gap (several seconds on a cold prebuffer; the
+    // Scrypted side no longer sends a bridging snapshot). The wake path also
+    // shows this, but a stream can start while already AWAKE (e.g. a restart)
+    // where the state-machine wake is a no-op — this covers that case too.
+    // Guard with the decoder lock so the RGB565 present can't race a trailing
+    // decode-task paint from the previous connection; skip if not awake.
+    if (state_machine_current() == VIEWPORT_STATE_AWAKE &&
+        jpeg_decoder_try_lock(500)) {
+        local_screens_show_loading();
+        jpeg_decoder_unlock();
+    }
 
     while (1) {
         uint8_t first4[4];
