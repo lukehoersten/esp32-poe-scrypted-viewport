@@ -3,12 +3,14 @@
 The ESP32 firmware needs something on the Scrypted side that:
 - registers each viewport via `POST /config` on startup,
 - receives device-initiated `POST /state` callbacks (tap, idle timeout),
-- starts a JPEG stream to a viewport when its bound camera fires an event (doorbell ring, motion, person), and
+- starts a live MJPEG stream to a viewport when its bound camera fires an event (doorbell ring, motion, person), and
 - stops the stream when the viewport reports `sleep` or its own per-stream timer expires.
+
+The stream is real video: one `ffmpeg` child pulls the camera's substream, scales/rotates to panel-native 800×480, and pipes MJPEG frames straight to the firmware over a raw TCP data socket (port 81) at ~24 fps — no per-frame HTTP.
 
 `scrypted-viewport.ts` in this directory does all of that as a single-file TypeScript script for the **Scripts plugin**. Each viewport is a child Scrypted device under the script — you add, remove, and edit viewports entirely through the Scrypted UI; no script editing required after the initial paste.
 
-v2 will replace this with a packaged plugin doing `POST /stream` over MJPEG; for now this is enough to bring up end-to-end functionality.
+v2 will repackage this single-file script as a proper installable plugin; the streaming path is already in place.
 
 ## Install
 
@@ -26,7 +28,7 @@ On the "Scrypted Viewport" device page, click **+ Add Device**. You'll get a sma
 | Field | What to enter |
 | --- | --- |
 | **Viewport name** | Lowercase routing key, e.g. `mudroom`. Becomes the device's mDNS hostname (`viewport-mudroom.local`) and the value the firmware sends back in callbacks. |
-| **IP or hostname** | Optional. Leave blank and the script auto-resolves `viewport-<name>.local` via the OS mDNS resolver (Bonjour on macOS, nss-mdns on Linux, host networking in Docker). Set manually if mDNS resolution isn't available in your network. |
+| **IP or hostname** | The device's LAN address — an IP or a hostname string (e.g. `viewport-<mac>.local`). Set it manually; the script POSTs to this string directly and does **not** auto-resolve mDNS. See [Finding a viewport's IP / hostname](#finding-a-viewports-ip--hostname). |
 | **Camera** | Dropdown — pick the camera whose events should wake this viewport. The dropdown is filtered to devices implementing `Camera`. |
 | **Orientation** | `portrait` (480×800, default) or `landscape` (800×480). Tells the device + script what dimensions to send. |
 
@@ -48,15 +50,19 @@ To verify: on a wake, the plugin log's `substream=` shows `id:N(prebuffered)` an
 Open the viewport device's page → **Settings**. The fields are grouped:
 
 **Binding**
-- **IP or hostname** — where the firmware lives on the LAN.
-- **Camera** — which Scrypted camera drives the wake events + the snapshot source.
-- **Wake triggers** — multi-select of `doorbell`, `motion`, `person`. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap the panel to see the camera). Default: all three on.
+- **IP or hostname** — where the firmware lives on the LAN (set manually; no mDNS auto-resolve).
+- **Camera** — which Scrypted camera drives the wake events and provides the video stream.
+- **Wake triggers** — multi-select of `doorbell`, `motion`, `person`. Default: **person + doorbell** (motion is opt-in — doorbell cameras fire it constantly). The `doorbell` option only appears for doorbell-capable cameras. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap the panel to see the camera).
 
 **Display**
 - **Orientation** — `portrait` (480×800) or `landscape` (800×480). Sent to the device in `/config`.
-- **Brightness (0–100)** — gamma-corrected on the panel. Default 80.
+- **Brightness (0–100)** — gamma-corrected on the panel. Default 100.
 - **Idle timeout (ms)** — how long the device stays awake after the last paint before it sleeps itself. `0` disables; non-zero must be ≥ 5000. Default 60000.
-- **Frame push interval (ms)** — how often a JPEG is POSTed during an active stream. 1000 = 1 fps; 100 = 10 fps. Clamped to ≥ 33 ms (~30 fps max). Default 1000.
+- **JPEG quality (1–31, lower = better)** — ffmpeg mjpeg `-q:v`. 1 ≈ visually lossless (~140 KB/frame); 5 ≈ good (~70 KB); 10+ noticeably lossy. Default 1.
+- **Max Scrypted-side buffer (MB)** — emergency cap on Node's TCP send queue for the stream socket; skip-oldest backpressure normally keeps this near one in-flight frame. Default 20.
+- **Stream prebuffer (ms)** — cold-start mitigation; see [Fast wake — camera prebuffer](#fast-wake--camera-prebuffer-required). Default 6000.
+
+**Actions** — momentary toggles: **Wake now** POSTs `{wake}` and starts a stream; **Sleep now** stops the stream and POSTs `{sleep}`. Each resets itself after firing.
 
 **Status (live)** — read-only fields that fetch `/state` + `/config` from the device every time you open the Settings page: name, MAC, IP, awake/asleep, configured flag, uptime, frame counters, error counters, resolution, free heap, free PSRAM, firmware version, and the registered scrypted callback URL. If the device is offline you'll just see "device: offline / unreachable".
 
@@ -71,12 +77,12 @@ Open the viewport device's page → **Settings** menu → **Delete Device**. The
 - **Camera event (doorbell ring / motion / person)** → look up the viewport bound to that camera → `startStream(viewport)`:
   - cancel any prior stream + safety timer for that viewport,
   - POST `{state: "wake"}` to the device,
-  - start the snapshot interval,
+  - open the TCP data socket and spawn the ffmpeg child that streams MJPEG frames,
   - arm a per-stream safety timer at the viewport's `idle_timeout_ms`.
+  - Events that arrive while a stream is already live or starting are ignored — the wake window is anchored to the first event and isn't extended or restarted.
 - **Device-initiated `{state: "wake"}` callback** (operator tapped the panel) → same `startStream` path.
-- **Device-initiated `{state: "sleep"}` callback** → `stopStream` without echoing sleep back (the device already knows).
+- **Device-initiated `{state: "sleep"}` callback** → `stopStream` without echoing sleep back (the device already knows). This is how the script learns the device slept itself (tap-to-sleep or its own idle timer).
 - **Per-stream safety timer fires** → `stopStream` and POST `{state: "sleep"}` to the device.
-- **`POST /frame` returns 409** → device went to sleep on its own (tap-to-sleep, or its idle timer); `stopStream` without echo.
 
 ## What the script does on script load + every 5 minutes
 
@@ -95,9 +101,9 @@ That pulls in `@scrypted/sdk` and `@types/node` so the TS server can resolve eve
 
 ## v1 limitations
 
-- Snapshot-rate only (~1 fps). Live MJPEG over `POST /stream` is v2.
-- Manual IP per viewport (no mDNS-SD discovery yet). DHCP reservation is the simplest workaround.
-- Camera must respect `picture.width` / `picture.height` in `PictureOptions` or be paired with a snapshot plugin that resizes. If the camera returns the wrong size, the device rejects `/frame` with 400 and you'll see warning logs. Workaround: configure the camera plugin's snapshot size, or wait for v2 (FFmpeg-side resize).
+- Packaged as a single-file Scripts paste rather than an installable plugin (v2 repackages it). Updating means re-pasting the file.
+- Manual IP per viewport (no mDNS-SD discovery). A DHCP reservation is the simplest way to keep it stable.
+- Fast wake depends on a rebroadcast prebuffer on the streamed substream — see [Fast wake — camera prebuffer](#fast-wake--camera-prebuffer-required). Without it the stream still works but the first live frame waits a full keyframe interval (~5 s).
 - No retry on transport errors. Best-effort matches the device's own semantics; the next event or callback re-syncs.
 
 ## Finding a viewport's IP / hostname
@@ -121,6 +127,6 @@ After installing the script and adding one viewport binding:
 
 1. **Fresh viewport** boots → info screen on panel.
 2. Script's `getDevice()` runs on script start → `POST /config` lands → viewport → `state: asleep`, backlight off.
-3. **Tap the viewport** → device POSTs `{viewport, state: "wake"}` → script logs `recv "<name>" -> wake` → snapshots start flowing for `idle_timeout_ms`.
+3. **Tap the viewport** → device POSTs `{viewport, state: "wake"}` → script logs `recv "<name>" -> wake` → the live stream flows for `idle_timeout_ms`.
 4. **Tap again** → device POSTs `{state: "sleep"}` → script stops streaming.
-5. **Trigger the bound camera** (doorbell, motion sensor, or person detection) → script POSTs `{state: "wake"}` → snapshots flow until either side's idle timer cuts off.
+5. **Trigger the bound camera** (doorbell, motion sensor, or person detection) → script POSTs `{state: "wake"}` → panel shows "Loading…" then live video (~0.7 s with prebuffer) until either side's idle timer cuts off.
