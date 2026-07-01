@@ -148,7 +148,7 @@ Returns `200 OK` with JSON:
 
 - `state` is `wake` or `sleep`. Anything else: `400`.
 - Idempotent. Already-in-that-state calls return `204` and do nothing.
-- `wake`: backlight on, render loading screen (until the next `/frame`), reset idle timer.
+- `wake`: backlight on, render loading screen (until the first frame paints), reset idle timer.
 - `sleep`: backlight off; framebuffer discarded.
 - The device does NOT POST back to Scrypted (Scrypted initiated).
 - Response: `204`.
@@ -262,7 +262,7 @@ Transitions:
 | `POST /state {"state":"sleep"}` | Asleep | none |
 | `POST /frame` | (no state change) | — |
 
-`/frame` never changes state. Scrypted must `POST /state {"state":"wake"}` (or wait for a tap-driven `wake` POST from the device) before sending frames. This makes the protocol race-free: a `/frame` arriving after a tap-to-sleep is rejected with `409`, not silently re-woken.
+Frames never change state — neither the MJPEG stream on the data socket nor a `POST /frame`. Scrypted must `POST /state {"state":"wake"}` (or wait for a tap-driven `wake` POST from the device) before frames will paint. This makes the protocol race-free: once the device is asleep, frames arriving on the stream socket are discarded by the decode task and a `POST /frame` is rejected with `409` — neither silently re-wakes the panel. Scrypted learns the device slept from its `state=sleep` callback (and, as a backstop, its own per-stream safety timer).
 
 Only `tap` is detected on the touchscreen — long-press and swipes are out of scope for v1. `tap` itself is internal; what Scrypted sees is the resulting `state`.
 
@@ -302,9 +302,9 @@ No other fields. No timestamp (no RTC, no SNTP); Scrypted timestamps on receipt.
 
 **No application-level ack**
 
-HTTP 2xx is transport-level only. There is no application-level ack: the device does not retry, does not block subsequent state changes on the response, and does not treat a 5xx response as anything more than a counter increment. Idempotency + `/frame` returning `409` + each side's independent idle timer recover every failure mode without an ack:
+HTTP 2xx is transport-level only. There is no application-level ack: the device does not retry, does not block subsequent state changes on the response, and does not treat a 5xx response as anything more than a counter increment. Idempotency + frames not painting while asleep + each side's independent idle timer recover every failure mode without an ack:
 
-- Scrypted misses the device's `sleep`: its own per-stream timer eventually stops the stream, or the next `/frame` it sends returns `409`.
+- Scrypted misses the device's `sleep`: its own per-stream safety timer eventually tears down the ffmpeg stream, and in the meantime any frames still on the wire are discarded by the (now-asleep) device, so nothing paints.
 - Device misses Scrypted's `wake`/`sleep`: same — the next state change on either side syncs them.
 
 Don't design Scrypted-side logic that waits for the device to confirm a state change. There is no confirmation.
@@ -331,7 +331,7 @@ Don't design Scrypted-side logic that waits for the device to confirm a state ch
 **Failure semantics**
 
 - The local state change always happens regardless of POST outcome.
-- A dropped or failed POST is recovered by the next user tap, the device's idle timer firing `sleep`, or the next `/frame` from Scrypted returning `409`.
+- A dropped or failed POST is recovered by the next user tap, the device's idle timer firing `sleep`, or Scrypted's per-stream safety timer ending the stream.
 - No retry queue. No backoff. No persistence across reboots.
 
 **When the device does NOT POST**
@@ -355,7 +355,7 @@ Rules:
 3. **Last write wins.** No priorities. No "the device is where the user is so it always trumps Scrypted." If a stale `sleep` lands after a fresh `wake`, the device sleeps; the user taps again and we're back. One extra tap is cheap.
 4. **Scrypted must cancel its own pending operations on each inbound POST.** When a `wake` arrives, Scrypted cancels any pending per-viewport sleep timer before starting a fresh stream. Same in reverse. This makes "stale Scrypted timer fires after the user tapped to wake" impossible without needing protocol-level epochs.
 
-Idempotency does the rest — `POST /state` on either side and `POST /frame` (relative to its `409`-vs-`204` behavior) are all no-ops when the recipient is already in the requested state.
+Idempotency does the rest — `POST /state` on either side is a no-op when the recipient is already in the requested state, and frames (streamed on the data socket, or a `POST /frame`) never paint while the device is asleep, so a stale stream can't re-wake it.
 
 ## Idle
 
@@ -372,8 +372,9 @@ All endpoints are safe to retry. Every state-change path converges to the same f
 | `POST /config` | yes | partial merge into persisted config, atomic |
 | `POST /state` | yes | no-op if already in that state |
 | `POST /frame` | yes (within state) | paints if awake; `409` if asleep — no partial state |
+| Stream socket (`:81`) | yes (within state) | frames paint if awake, are discarded if asleep — no partial state; skip-oldest keeps only the freshest |
 
-`POST /state` (in either direction) carries imperatives, not notifications. Both sides act and forget; neither expects an application-level ack. A dropped POST is recovered by the next user action, by Scrypted's own timeout, or by a `/frame` returning `409`.
+`POST /state` (in either direction) carries imperatives, not notifications. Both sides act and forget; neither expects an application-level ack. A dropped POST is recovered by the next user action or by Scrypted's own per-stream safety timer.
 
 Failure modes do not corrupt state:
 
@@ -396,7 +397,7 @@ There is no factory-reset gesture. To wipe NVS, plug USB and run `idf.py erase-f
 The device renders exactly two things itself; everything else is a JPEG from Scrypted:
 
 - **Info screen**: ~15 lines of `label  value` pairs (white on black, auto-scaled) covering the full `GET /config` + `GET /state` dump — name, host, ip, state, configured, scrypted, orientation, brightness, idle, firmware, uptime, frames, errors, free heap, free PSRAM. Shown on first boot until `/config`, on NVS erase, and as a 15 s overlay on a touch long-press.
-- **Loading screen**: shown between a wake and the next `/frame` arriving. Plain "Loading…" text. Rendered in the current orientation.
+- **Loading screen**: shown from a wake — and re-shown on each new stream connection — until the first frame paints, so a stale prior frame never flashes during the connect→first-frame gap. Plain "Loading…" text. Rendered in the current orientation.
 
 Both use a small embedded bitmap font — full lowercase a–z, digits, period, colon, dash, slash, plus uppercase `L` for "Loading...". No LVGL, no general text engine.
 
@@ -533,7 +534,7 @@ JPEG → RGB565 framebuffer → DSI panel, single buffer. No double buffering, n
 Every endpoint is idempotent; every failure leaves the device in a sane state.
 
 - JPEG decode fails → `decode_errors++`, return 400 or 500, keep previous frame on screen, wake/sleep state unchanged.
-- Outbound `/state` POST fails → `state_post_failures++`, continue. Local state change still happened. No retry queue; Scrypted catches up via its own timeout, the next event, or the next `/frame` returning 409.
+- Outbound `/state` POST fails → `state_post_failures++`, continue. Local state change still happened. No retry queue; Scrypted catches up via its own per-stream safety timer or the next event.
 - Ethernet disconnects → driver reconnects automatically. No reboot loop. `GET /state` keeps serving over loopback for diagnostics.
 - Display init fails → log loudly, keep serving the rest of the API. The protocol is still usable for re-registration.
 - Task hangs → ESP-IDF watchdog reboots. NVS rebuilds soft state on the next boot.
@@ -588,7 +589,8 @@ Scrypted Viewport is a thin network framebuffer appliance.
 ESP:
 - DHCP
 - mDNS
-- HTTP server (`/state`, `/config`, `/frame`)
+- HTTP server (`/state`, `/config`, `/frame`, `/firmware`)
+- MJPEG stream server (raw TCP socket on `:81`)
 - HTTP client (outbound `/state` POSTs to Scrypted)
 - JPEG decode
 - framebuffer
