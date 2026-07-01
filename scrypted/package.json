@@ -1,6 +1,6 @@
 {
   "name": "scrypted-viewport-script",
-  "version": "0.1.0",
+  "version": "1.3.0",
   "private": true,
   "description": "Workspace metadata so editors can find @scrypted/sdk types when iterating on scrypted-viewport.ts locally. The actual install is to paste the file into Scrypted's Scripts plugin; nothing here is shipped.",
   "devDependencies": {
