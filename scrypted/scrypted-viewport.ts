@@ -37,11 +37,13 @@ const SCRIPT_VERSION = "0be8f18";
 // Streaming
 // ---------
 // On wake we subscribe to the camera's video stream, spawn one ffmpeg
-// child that scales + re-encodes to MJPEG (q:v 2, lanczos) at the
-// viewport's configured fps, demux JPEG frames out of stdout (FFD8…FFD9)
-// and POST each one to the firmware's existing /frame endpoint. Single-
-// flight semantics gate against the firmware's in-flight mutex; surplus
-// frames are dropped silently and counted for a periodic skip-rate log.
+// child that scales + rotates to panel-native 800x480 and re-encodes to
+// MJPEG (lanczos; q:v = jpeg_quality, default 1) at the source rate
+// (~24fps), demux JPEG frames out of stdout (FFD8…FFD9), and write each
+// one — framed with a 16-byte header — to the firmware over a raw TCP
+// data socket (port 81), not per-frame HTTP. Backpressure is skip-oldest:
+// when the socket can't accept a write, the newest frame replaces any
+// held one so we only ever fall behind by ~1 frame.
 //
 // Limits
 // ------
