@@ -181,12 +181,56 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const parsed = v ? parseInt(v, 10) : NaN;
         return Number.isFinite(parsed) ? Math.max(1, Math.min(200, parsed)) : 20;
     }
-    // Which camera-event types wake this viewport. Empty = tap-only,
-    // never woken by Scrypted. Default = all three (doorbell + motion +
-    // person detection).
+    // Cold-start mitigation: request a prebuffer from the rebroadcast
+    // plugin so getVideoStream hands ffmpeg a buffer that already begins on
+    // a recent keyframe — eliminating the wait for the camera's NEXT
+    // keyframe (the ~5-6s first-frame gap we measured). Because the whole
+    // pipeline is skip-to-freshest (ffmpeg unpaced, Scrypted drop-oldest,
+    // firmware FIONREAD-skip), the prebuffered burst collapses: the panel
+    // catches up to live within a fraction of a second and steady-state
+    // g2g is unchanged — it only kills the startup gap, no permanent lag.
+    // Default 3000ms: large enough to reliably contain a keyframe for the
+    // ~5s GOP measured here, small enough that the startup burst is modest.
+    // To work, the prebuffer must be ≥ the source GOP; raise it if the
+    // spawned→first-byte gap doesn't shrink. 0 = off (live edge).
+    get streamPrebufferMs(): number {
+        const v = this.storage.getItem("stream_prebuffer_ms");
+        const parsed = v ? parseInt(v, 10) : NaN;
+        // Default 6000ms — must exceed the camera's keyframe interval (measured
+        // 5.044s on this Unifi cam) so the requested backfill is guaranteed to
+        // contain at least one IDR; otherwise ffmpeg still waits for the next
+        // live keyframe. The Scrypted-side prebuffer for the chosen stream must
+        // ALSO be enabled and ≥ that interval (enable it under the camera's
+        // Stream Management → per-stream tab). 0 = off (cold live-edge, ~6s).
+        return Number.isFinite(parsed) ? Math.max(0, Math.min(12000, parsed)) : 6000;
+    }
+    // True when the bound camera can emit a doorbell ring — i.e. it
+    // advertises BinarySensor (Unifi pushes BinarySensor onto the camera
+    // device when isDoorbell) or self-reports as a Doorbell. Drives both
+    // the default triggers and whether "doorbell" is even offered as a
+    // wake option: a plain camera never rings, so don't show the choice.
+    get cameraIsDoorbell(): boolean {
+        const id = this.cameraId;
+        if (!id) return false;
+        try {
+            const cam: any = systemManager.getDeviceById(id);
+            const ifaces: string[] = cam?.interfaces || [];
+            return ifaces.includes(ScryptedInterface.BinarySensor) ||
+                   cam?.type === ScryptedDeviceType.Doorbell;
+        } catch { return false; }
+    }
+    // The wake options applicable to the bound camera. "doorbell" only
+    // appears for doorbell-capable cameras.
+    get triggerChoices(): string[] {
+        return this.cameraIsDoorbell ? ["doorbell", "person", "motion"] : ["person", "motion"];
+    }
+    // Which camera-event types wake this viewport. Empty = tap-only, never
+    // woken by Scrypted. Default = person + doorbell (doorbell only when the
+    // camera is doorbell-capable); motion is opt-in since doorbell cameras
+    // are very chatty with motion and would wake the panel constantly.
     get triggers(): Set<string> {
         const v = this.storage.getItem("triggers");
-        if (v === null) return new Set(["doorbell", "motion", "person"]);
+        if (v === null) return new Set(this.cameraIsDoorbell ? ["doorbell", "person"] : ["person"]);
         try { return new Set(JSON.parse(v)); } catch { return new Set(); }
     }
 
@@ -213,8 +257,8 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 group: "Binding",
                 key: "triggers",
                 title: "Wake triggers",
-                description: "Which camera-event types automatically wake the viewport. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap to see the camera).",
-                choices: ["doorbell", "motion", "person"],
+                description: "Which camera-event types automatically wake the viewport. Defaults to person + doorbell; motion is opt-in (doorbell cameras fire motion constantly). \"doorbell\" only appears for doorbell-capable cameras. Clear all for tap-only mode (never woken by Scrypted; user must tap).",
+                choices: this.triggerChoices,
                 multiple: true,
                 value: Array.from(this.triggers),
             } as any,
@@ -257,6 +301,14 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                 description: "Emergency cap on Node's TCP send queue for the stream socket. Skip-oldest backpressure handling normally keeps the queue at ~1 in-flight frame, so this should rarely trigger; if it does (stuck connection that never fires 'drain') the socket is destroyed and reconnected. Default 20.",
                 type: "number",
                 value: this.maxNodeBufMb,
+            } as any,
+            {
+                group: "Display",
+                key: "stream_prebuffer_ms",
+                title: "Stream prebuffer (ms)",
+                description: "Cold-start mitigation. Requests this much prebuffer from the rebroadcast plugin so the live stream opens on an already-buffered keyframe instead of waiting for the camera's next one — cuts the ~5–6s first-frame gap. Because the pipeline is skip-to-freshest, the buffered burst collapses to live within a fraction of a second, so this does NOT add steady-state latency — it only removes the startup gap. Must be ≥ the camera's keyframe interval (GOP) to help. Default 3000; raise toward the GOP if the spawned→first-byte gap doesn't shrink. 0 = off (live edge).",
+                type: "number",
+                value: this.streamPrebufferMs,
             } as any,
             {
                 group: "Actions",
@@ -358,12 +410,33 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             return;
         }
         if (key === "triggers") {
-            // multi-select arrives as array; serialise to JSON for storage
-            this.storage.setItem("triggers", JSON.stringify(Array.isArray(value) ? value : []));
+            // multi-select arrives as array; serialise to JSON for storage.
+            // Strip "doorbell" if the bound camera can't ring (mirror of
+            // createDevice + triggerChoices) so a stale/forced selection
+            // can't smuggle doorbell onto a plain camera.
+            let arr = Array.isArray(value) ? (value as string[]) : [];
+            if (!this.cameraIsDoorbell) arr = arr.filter(t => t !== "doorbell");
+            this.storage.setItem("triggers", JSON.stringify(arr));
         } else {
             this.storage.setItem(key, String(value ?? ""));
+            if (key === "cameraId") {
+                // The camera binding drives which wake triggers are valid
+                // (doorbell only for doorbell cameras). Reconcile the stored
+                // selection to the new camera's choices so we never persist
+                // a trigger the camera can't emit.
+                const valid = new Set(this.triggerChoices);
+                const reconciled = Array.from(this.triggers).filter(t => valid.has(t));
+                this.storage.setItem("triggers", JSON.stringify(reconciled));
+            }
         }
         await this.provider.onBindingChanged(this);
+        // After a camera change, tell the Scrypted console the Settings
+        // interface changed so it re-fetches getSettings() and re-renders
+        // the Wake-triggers choices live (showing/hiding doorbell) instead
+        // of waiting for a manual page reload.
+        if (key === "cameraId") {
+            try { await (this as any).onDeviceEvent?.(ScryptedInterface.Settings, undefined); } catch {}
+        }
     }
 }
 
@@ -376,6 +449,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister[]>(); // nativeId -> all event listeners for this viewport (camera + child devices)
+    // nativeId -> cameraId we currently have a listener attached for.
+    // Source of truth for attachListener idempotency: lets it self-heal
+    // (re-attach after the reload storage-race) without stacking duplicate
+    // listeners on every register cycle. "" = processed-but-no-camera
+    // (suppresses repeated "no camera assigned" warnings); absent = never
+    // processed.
+    private attachedCameraId = new Map<string, string>();
     streams = new Map<string, {                                   // viewport name -> stream control (accessed by Viewport.putSetting for manual wake/sleep)
         timeout:   NodeJS.Timeout;
         abort:     AbortController;       // also tears down the ffmpeg child via its listener
@@ -414,17 +494,40 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     //            and clear in-memory maps. Idempotent.
 
     async start() {
+        this.console.log(`StartStop.start() invoked (running=${this.running})`);
         if (this.running) return;
         await this.bootstrap();
         this.running = true;
     }
 
     async stop() {
-        if (!this.running) return;
+        // ALWAYS drain — never gate on this.running. Live resources
+        // (ffmpeg children, sockets, intervals, listeners) live in the
+        // global __viewportShutdownCleaners array, which is the real
+        // source of truth. The Scrypted Scripts sandbox leaks instances
+        // across re-pastes, so the instance that receives this Stop click
+        // can have this.running===false (a newer load owns the resources,
+        // or bootstrap() is mid-await) while subprocesses are still alive.
+        // The old `if (!this.running) return` short-circuited those teardowns
+        // and orphaned ffmpeg/sockets — the "Stop does nothing" symptom.
+        this.console.log(`StartStop.stop() invoked (running=${this.running})`);
+        // 1. Drain the global cleaner array: aborts every stream (→ ffmpeg
+        //    SIGTERM, socket destroy, streamLogger + idle-timeout clear),
+        //    removes every camera + system event listener, clears the
+        //    reregister interval and the diagnostic listener.
         drainShutdownCleaners(this.console, "stop");
+        // 2. Cancel any pending per-viewport debounce timers — these aren't
+        //    in the cleaner array and would otherwise fire ~300ms later and
+        //    re-attach/re-register against a stopped provider.
+        for (const t of this.bindingDebounce.values()) { try { clearTimeout(t); } catch {} }
+        this.bindingDebounce.clear();
+        // 3. Drop all in-memory state so a later start() rebuilds from
+        //    scratch — identical to a fresh load. (Child DEVICE records and
+        //    their storage persist; only our live instances/listeners go.)
         this.viewports.clear();
         this.listeners.clear();
         this.streams.clear();
+        this.attachedCameraId.clear();
         this.running = false;
     }
 
@@ -487,13 +590,23 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // (host / cameraId / orientation / ...) throws on script reload.
         // Then eagerly instantiate so each child's registration + camera
         // event subscription happen at plugin load.
+        const staleChildIds: string[] = [];
         for (const nativeId of this.childIds) {
             try {
+                // A childId whose storage container is gone is a stale entry
+                // — the device was deleted in the UI (or never persisted) but
+                // its id lingered in our childIds list. Re-discovering it would
+                // resurrect a ghost the user deleted, so prune it instead.
+                const store = deviceManager.getDeviceStorage(nativeId);
+                if (!store) {
+                    this.console.warn(`pruning stale child ${nativeId} — no storage (deleted or never persisted)`);
+                    staleChildIds.push(nativeId);
+                    continue;
+                }
                 // Use the persisted display_name as the canonical device
                 // name so a script reload doesn't reset it to the nativeId.
                 // First-time provision falls back to the nativeId.
-                const displayName =
-                    deviceManager.getDeviceStorage(nativeId).getItem("display_name") || nativeId;
+                const displayName = store.getItem("display_name") || nativeId;
                 await deviceManager.onDeviceDiscovered({
                     providerNativeId: this.nativeId,
                     nativeId,
@@ -503,7 +616,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 });
                 await this.getDevice(nativeId);
             }
+            // Other (transient) load errors are logged but NOT pruned — only a
+            // missing storage container is a definitive "device gone" signal.
             catch (e) { this.console.warn(`load child ${nativeId} failed:`, (e as Error).message); }
+        }
+        if (staleChildIds.length) {
+            this.childIds = this.childIds.filter(id => !staleChildIds.includes(id));
+            this.console.log(`pruned ${staleChildIds.length} stale child id(s): ${staleChildIds.join(", ")}`);
         }
 
         // Unified script-reload cleanup.
@@ -535,6 +654,42 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             }
         }, REREGISTER_INTERVAL_MS);
         pushShutdownCleaner(() => clearInterval(reregisterHandle));
+
+        // DIAGNOSTIC (doorbell/motion plumbing). The per-camera listener
+        // logs nothing on a real doorbell ring, yet HomeKit receives the
+        // event — so the event fires on a device and/or interface we
+        // aren't subscribed to. systemManager.listen with no filter sees
+        // EVERY event from EVERY device. We log only the sensor interfaces
+        // we care about, with the SOURCE device id + name, so a single
+        // ring reveals exactly which device id emits BinarySensor — then
+        // we compare that to each viewport's selected cameraId. Remove
+        // once the source device is confirmed. Cleaned up on re-paste.
+        try {
+            // Literal strings (not ScryptedInterface.*) so this diagnostic
+            // still works even if the injected ScryptedInterface global is
+            // itself the bug — that global is the suspect, so don't trust it.
+            const SENSOR_IFACES = ["BinarySensor", "MotionSensor", "ObjectDetector"];
+            const diagReg = (systemManager as any).listen((source: any, details: any, data: any) => {
+                const iface = details?.eventInterface;
+                if (SENSOR_IFACES.includes(iface)) {
+                    this.console.log(
+                        `evtscan: iface=${iface} srcId=${source?.id} srcName="${source?.name}" ` +
+                        `prop=${details?.property} data=${typeof data === "object" ? JSON.stringify(data) : String(data)}`);
+                }
+            });
+            pushShutdownCleaner(() => { try { diagReg.removeListener(); } catch {} });
+            // Confirm the injected ScryptedInterface global resolves the
+            // names our real listener filters on. If any print as
+            // "undefined", that global is broken and the real listen()
+            // filter matches nothing — explaining the silence directly.
+            this.console.log(
+                `evtscan: armed. ScryptedInterface resolves: ` +
+                `BinarySensor=${ScryptedInterface?.BinarySensor} ` +
+                `MotionSensor=${ScryptedInterface?.MotionSensor} ` +
+                `ObjectDetector=${ScryptedInterface?.ObjectDetector}`);
+        } catch (e) {
+            this.console.warn(`evtscan arm failed: ${(e as Error).message}`);
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -589,10 +744,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             {
                 key: "triggers",
                 title: "Wake triggers",
-                description: "Which camera-event types automatically wake the viewport. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap to see the camera).",
+                description: "Which camera-event types automatically wake the viewport. Defaults to person + doorbell; motion is opt-in (doorbell cameras fire motion constantly). If the camera isn't a doorbell, the doorbell trigger is dropped automatically on save. Clear all for tap-only mode.",
+                // Choices can't depend on the camera picked in this same
+                // (static) form, so all three are offered here; createDevice
+                // strips "doorbell" when the chosen camera can't ring, and
+                // the per-device settings page hides it thereafter.
                 choices: ["doorbell", "motion", "person"],
                 multiple: true,
-                value: ["doorbell", "motion", "person"],
+                value: ["doorbell", "person"],
             } as any,
             {
                 key: "orientation",
@@ -631,10 +790,22 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         childStore.setItem("orientation",  String(settings.orientation || "portrait"));
         // settings.triggers arrives as an array from the multi-select.
         // JSON-encode to match how Viewport.putSetting stores it on
-        // subsequent edits.
-        const trigs = Array.isArray(settings.triggers)
+        // subsequent edits. Strip "doorbell" if the chosen camera can't
+        // ring — the static add-form can't filter choices by camera, so we
+        // enforce it here (mirror of Viewport.triggerChoices).
+        let camIsDoorbell = false;
+        if (settings.cameraId) {
+            try {
+                const cam: any = systemManager.getDeviceById(String(settings.cameraId));
+                const ifaces: string[] = cam?.interfaces || [];
+                camIsDoorbell = ifaces.includes(ScryptedInterface.BinarySensor) ||
+                                cam?.type === ScryptedDeviceType.Doorbell;
+            } catch { /* leave false */ }
+        }
+        let trigs = Array.isArray(settings.triggers)
             ? settings.triggers
-            : ["doorbell", "motion", "person"];
+            : (camIsDoorbell ? ["doorbell", "person"] : ["person"]);
+        if (!camIsDoorbell) trigs = trigs.filter((t: string) => t !== "doorbell");
         childStore.setItem("triggers",     JSON.stringify(trigs));
 
         this.childIds = [...this.childIds, nativeId];
@@ -690,15 +861,44 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private attachListener(v: Viewport) {
         const tag = v.name || v.storage.getItem("display_name") || v.nativeId;
-        if (!v.cameraId) {
+        const nid  = v.nativeId!;
+        const want = v.cameraId || "";
+        const have = this.attachedCameraId.get(nid);
+
+        // Idempotent fast-path: already listening on the right camera and
+        // the listeners are still installed → nothing to do. This is what
+        // lets registerViewport call us on every (5-min) cycle to self-heal
+        // the reload storage-race without restacking listeners or spamming
+        // logs. (The empty-camera case dedups on `have === want` below.)
+        if (want === have && (want === "" || (this.listeners.get(nid)?.length ?? 0) > 0)) return;
+
+        // State changed (first attach, camera swapped, or listeners lost):
+        // tear down whatever was there before re-deciding.
+        this.detachListener(nid);
+
+        if (!want) {
+            // Record the empty state so subsequent register cycles don't
+            // re-warn every 5 minutes. Cleared by detachListener on rebind.
+            this.attachedCameraId.set(nid, "");
             this.console.warn(`viewport "${tag}": no camera assigned — open Settings and pick a camera; subscription skipped`);
             return;
         }
         const cam = systemManager.getDeviceById(v.cameraId);
         if (!cam) {
+            // Leave attachedCameraId unset so the next register cycle retries
+            // (the camera device may simply not be loaded yet).
             this.console.warn(`viewport "${tag}": camera ${v.cameraId} not found`);
             return;
         }
+        // DIAGNOSTIC: dump the selected camera's id + advertised interface
+        // list. If BinarySensor/MotionSensor/ObjectDetector are NOT present
+        // here, the doorbell/motion events live on a different Scrypted
+        // device than the one picked — and our listen() can never fire.
+        // Cross-reference srcId from the evtscan log on a real ring.
+        this.console.log(
+            `attach "${tag}": cameraId=${v.cameraId} cam.id=${(cam as any).id} ` +
+            `cam.name="${(cam as any).name}" type=${(cam as any).type} ` +
+            `interfaces=[${((cam as any).interfaces || []).join(", ")}]`);
         // Scrypted's ScryptedDevice.listen(event, cb) takes a SINGLE
         // interface (or EventListenerOptions {event}), never an array.
         // Confirmed in sdk/types/src/types.input.ts:21. Passing an array
@@ -729,6 +929,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         }
         const targetNames = [`${cam.name || cam.id} (${ifaces.join("+")})`];
         this.listeners.set(v.nativeId!, regs);
+        this.attachedCameraId.set(nid, want);
         this.console.log(`viewport "${tag}": subscribed to [${targetNames.join(", ")}]`);
     }
 
@@ -738,6 +939,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             for (const r of regs) { try { r.removeListener(); } catch {} }
             this.listeners.delete(nativeId);
         }
+        // Clear the idempotency tracker so the next attachListener re-decides
+        // from scratch (re-attach after a rebind / camera swap).
+        this.attachedCameraId.delete(nativeId);
     }
 
     private async registerViewport(v: Viewport) {
@@ -768,6 +972,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             // still find it. createDevice + putSetting always update this.
             v.storage.setItem("display_name", name);
             this.console.log(`registered "${name}" (${v.host})`);
+            // Self-heal the camera subscription. A successful /config POST
+            // proves storage is attached (host is readable) — the exact
+            // moment the bootstrap attachListener may have run too early
+            // (storage race) and skipped with an empty cameraId, never to
+            // retry. attachListener is idempotent, so this is a no-op once
+            // the right listener is in place; on the racy reload it's what
+            // finally wires the doorbell/motion subscription without the
+            // user having to re-save the setting.
+            this.attachListener(v);
         } catch (e) {
             this.console.warn(`register "${name}" failed:`, (e as Error).message);
         }
@@ -787,6 +1000,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     streamStarting = new Set<string>();
 
     private handleCameraEvent(v: Viewport, details: any, data: any) {
+        // Ignore ALL events while a stream is already live OR starting for
+        // this viewport. The wake window is anchored to the FIRST event;
+        // subsequent events (motion re-asserts every ~500ms, person detect
+        // fires repeatedly, the doorbell ring lands mid-motion) must not
+        // queue, relaunch, or extend it. Cheapest possible early-out — before
+        // trigger evaluation and before any logging — so a live stream sees
+        // zero per-event work or log noise. (The system-wide evtscan listener
+        // still records everything for diagnostics, independent of this.)
+        if (this.streams.has(v.name) || this.streamStarting.has(v.nativeId!)) return;
+
         const iface = details.eventInterface;
         // TRACE: every event the camera emits on the interfaces we
         // listen to. Use to diagnose doorbell/motion/person plumbing.
@@ -810,11 +1033,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // snapshot + stream start truly in parallel.
         const tEvent = Date.now();
         this.console.log(`event ${iface} -> "${v.name}": fired at +0ms (wake)`);
-        // If a stream is already in flight for this viewport, the event
-        // is just reinforcement — the existing ffmpeg child is already
-        // pushing frames. We do NOT relaunch (would race with previous).
-        if (this.streams.has(v.name)) return;
-        if (this.streamStarting.has(v.nativeId!)) return;
         this.streamStarting.add(v.nativeId!);
         this.startStream(v, tEvent)
             .catch(e => this.console.error("startStream failed", e))
@@ -842,16 +1060,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // Snapshot-then-stream: fire takePicture in parallel with the
         // main ffmpeg spawn below. takePicture often hits a cached
-        // image and resolves in 50–300ms, vs. 0.5–3s before the first
-        // ffmpeg-emitted frame lands (ffmpeg startup + RTSP connect +
-        // first H.264 keyframe wait). The snapshot fills the gap so
-        // the panel shows the camera near-instantly on tap/event.
-        // Fire-and-forget — runs in parallel with stream socket bring-up.
-        // Whichever lands first wins user-visibly; if the stream's
-        // first frame arrives before the snapshot finishes, the snapshot
-        // just overpaints stale data on top of a fresher frame for
-        // ~1 paint cycle. Errors are silent so a missing snapshot path
-        // doesn't break the stream start.
+        // image and resolves in 50–300ms, vs. the ~5s before the first
+        // ffmpeg-emitted frame lands. The snapshot fills the gap so the panel
+        // shows the camera near-instantly on tap/event. Fire-and-forget —
+        // runs in parallel with stream socket bring-up. If the stream's first
+        // frame arrives before the snapshot finishes, the snapshot just
+        // overpaints stale data on top of a fresher frame for ~1 paint cycle.
+        // Errors are silent so a missing snapshot path doesn't break start.
         this.pushSnapshot(v, cam, tEvent).catch(() => {});
 
         // Fetch the panel's native dimensions from the firmware and
@@ -933,12 +1148,72 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         //                     the past, not the present)
         let stream: any;
         let pickedDest = "(default)";
-        for (const destination of ["medium-resolution", "local", "remote"]) {
-            try { stream = await cam.getVideoStream({ destination }); pickedDest = destination; break; }
-            catch { /* try next */ }
+        // prebuffer>0 asks the rebroadcast plugin to seek back to a
+        // recent keyframe so ffmpeg starts decoding immediately instead
+        // of waiting for the camera's next IDR. Omitted entirely when 0
+        // so the request shape is byte-identical to the old live-edge
+        // behavior (no accidental prebuffer if the plugin defaults it).
+        const prebufferMs = v.streamPrebufferMs;
+        // Only ONE stream typically carries a maintained prebuffer (the one
+        // HomeKit/NVR keeps hot — e.g. "High" with 10s here). The Medium/Low
+        // substreams have none, so requesting them forces a cold RTSP connect
+        // that waits for the next live keyframe (~6s). To get an instant
+        // start we must pick the prebuffered stream BY ID. We downscale every
+        // source to 800x480, so its native resolution is irrelevant to output
+        // — the only cost is a little extra Scrypted-side decode CPU.
+        let prebufferedId: string | null = null;
+        let streamOptsList: any[] = [];
+        try {
+            streamOptsList = (await cam.getVideoStreamOptions?.()) || [];
+            for (const o of streamOptsList) {
+                this.console.log(
+                    `streamopt "${v.name}": id=${o.id} name=${o.name} prebuffer=${o.prebuffer ?? "-"} ` +
+                    `container=${o.container ?? "-"} ${o.video?.width ?? "?"}x${o.video?.height ?? "?"}@${o.video?.fps ?? "?"} ` +
+                    `dest=${JSON.stringify(o.destinations ?? o.destination ?? "-")}`);
+            }
+            // Among streams that carry a maintained prebuffer, pick the SMALLEST
+            // one that still covers the panel — minimizes Scrypted-side decode
+            // cost (we downscale to 800x480 regardless). Picking the largest
+            // (e.g. 5MP "High") needlessly halves the achievable fps; picking
+            // below panel res would force an upscale. panel long/short edges
+            // guard against the sub-panel "Low" substream.
+            const panelPixels = panelW * panelH;
+            const prebuffered = streamOptsList.filter(o => (o.prebuffer ?? 0) > 0);
+            const covers = prebuffered
+                .filter(o => (o.video?.width ?? 0) * (o.video?.height ?? 0) >= panelPixels)
+                .sort((a, b) => (a.video.width * a.video.height) - (b.video.width * b.video.height));
+            // Prefer smallest-that-covers; else the largest available prebuffered
+            // (better an upscale than no prebuffer at all).
+            const best = covers[0]
+                ?? prebuffered.sort((a, b) => ((b.video?.width ?? 0) * (b.video?.height ?? 0)) - ((a.video?.width ?? 0) * (a.video?.height ?? 0)))[0];
+            if (best) prebufferedId = best.id;
+        } catch (e) {
+            this.console.warn(`stream "${v.name}": getVideoStreamOptions failed: ${(e as Error).message}`);
+        }
+
+        // Preferred path: the prebuffered stream by id, with our backfill
+        // request — hands ffmpeg a buffered keyframe immediately.
+        if (prebufferMs > 0 && prebufferedId != null) {
+            try {
+                stream = await cam.getVideoStream({ id: prebufferedId, prebuffer: prebufferMs });
+                pickedDest = `id:${prebufferedId}(prebuffered)`;
+            } catch { /* fall through to destination loop */ }
+        }
+        // Fallback: original destination preference (no prebuffer available,
+        // or the id request failed).
+        if (!stream) {
+            const streamOpts = (destination: string): any =>
+                prebufferMs > 0 ? { destination, prebuffer: prebufferMs } : { destination };
+            for (const destination of ["medium-resolution", "local", "remote"]) {
+                try { stream = await cam.getVideoStream(streamOpts(destination)); pickedDest = destination; break; }
+                catch { /* try next */ }
+            }
         }
         if (!stream) { stream = await cam.getVideoStream(); pickedDest = "(camera-default)"; }
-        this.console.log(`stream "${v.name}": orientation=${v.orientation} panel=${panelW}x${panelH} vf="${vf}" substream=${pickedDest}`);
+        // True only when we actually got the prebuffered-by-id stream — drives
+        // the burst-friendly ffmpeg input flags below.
+        const usingPrebuffer = pickedDest.includes("prebuffered");
+        this.console.log(`stream "${v.name}": orientation=${v.orientation} panel=${panelW}x${panelH} vf="${vf}" substream=${pickedDest} prebuffer=${prebufferMs}ms usingPrebuffer=${usingPrebuffer}`);
         const ffmpegInputBuf: Buffer = await mediaManager.convertMediaObjectToBuffer(
             stream, "x-scrypted/x-ffmpeg-input");
         let ffmpegInput: any;
@@ -946,6 +1221,29 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         catch (e) {
             this.console.warn(`"${v.name}" no usable video stream for ffmpeg — skipping`);
             return;
+        }
+        // DIAGNOSTIC (cold-start). prebuffer=3000 didn't move first-byte, so
+        // determine what source we actually got. A rebroadcast/prebuffer feed
+        // is a hot localhost socket (tcp://127.0.0.1:PORT) and starts in ms;
+        // a direct camera RTSP connect (rtsp://<cam-ip>) is the slow ~6s path.
+        // Log the input URL (credentials stripped) + the returned stream
+        // options so we can see whether prebuffer engaged.
+        try {
+            const args: string[] = ffmpegInput.inputArguments || [];
+            const i = args.indexOf("-i");
+            const rawUrl = i >= 0 && i + 1 < args.length ? String(args[i + 1]) : "(no -i)";
+            const safeUrl = rawUrl.replace(/\/\/[^@/]*@/, "//***@");   // strip user:pass@
+            const mso = ffmpegInput.mediaStreamOptions || {};
+            this.console.log(
+                `stream "${v.name}": src container=${ffmpegInput.container} url=${safeUrl} ` +
+                `msoId=${mso.id} msoName=${mso.name} mso.prebuffer=${mso.prebuffer} ` +
+                `mso.refreshAt=${mso.refreshAt ?? "-"} tool=${ffmpegInput.mediaStreamOptions?.tool ?? "-"}`);
+            // Full input args (credentials stripped) — reveals rtsp_transport,
+            // probe flags, and any source-side latency knobs Scrypted set.
+            const safeArgs = args.map(a => a.replace(/\/\/[^@/]*@/, "//***@"));
+            this.console.log(`stream "${v.name}": inputArgs=${JSON.stringify(safeArgs)}`);
+        } catch (e) {
+            this.console.warn(`stream "${v.name}": src introspection failed: ${(e as Error).message}`);
         }
 
         const { spawn } = require("child_process");
@@ -1094,16 +1392,36 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             if (abort.signal.aborted) return;
             workBuf = Buffer.alloc(0);   // reset framer state on each respawn
             const p = spawn(ffmpegPath, [
-                "-hide_banner", "-loglevel", "error",
-                // Latency tuning on the INPUT side: don't buffer, don't
-                // probe, decode straight through. probesize/analyzeduration
-                // at the minimum keeps ffmpeg from sitting on the first
-                // ~5s of source to learn the stream layout.
-                "-fflags", "+genpts+nobuffer+discardcorrupt",
-                "-flags", "low_delay",
-                "-avioflags", "direct",
-                "-probesize", "32",
-                "-analyzeduration", "0",
+                // DIAGNOSTIC: "info" (was "error") surfaces ffmpeg's RTSP
+                // connect/parse milestones (Input #0, stream mapping, first
+                // swscaler line) which our stderr handler stamps with since()
+                // — that's how we located the ~6s as ~1.1s RTSP + ~4.2s
+                // keyframe wait. "-nostats" suppresses the per-~500ms frame=
+                // progress flood while keeping those milestone lines. Revert
+                // to "error" (and drop -nostats) once done diagnosing.
+                "-hide_banner", "-loglevel", "info", "-nostats",
+                // INPUT flags depend on the source path:
+                //  • live-edge: aggressive low-latency tuning — no input
+                //    buffering, unbuffered direct I/O, minimal probe — so a
+                //    live RTSP stream is decoded straight through with the
+                //    least added latency.
+                //  • prebuffered: the rebroadcaster hands us a ~6s BURST of
+                //    buffered frames (starting on a keyframe). "-avioflags
+                //    direct" + "-fflags nobuffer" throttle that burst to tiny
+                //    unbuffered socket reads — measured first-frame scaled
+                //    linearly with prebuffer size, i.e. ffmpeg was draining
+                //    the burst slowly, not waiting for a keyframe. Dropping
+                //    those two lets ffmpeg gulp the burst and emit the buffered
+                //    keyframe almost immediately. Keep genpts+discardcorrupt;
+                //    let Scrypted's own probesize/analyzeduration (in
+                //    inputArguments) stand.
+                ...(usingPrebuffer
+                    ? ["-fflags", "+genpts+discardcorrupt"]
+                    : ["-fflags", "+genpts+nobuffer+discardcorrupt",
+                       "-flags", "low_delay",
+                       "-avioflags", "direct",
+                       "-probesize", "32",
+                       "-analyzeduration", "0"]),
                 ...(ffmpegInput.inputArguments || []),
                 "-an", "-sn",
                 "-vf", vf,
@@ -1117,11 +1435,27 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 "pipe:1",
             ]);
             currentProc = p;
+            // Cold-start latency breakdown. The user-visible gap is
+            // "first ffmpeg frame" (~5s observed), masked by the snapshot.
+            // To attribute it we stamp three points:
+            //   spawned     — process created (ffmpeg startup cost begins)
+            //   first byte  — first stdout byte = RTSP connect + first
+            //                 keyframe decoded + first re-encoded JPEG
+            //                 started flushing. The spawned→first-byte gap
+            //                 is the keyframe/GOP wait we're chasing.
+            //   first frame — first complete JPEG framed out (≈ first byte
+            //                 + one frame's worth of pipe drain)
+            this.console.log(`stream "${v.name}": ffmpeg spawned +${since()}ms (substream=${pickedDest})`);
 
             let firstFfmpegFrameLogged = false;
             let firstSocketWriteLogged = false;
+            let firstByteLogged        = false;
             p.stdout.on("data", (chunk: Buffer) => {
                 if (abort.signal.aborted) return;
+                if (!firstByteLogged) {
+                    this.console.log(`stream "${v.name}": ffmpeg first stdout byte +${since()}ms (${chunk.length}B)`);
+                    firstByteLogged = true;
+                }
                 workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
                 while (true) {
                     const eoi = workBuf.indexOf(Buffer.from([0xff, 0xd9]));
@@ -1203,7 +1537,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 const text = chunk.toString("utf8").trim();
                 if (!text) return;
                 if (text.includes("Immediate exit requested")) return;
-                this.console.warn(`ffmpeg "${v.name}": ${text}`);
+                // Prefix with the since() clock so each ffmpeg milestone
+                // (Opening, SDP, Input #0, first frame) is placed on the
+                // same timeline as spawned/first-byte — that's how we locate
+                // the ~6s. Multi-line stderr chunks get one stamp.
+                this.console.warn(`ffmpeg "${v.name}" +${since()}ms: ${text.replace(/\n/g, " | ")}`);
             });
             p.on("error", (e: any) => {
                 if (!abort.signal.aborted) this.console.warn(`ffmpeg "${v.name}" spawn error:`, e.message);
@@ -1315,6 +1653,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.log(`"${v.name}": Scrypted-side stream timeout — stopping`);
             this.stopStream(v.name);
         }, timeoutMs);
+        // Clear the idle timer on ANY teardown path, not just stopStream.
+        // On a StartStop.stop()/re-paste drain the stream is killed via its
+        // abort cleaner (not stopStream), which would otherwise leave this
+        // setTimeout dangling for up to idleTimeoutMs (default 60s).
+        abort.signal.addEventListener("abort", () => clearTimeout(timeout));
 
         // The latest spawned ffmpeg child is held in the spawnFfmpeg
         // closure (currentProc); the abort signal listener kills it on
