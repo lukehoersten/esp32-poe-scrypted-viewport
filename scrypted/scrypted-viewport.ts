@@ -456,6 +456,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // (suppresses repeated "no camera assigned" warnings); absent = never
     // processed.
     private attachedCameraId = new Map<string, string>();
+    // nativeId -> last-registered config signature, so the "registered" line
+    // logs only on a real change, not every 5-minute reregister cycle.
+    private lastRegisterSig = new Map<string, string>();
     streams = new Map<string, {                                   // viewport name -> stream control (accessed by Viewport.putSetting for manual wake/sleep)
         timeout:   NodeJS.Timeout;
         abort:     AbortController;       // also tears down the ffmpeg child via its listener
@@ -526,6 +529,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.listeners.clear();
         this.streams.clear();
         this.attachedCameraId.clear();
+        this.lastRegisterSig.clear();
         this.running = false;
     }
 
@@ -924,7 +928,13 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             // Cache the name in storage so a future empty-.name event can
             // still find it. createDevice + putSetting always update this.
             v.storage.setItem("display_name", name);
-            this.console.log(`registered "${name}" (${v.host})`);
+            // Log only when the registration actually changed (first time, or a
+            // setting/host change) — not on every 5-minute reregister cycle.
+            const sig = `${v.host}|${name}|${v.idleTimeoutMs}|${v.orientation}|${v.brightness}`;
+            if (this.lastRegisterSig.get(v.nativeId!) !== sig) {
+                this.lastRegisterSig.set(v.nativeId!, sig);
+                this.console.log(`registered "${name}" (${v.host})`);
+            }
             // Self-heal the camera subscription. A successful /config POST
             // proves storage is attached (host is readable) — the exact
             // moment the bootstrap attachListener may have run too early
@@ -1214,6 +1224,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         let sentFrames        = 0;
         let bytesSent         = 0;
         let flushCount        = 0;   // socket destroy+reconnect count due to buffer cap (safety net)
+        let lastFlushCount    = 0;   // flushCount at last window roll, to detect a flush this window
         // Duty cycle: framesSampled = every ffmpeg frame we considered
         // sending this window; framesUnderBp = the subset for which the
         // socket was backpressured at decision time. Ratio = % of frames
@@ -1337,21 +1348,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 "pipe:1",
             ]);
             currentProc = p;
-            // Cold-start latency stamps (spawned → first stdout byte → first
-            // framed JPEG). One-shot per stream; a regression in wake-to-video
-            // shows up here immediately. With the prebuffered path these land
-            // ~0.7s after spawn; live-edge waits a full GOP (~5s) for a keyframe.
-            this.console.log(`stream "${v.name}": ffmpeg spawned +${since()}ms (substream=${pickedDest})`);
-
+            // Single cold-start stamp: first framed JPEG out. One-shot per
+            // stream; a wake-to-video regression shows up here immediately
+            // (~0.7s on the prebuffered path, ~5s on a cold live-edge GOP).
             let firstFfmpegFrameLogged = false;
-            let firstSocketWriteLogged = false;
-            let firstByteLogged        = false;
             p.stdout.on("data", (chunk: Buffer) => {
                 if (abort.signal.aborted) return;
-                if (!firstByteLogged) {
-                    this.console.log(`stream "${v.name}": ffmpeg first stdout byte +${since()}ms (${chunk.length}B)`);
-                    firstByteLogged = true;
-                }
                 workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
                 while (true) {
                     const eoi = workBuf.indexOf(Buffer.from([0xff, 0xd9]));
@@ -1420,10 +1422,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     }
 
                     const ok = writeFramed(framed);
-                    if (!firstSocketWriteLogged) {
-                        this.console.log(`stream "${v.name}": first socket.write +${since()}ms (jpeg=${(frame.length / 1024).toFixed(0)}KB)`);
-                        firstSocketWriteLogged = true;
-                    }
                     if (!ok) socketBackpressured = true;
                 }
             });
@@ -1521,7 +1519,21 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             const nodeBufBytes = sock?.writableLength ?? 0;
             const sentBps      = mbPerSec * 1024 * 1024;
             const nodeBufMs    = sentBps > 0 ? (nodeBufBytes / sentBps * 1000).toFixed(0) : "?";
-            this.console.log(
+            // Log only noteworthy windows to keep the console readable when a
+            // chatty camera keeps a viewport streaming for long stretches. A
+            // healthy 24fps window prints nothing (the per-wake lines already
+            // confirm liveness); we surface only degradation: socket-not-ready
+            // drops, a buffer-cap flush this window, the firmware shedding ≥2fps
+            // to stay fresh, or painted dipping below ~20fps.
+            const flushedThisWindow = flushCount - lastFlushCount;
+            lastFlushCount = flushCount;
+            const skippedNum = paintedNum >= 0 ? Math.max(0, sentRate - paintedNum) : 0;
+            const noteworthy =
+                droppedFrames > 0 ||
+                flushedThisWindow > 0 ||
+                skippedNum >= 2 ||
+                (paintedNum >= 0 && paintedNum < 20);
+            if (noteworthy) this.console.log(
                 `stream "${v.name}": sent=${sentRate.toFixed(1)}fps painted=${painted}fps ` +
                 `(fw-skipped=${skipped}fps, drop-oldest=${droppedOldest}, drops=${droppedFrames}, flushes=${flushCount}) ` +
                 `${mbPerSec.toFixed(2)}MB/s sent / ${paintedMb}MB/s painted | ` +
