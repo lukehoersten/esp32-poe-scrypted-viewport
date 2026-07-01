@@ -32,6 +32,17 @@ On the "Scrypted Viewport" device page, click **+ Add Device**. You'll get a sma
 
 Click **Create**. The script immediately POSTs `/config` to the device. Within a second or two, the viewport device should show up in Scrypted with its own page.
 
+## Fast wake — camera prebuffer (required)
+
+Wake-to-live-video is ~0.7 s **only if** the streamed substream keeps a rebroadcast prebuffer; otherwise the panel waits a full keyframe interval (~5 s on Unifi) for the next IDR before the first frame decodes. This is a per-camera Scrypted setting, not something the script can set:
+
+1. Open the **camera device** in Scrypted → **Stream Management** (the `@scrypted/prebuffer-mixin` / rebroadcast settings).
+2. Select the **STREAM: MEDIUM** tab (the script streams the smallest substream that still covers the panel — usually "Medium" — and downscales to 800×480, so its native resolution doesn't matter). **Enable Prebuffer** on it. By default many cameras only prebuffer the High stream (for HomeKit/NVR); Medium/Low have none.
+3. The prebuffer duration must be **≥ the camera's keyframe interval** so the buffer always contains a keyframe. That tab shows a read-only **"Detected Keyframe Interval"** (e.g. 5.044 s on the Unifi doorbell) — the enabled default of 10 s is comfortably above it. The keyframe interval itself is usually **not** settable in the camera's own app (e.g. Unifi Protect).
+4. On the viewport's Settings, leave **Stream prebuffer (ms)** at its default (`6000`, i.e. above the ~5 s GOP). If it was ever saved as `0`, clear/reset it — a stored `0` disables the prebuffer request.
+
+To verify: on a wake, the plugin log's `substream=` shows `id:N(prebuffered)` and `usingPrebuffer=true`, and `first ffmpeg frame` lands at ~0.7 s instead of ~5–6 s. If you see `usingPrebuffer=false` or a ~5 s first frame, the chosen substream isn't prebuffered — revisit step 2.
+
 ## Editing a viewport
 
 Open the viewport device's page → **Settings**. The fields are grouped:
