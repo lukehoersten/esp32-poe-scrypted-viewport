@@ -29,17 +29,21 @@ CONFIG_LWIP_IPV4=y
 CONFIG_LWIP_IPV6=y
 CONFIG_MDNS_MAX_INTERFACES=1
 
-# TCP receive-window kept at IDF defaults (4 × MSS = 5760). An
-# attempt to raise WND to 65535 regressed g2g from ~100ms to 17s
-# growing unbounded — the bigger window let Scrypted bury the ESP32
-# in queued bytes faster than the single recv→decode→paint task
-# can drain them, with no way to skip-oldest on the kernel queue.
-# The real bottleneck is task serialization, not window size; raise
-# this only once the recv path is on its own FreeRTOS task with a
-# 1-deep latest-frame slot to the decode/paint task.
-CONFIG_LWIP_TCP_WND_DEFAULT=5760
+# TCP receive window. History: at the IDF default (4 × MSS = 5760)
+# with the OLD single recv→decode→paint task, raising WND to 65535
+# regressed g2g to 17s unbounded (kernel queue buildup, no skip-
+# oldest possible). The recv/decode task split + 1-deep latest-frame
+# slot removed that failure mode; the instrumented baseline at 5760
+# then showed the window as the dominant throttle: wire=53Mbps
+# (= WND/RTT ceiling) vs ~94Mbps line rate, recv_chunk_max pinned at
+# exactly 5760, sender backpressured on 44-61% of frames. 23040 =
+# 16 × MSS. RECVMBOX must scale with the window (16 segments can be
+# in flight; a 6-deep mbox would silently become the new cap).
+# Regression tripwires when touching these: /state stream.pend_age_*
+# and recv_dropped_oldest must stay flat, sender g2g must not grow.
+CONFIG_LWIP_TCP_WND_DEFAULT=23040
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_LWIP_TCP_SACK_OUT=y
 
 # HTTP server
