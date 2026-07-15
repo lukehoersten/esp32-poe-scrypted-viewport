@@ -23,6 +23,15 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 # Ethernet (Waveshare ESP32-P4-ETH-POE: internal EMAC + external PHY)
 CONFIG_ETH_ENABLED=y
 CONFIG_ETH_USE_ESP32_EMAC=y
+# EMAC RX DMA pool must exceed TCP_WND or a full-window burst overruns
+# the RX descriptors and the silent tail-drop puts the sender into a
+# ~200-400ms RTO stall (measured: WND=23040 with the default 20x512B
+# = 10KB pool made recv bimodal — wire_max 75Mbps on clean frames,
+# 200-450ms stalls on lossy ones, sender fps 20 -> 14). 1600B = one
+# full MSS frame per buffer (also 1 descriptor/packet instead of 3);
+# 24 x 1600 = 38.4KB >= 23040 + slack. ~44KB extra internal RAM.
+CONFIG_ETH_DMA_BUFFER_SIZE=1600
+CONFIG_ETH_DMA_RX_BUFFER_NUM=24
 
 # LWIP / mDNS
 CONFIG_LWIP_IPV4=y
