@@ -73,6 +73,22 @@ typedef struct {
     uint32_t last_paint_event_us_low;   // last v1 frame's event_us_low,
                                         // 0 if none seen yet on this
                                         // boot or last frame was v0
+    // TCP-window decomposition. Together with recv/dec/paint these account
+    // for the whole frame interval:
+    //   interval ≈ hdr_gap (sender idle) + recv (wire) + pend_age (handoff
+    //   queue wait) + dec + paint.
+    // wire = instantaneous throughput while the body drained (jpeg_len /
+    // recv_us). Ceiling ≈ TCP_WND / RTT — the definitive window-throttle
+    // metric: scales with CONFIG_LWIP_TCP_WND iff the window is the limiter.
+    uint32_t wire_min_kbps, wire_avg_kbps, wire_max_kbps;
+    // Blocked-with-nothing-to-read time between previous body completion
+    // and next header completion. Large → sender-paced (we are NOT the
+    // bottleneck); ~0 → back-to-back arrivals, receive path is the limiter.
+    uint32_t hdr_gap_min_us, hdr_gap_avg_us, hdr_gap_max_us;
+    // publish → decode-claim latency of painted frames. Healthy: bounded
+    // well under a frame interval. Growing window-over-window = latency
+    // backlog building (the failure mode that killed the last WND raise).
+    uint32_t pend_age_min_us, pend_age_avg_us, pend_age_max_us;
 } stream_server_stats_t;
 
 void stream_server_snapshot_stats(stream_server_stats_t *out);

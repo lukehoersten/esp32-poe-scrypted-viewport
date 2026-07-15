@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/netdb.h"
+#include "lwip/opt.h"
 #include "lwip/sockets.h"
 #include "sys/ioctl.h"
 
@@ -96,6 +97,11 @@ typedef struct {
     uint32_t recv_chunk_min;
     uint32_t recv_chunk_max;
     int64_t  recv_us;           // body-recv duration on the recv-task side
+    int64_t  hdr_gap_us;        // prev body done → this header read complete;
+                                // -1 on the first frame of a connection.
+                                // Large = sender idle; ~0 = back-to-back.
+    int64_t  publish_us;        // esp_timer at publish; decode-task derives
+                                // pending_age = claim time - publish_us.
 } slot_meta_t;
 static slot_meta_t s_pending_meta;
 
@@ -169,8 +175,9 @@ static esp_err_t read_body_instrumented(int fd, void *buf, size_t n,
 // Install a just-received frame into the pending slot and rotate the recv
 // target to a fresh buffer. If pending already held a frame, the older one
 // is overwritten in place (drop-oldest at the receiver).
-static void publish_frame(const slot_meta_t *meta)
+static void publish_frame(slot_meta_t *meta)
 {
+    meta->publish_us = esp_timer_get_time();
     portENTER_CRITICAL(&s_slot_mux);
     if (s_pending_idx >= 0) {
         // Drop-oldest: swap recv_idx with pending_idx so the just-filled
@@ -204,7 +211,12 @@ static void handle_client_recv(int fd, const char *peer)
     int       so_rcvbuf     = 0;
     socklen_t so_rcvbuf_len = sizeof(so_rcvbuf);
     if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &so_rcvbuf, &so_rcvbuf_len) == 0) {
-        ESP_LOGI(TAG, "client %s SO_RCVBUF=%d", peer, so_rcvbuf);
+        // Self-labeling config stamp: every capture records the lwIP window
+        // it was measured under, so A/B window experiments can't get mixed up.
+        ESP_LOGI(TAG, "client %s SO_RCVBUF=%d TCP_WND=%d TCP_MSS=%d RECVMBOX=%d",
+                 peer, so_rcvbuf, (int)CONFIG_LWIP_TCP_WND_DEFAULT,
+                 (int)CONFIG_LWIP_TCP_MSS,
+                 (int)CONFIG_LWIP_TCP_RECVMBOX_SIZE);
         portENTER_CRITICAL(&s_stats_mux);
         s_stats.so_rcvbuf = (uint32_t)so_rcvbuf;
         portEXIT_CRITICAL(&s_stats_mux);
@@ -230,6 +242,8 @@ static void handle_client_recv(int fd, const char *peer)
         local_screens_show_loading();
         jpeg_decoder_unlock();
     }
+
+    int64_t t_prev_body_done = 0;   // 0 → first frame, no gap sample
 
     while (1) {
         uint8_t first4[4];
@@ -265,6 +279,15 @@ static void handle_client_recv(int fd, const char *peer)
             event_us_low = 0;
         }
 
+        // Gap = previous body fully drained → this header fully read. The
+        // 8/16 header bytes themselves are noise (<1 MSS); what this really
+        // measures is how long recv-task sat blocked with nothing to read,
+        // i.e. sender-side pacing. ~0 means frames are arriving back-to-back
+        // and the receive path is the limiter.
+        int64_t t_hdr_done = esp_timer_get_time();
+        int64_t hdr_gap_us = t_prev_body_done ? (t_hdr_done - t_prev_body_done)
+                                              : -1;
+
         if (jpeg_len == 0 || jpeg_len > s_buf_cap) {
             ESP_LOGW(TAG, "bad frame length %u from %s — closing connection",
                      (unsigned)jpeg_len, peer);
@@ -288,7 +311,8 @@ static void handle_client_recv(int fd, const char *peer)
             ESP_LOGI(TAG, "client %s disconnected (body read)", peer);
             return;
         }
-        int64_t recv_us = esp_timer_get_time() - t0;
+        t_prev_body_done = esp_timer_get_time();
+        int64_t recv_us  = t_prev_body_done - t0;
 
         slot_meta_t meta = {
             .jpeg_len       = jpeg_len,
@@ -300,6 +324,7 @@ static void handle_client_recv(int fd, const char *peer)
             .recv_chunk_min = (chunk_min == UINT32_MAX ? 0 : chunk_min),
             .recv_chunk_max = chunk_max,
             .recv_us        = recv_us,
+            .hdr_gap_us     = hdr_gap_us,
         };
         publish_frame(&meta);
     }
@@ -400,6 +425,13 @@ static void decode_task(void *arg)
     int64_t  pnt_min  = INT64_MAX, pnt_max  = 0, pnt_sum  = 0;
     int64_t  idle_min = INT64_MAX, idle_max = 0, idle_sum = 0;
     int64_t  dwait_min = INT64_MAX, dwait_max = 0, dwait_sum = 0;
+    // Window-tuning decomposition: gap (sender idle), pending age (frame
+    // sat in the handoff slot), per-frame wire rate during body recv.
+    int64_t  gap_min  = INT64_MAX, gap_max  = 0, gap_sum  = 0;
+    uint64_t gap_samples = 0;   // first frame of a conn has no gap
+    int64_t  page_min = INT64_MAX, page_max = 0, page_sum = 0;
+    uint32_t wire_min = UINT32_MAX, wire_max = 0;   // kbit/s
+    uint64_t recv_bytes = 0;                        // bytes behind recv_sum
     uint32_t queued_min = UINT32_MAX, queued_max = 0; uint64_t queued_sum = 0;
     uint32_t calls_min  = UINT32_MAX, calls_max  = 0; uint64_t calls_sum  = 0;
     uint32_t chunk_min  = UINT32_MAX, chunk_max  = 0; uint64_t chunk_total_calls = 0;
@@ -498,9 +530,37 @@ static void decode_task(void *arg)
         int64_t pnt_us = t_paint  - t_decode;
         int64_t recv_us = meta.recv_us;
 
+        // Publish → claim latency. Bounded (< one frame interval) is
+        // healthy; growing across windows is the kernel-queue-buildup
+        // failure mode a bigger TCP window could reintroduce.
+        int64_t page_us = t_entry - meta.publish_us;
+        if (page_us < page_min) page_min = page_us;
+        if (page_us > page_max) page_max = page_us;
+        page_sum += page_us;
+
+        if (meta.hdr_gap_us >= 0) {
+            if (meta.hdr_gap_us < gap_min) gap_min = meta.hdr_gap_us;
+            if (meta.hdr_gap_us > gap_max) gap_max = meta.hdr_gap_us;
+            gap_sum += meta.hdr_gap_us;
+            gap_samples++;
+        }
+
+        // Instantaneous wire rate while the body was draining. This is the
+        // direct TCP-window-throttle metric: ceiling ≈ WND/RTT regardless
+        // of link speed, so it should scale with CONFIG_LWIP_TCP_WND if the
+        // window is the limiter — and stay flat if something else is.
+        if (recv_us > 0) {
+            uint32_t kbps = (uint32_t)(((uint64_t)meta.jpeg_len * 8000u) /
+                                       (uint64_t)recv_us);
+            if (kbps < wire_min) wire_min = kbps;
+            if (kbps > wire_max) wire_max = kbps;
+        }
+
         if (recv_us < recv_min) recv_min = recv_us;
         if (recv_us > recv_max) recv_max = recv_us;
-        recv_sum += recv_us;
+        recv_sum   += recv_us;
+        recv_bytes += meta.jpeg_len;   // painted-frame bytes, matches recv_sum
+                                       // for the window wire-rate average
         if (dec_us  < dec_min)  dec_min  = dec_us;
         if (dec_us  > dec_max)  dec_max  = dec_us;
         dec_sum  += dec_us;
@@ -539,6 +599,10 @@ static void decode_task(void *arg)
             uint32_t calls_avg  = (uint32_t)(calls_sum  / window_samples);
             uint32_t chunk_avg  = chunk_total_calls > 0
                 ? (uint32_t)(bytes_in_window / chunk_total_calls) : 0;
+            uint32_t wire_avg   = recv_sum > 0
+                ? (uint32_t)((recv_bytes * 8000u) / (uint64_t)recv_sum) : 0;
+            int64_t  gap_avg    = gap_samples > 0
+                ? (gap_sum / (int64_t)gap_samples) : 0;
 
             // Snapshot + reset drop-oldest counter for this window.
             portENTER_CRITICAL(&s_slot_mux);
@@ -548,6 +612,9 @@ static void decode_task(void *arg)
 
             ESP_LOGI(TAG,
                 "%llu frames over %.1fs: %.1ffps %.2fMB/s avg-jpeg=%uKB drop-oldest=%u | "
+                "wire min/avg/max=%u/%u/%ukbps | "
+                "hdr_gap min/avg/max=%lld/%lld/%lldus | "
+                "pend_age min/avg/max=%lld/%lld/%lldus | "
                 "recv min/avg/max=%lld/%lld/%lldus | "
                 "dec  min/avg/max=%lld/%lld/%lldus | "
                 "paint min/avg/max=%lld/%lld/%lldus | "
@@ -559,6 +626,12 @@ static void decode_task(void *arg)
                 (unsigned long long)window_samples, win_s, fps, mb_per_s,
                 (unsigned)((bytes_in_window / window_samples) / 1024),
                 (unsigned)dropped_oldest,
+                (unsigned)(wire_min == UINT32_MAX ? 0 : wire_min),
+                (unsigned)wire_avg, (unsigned)wire_max,
+                (long long)(gap_min == INT64_MAX ? 0 : gap_min),
+                (long long)gap_avg, (long long)gap_max,
+                (long long)(page_min == INT64_MAX ? 0 : page_min),
+                (long long)(page_sum / window_samples), (long long)page_max,
                 (long long)recv_min, (long long)(recv_sum / window_samples), (long long)recv_max,
                 (long long)dec_min,  (long long)(dec_sum  / window_samples), (long long)dec_max,
                 (long long)pnt_min,  (long long)(pnt_sum  / window_samples), (long long)pnt_max,
@@ -604,6 +677,15 @@ static void decode_task(void *arg)
                 .decode_idle_avg_us  = (uint32_t)(dwait_sum / window_samples),
                 .decode_idle_max_us  = (uint32_t)dwait_max,
                 .last_paint_event_us_low = last_event_us_low,
+                .wire_min_kbps    = (wire_min == UINT32_MAX ? 0 : wire_min),
+                .wire_avg_kbps    = wire_avg,
+                .wire_max_kbps    = wire_max,
+                .hdr_gap_min_us   = (uint32_t)(gap_min == INT64_MAX ? 0 : gap_min),
+                .hdr_gap_avg_us   = (uint32_t)gap_avg,
+                .hdr_gap_max_us   = (uint32_t)gap_max,
+                .pend_age_min_us  = (uint32_t)(page_min == INT64_MAX ? 0 : page_min),
+                .pend_age_avg_us  = (uint32_t)(page_sum / window_samples),
+                .pend_age_max_us  = (uint32_t)page_max,
             };
             portENTER_CRITICAL(&s_stats_mux);
             s_stats = snap;
@@ -614,6 +696,10 @@ static void decode_task(void *arg)
             recv_min = dec_min = pnt_min = idle_min = dwait_min = INT64_MAX;
             recv_max = dec_max = pnt_max = idle_max = dwait_max = 0;
             recv_sum = dec_sum = pnt_sum = idle_sum = dwait_sum = 0;
+            gap_min  = page_min = INT64_MAX;
+            gap_max  = page_max = gap_sum = page_sum = 0;
+            gap_samples = 0;
+            wire_min = UINT32_MAX; wire_max = 0; recv_bytes = 0;
             queued_min = calls_min = chunk_min = UINT32_MAX;
             queued_max = calls_max = chunk_max = 0;
             queued_sum = calls_sum = chunk_total_calls = 0;

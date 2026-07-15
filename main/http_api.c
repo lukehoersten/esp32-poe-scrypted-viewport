@@ -118,6 +118,17 @@ static esp_err_t state_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(s, "decode_idle_max_us",  (double)stream.decode_idle_max_us);
     cJSON_AddNumberToObject(s, "last_paint_event_us_low",
                             (double)stream.last_paint_event_us_low);
+    // TCP-window decomposition (see stream_server.h): wire = body-drain
+    // throughput, hdr_gap = sender idle, pend_age = handoff queue wait.
+    cJSON_AddNumberToObject(s, "wire_min_kbps",   (double)stream.wire_min_kbps);
+    cJSON_AddNumberToObject(s, "wire_avg_kbps",   (double)stream.wire_avg_kbps);
+    cJSON_AddNumberToObject(s, "wire_max_kbps",   (double)stream.wire_max_kbps);
+    cJSON_AddNumberToObject(s, "hdr_gap_min_us",  (double)stream.hdr_gap_min_us);
+    cJSON_AddNumberToObject(s, "hdr_gap_avg_us",  (double)stream.hdr_gap_avg_us);
+    cJSON_AddNumberToObject(s, "hdr_gap_max_us",  (double)stream.hdr_gap_max_us);
+    cJSON_AddNumberToObject(s, "pend_age_min_us", (double)stream.pend_age_min_us);
+    cJSON_AddNumberToObject(s, "pend_age_avg_us", (double)stream.pend_age_avg_us);
+    cJSON_AddNumberToObject(s, "pend_age_max_us", (double)stream.pend_age_max_us);
     cJSON_AddItemToObject(root, "stream", s);
 
     char *body = cJSON_PrintUnformatted(root);
