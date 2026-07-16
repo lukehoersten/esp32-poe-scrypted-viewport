@@ -1,3 +1,4 @@
+#include "chip_temp.h"
 #include "display.h"
 #include "http_api.h"
 #include "jpeg_decoder.h"
@@ -42,6 +43,7 @@ void app_main(void)
 
     viewport_state_init();
     nvs_config_load();  // apply persisted config over defaults (best-effort)
+    chip_temp_init();   // best-effort; readers get NAN if unavailable
     // PROJECT_VER comes from CMakeLists.txt — git short hash + dirty
     // marker. Logged in the very first line so any captured boot log
     // tells us exactly which build is running.

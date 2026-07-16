@@ -1,11 +1,13 @@
 #include "local_screens.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "chip_temp.h"
 #include "display.h"
 #include "net_eth.h"
 #include "viewport_state.h"
@@ -310,6 +312,8 @@ esp_err_t local_screens_show_info(void)
     ADD("errs    %llu", (unsigned long long)(decode_err + post_err));
     ADD("heap    %s",  heap_str);
     ADD("psram   %s",  psram_str);
+    float temp_c = chip_temp_read();   // on-die junction temp; skip if n/a
+    if (!isnan(temp_c)) ADD("temp    %.1fc", (double)temp_c);
 
     #undef ADD
 

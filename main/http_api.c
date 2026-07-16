@@ -1,6 +1,7 @@
 #include "http_api.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -17,6 +18,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+#include "chip_temp.h"
 #include "display.h"
 #include "jpeg_decoder.h"
 #include "mdns_service.h"
@@ -78,6 +80,13 @@ static esp_err_t state_get_handler(httpd_req_t *req)
     // prevented (would-have-torn count under double buffering).
     cJSON_AddNumberToObject(root, "tear_guard_engaged",
         (double)display_tear_guard_engaged());
+    // On-die junction temperature (°C, ~10-20° above ambient under
+    // load). Omitted entirely if the sensor is unavailable.
+    float temp_c = chip_temp_read();
+    if (!isnan(temp_c)) {
+        cJSON_AddNumberToObject(root, "temp_c",
+                                round((double)temp_c * 10.0) / 10.0);
+    }
 
     viewport_state_unlock();
 
