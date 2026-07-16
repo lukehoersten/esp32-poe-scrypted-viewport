@@ -122,13 +122,30 @@ static uint8_t                  s_last_pwm;
 // instead writes the JPEG decoder output directly into the panel's
 // double-buffered framebuffer (see s_panel_fbs).
 static uint8_t                 *s_rot_buf;
-// The DPI driver owns the two framebuffers when num_fbs = 2. We grab
-// pointers to both after panel_init and alternate which one we hand to
-// the JPEG decoder + the panel for each /frame. draw_bitmap with a
-// pointer that's inside one of these turns into a cache writeback +
-// index swap (microseconds), eliminating the previous ~24 ms memcpy.
-static uint8_t                 *s_panel_fbs[2];
-static int                      s_back_fb;     // index of the fb the next paint will fill
+// The DPI driver owns the framebuffers when num_fbs > 1. We grab
+// pointers to all of them after panel_init and hand one to the JPEG
+// decoder + the panel for each frame. draw_bitmap with a pointer
+// that's inside one of these turns into a cache writeback + index
+// swap (microseconds), eliminating the previous ~24 ms memcpy.
+//
+// Triple buffering + scan tracking = tear-free with zero waiting.
+// draw_bitmap only updates the driver's cur_fb_index; the DMA reloads
+// that index at the END of the in-progress frame scan (~21 ms period
+// at ~47 Hz). So after a flip the just-retired fb keeps scanning out
+// until the next boundary — under double buffering, a back-to-back
+// decode would write into it mid-scan (tear). With three fbs the next
+// decode target is chosen to avoid BOTH the pending fb (flipped, will
+// display at the next boundary) and the scanning fb (tracked via the
+// driver's on_refresh_done, which fires exactly when the DMA reloads):
+// three buffers minus at most two excluded roles = always a free one.
+static uint8_t                 *s_panel_fbs[3];
+static int                      s_back_fb;      // fb the next paint will fill
+static volatile uint8_t         s_pending_fb;   // last fb handed to draw_bitmap
+static volatile uint8_t         s_scanning_fb;  // fb the DMA is scanning out now
+static volatile uint32_t        s_tear_guard_engaged;  // frames where scanning !=
+                                                       // pending at back-buffer pick
+                                                       // (= frames double buffering
+                                                       // would have torn)
 
 // ============================================================================
 // ATTINY88 I2C helpers
@@ -270,6 +287,17 @@ static esp_err_t bridge_init(void)
     return ESP_OK;
 }
 
+// Runs in the DPI driver's DMA-done ISR at every frame boundary — keep it
+// to the one assignment. See the comment at the registration site.
+static bool on_refresh_done_cb(esp_lcd_panel_handle_t panel,
+                               esp_lcd_dpi_panel_event_data_t *edata,
+                               void *user_ctx)
+{
+    (void)panel; (void)edata; (void)user_ctx;
+    s_scanning_fb = s_pending_fb;
+    return false;
+}
+
 // ============================================================================
 // DSI bring-up
 // ============================================================================
@@ -314,10 +342,12 @@ static esp_err_t dsi_bring_up(void)
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB888,
         .in_color_format    = LCD_COLOR_FMT_RGB888,
         .out_color_format   = LCD_COLOR_FMT_RGB888,
-        // Double-buffer the panel: the DSI engine streams one fb while
-        // we fill the other. esp_lcd_panel_draw_bitmap(fb) becomes a
-        // cache writeback + index swap (~µs) instead of a ~24 ms memcpy.
-        .num_fbs            = 2,
+        // Triple-buffer the panel (see s_panel_fbs): one fb scanning
+        // out, one pending display at the next frame boundary, one
+        // free for the decoder. esp_lcd_panel_draw_bitmap(fb) stays a
+        // cache writeback + index swap (~µs), and the decoder never
+        // writes a buffer the DMA might still be reading.
+        .num_fbs            = 3,
         .video_timing = {
             .h_size            = PANEL_H_ACTIVE,
             .v_size            = PANEL_V_ACTIVE,
@@ -350,15 +380,30 @@ static esp_err_t dsi_bring_up(void)
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel_init");
 
-    // Grab pointers to both framebuffers so we can hand them to the
-    // JPEG decoder as the direct decode destination — that triggers
+    // Grab pointers to all three framebuffers so we can hand them to
+    // the JPEG decoder as the direct decode destination — that triggers
     // the IDF DPI driver's fast path in draw_bitmap (no memcpy).
-    void *fb0 = NULL, *fb1 = NULL;
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 2, &fb0, &fb1),
+    void *fb0 = NULL, *fb1 = NULL, *fb2 = NULL;
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 3, &fb0, &fb1, &fb2),
                        TAG, "get_frame_buffer");
     s_panel_fbs[0] = fb0;
     s_panel_fbs[1] = fb1;
-    s_back_fb      = 1;   // fb0 is the one the driver shows first; we fill fb1 next
+    s_panel_fbs[2] = fb2;
+    s_pending_fb  = 0;   // driver scans fb0 first
+    s_scanning_fb = 0;
+    s_back_fb     = 1;
+
+    // Track which fb the DMA is actually scanning. on_refresh_done fires
+    // from the driver's DMA-done ISR at each frame boundary, exactly when
+    // the DMA has just been reloaded with cur_fb_index — i.e. the pending
+    // fb becomes the scanning fb. (If a flip lands concurrently, the
+    // stale value only over-excludes an actually-free fb for one frame —
+    // conservative, never a tear.)
+    esp_lcd_dpi_panel_event_callbacks_t cbs = {
+        .on_refresh_done = on_refresh_done_cb,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
+                       TAG, "register_event_callbacks");
 
     // Continuous HS clock — TC358762's internal FLL needs a stable
     // reference, and we still allow LP data-lane blanking so command
@@ -464,6 +509,22 @@ void *display_back_buffer(size_t *out_size)
 {
     if (!s_up) return NULL;
     if (out_size) *out_size = (size_t)PANEL_H_ACTIVE * PANEL_V_ACTIVE * 3;
+
+    // Pick the fb that is neither pending display nor being scanned out.
+    // Snapshot the ISR-written value once so both the exclusion and the
+    // counter see the same fb. If scanning == pending (steady state: the
+    // boundary already passed), two fbs are free — pick the lowest.
+    // If they differ, the previous fb is still mid-scan and this pick is
+    // exactly the case where double buffering would have torn.
+    uint8_t scanning = s_scanning_fb;
+    uint8_t pending  = s_pending_fb;
+    if (scanning != pending) s_tear_guard_engaged++;
+    for (int i = 0; i < 3; i++) {
+        if (i != scanning && i != pending) {
+            s_back_fb = i;
+            break;
+        }
+    }
     return s_panel_fbs[s_back_fb];
 }
 
@@ -474,8 +535,13 @@ esp_err_t display_flip_back_buffer(void)
     esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
                                               PANEL_H_ACTIVE, PANEL_V_ACTIVE,
                                               fb);
-    if (err == ESP_OK) s_back_fb ^= 1;   // next /frame fills the other one
+    if (err == ESP_OK) s_pending_fb = (uint8_t)s_back_fb;
     return err;
+}
+
+uint32_t display_tear_guard_engaged(void)
+{
+    return s_tear_guard_engaged;
 }
 
 esp_err_t display_present_rgb565(const uint16_t *src,

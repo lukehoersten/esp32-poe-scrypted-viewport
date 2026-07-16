@@ -73,6 +73,11 @@ static esp_err_t state_get_handler(httpd_req_t *req)
         (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(root, "free_psram",
         (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // Frames whose decode target was picked while the previous fb was
+    // still mid-scan — each one is a tear the triple-buffer guard
+    // prevented (would-have-torn count under double buffering).
+    cJSON_AddNumberToObject(root, "tear_guard_engaged",
+        (double)display_tear_guard_engaged());
 
     viewport_state_unlock();
 

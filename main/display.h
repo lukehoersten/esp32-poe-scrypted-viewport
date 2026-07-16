@@ -48,13 +48,20 @@ esp_err_t display_present_rgb565(const uint16_t *src,
 // driver skips the memcpy entirely; otherwise it copies via CPU.
 esp_err_t display_present_bgr888(const void *bgr888);
 
-// Double-buffer accessors for the zero-memcpy /frame path. The DPI
-// panel owns two BGR888 framebuffers; `display_back_buffer` hands back
-// the one that is NOT currently being streamed by the DSI engine so
-// callers (the JPEG decoder) can fill it in place. When the buffer is
-// ready, `display_flip_back_buffer` swaps it in — turns into a cache
-// writeback + index swap inside the IDF driver (no memcpy).
+// Framebuffer accessors for the zero-memcpy frame path. The DPI panel
+// owns three BGR888 framebuffers (triple buffering): one scanning out,
+// one pending display at the next frame boundary, one free.
+// `display_back_buffer` hands back the free one — guaranteed not to be
+// touched by the DSI DMA — so callers (the JPEG decoder) can fill it in
+// place with no tear risk and no waiting. When the buffer is ready,
+// `display_flip_back_buffer` swaps it in — a cache writeback + index
+// swap inside the IDF driver (no memcpy).
 //   `out_size` (if non-null) is set to the buffer's byte size, useful
 //   for passing to jpeg_decoder_process as its output capacity.
 void      *display_back_buffer(size_t *out_size);
 esp_err_t  display_flip_back_buffer(void);
+
+// Count of back-buffer picks made while the previously-flipped fb was
+// still scanning out — i.e. frames that would have torn under the old
+// double-buffer scheme. Monotonic since boot; exposed via /state.
+uint32_t   display_tear_guard_engaged(void);
