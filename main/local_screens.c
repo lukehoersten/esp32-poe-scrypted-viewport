@@ -74,7 +74,9 @@ static const uint8_t FONT[95][8] = {
 #define FG  0xFFFF   // white
 #define BG  0x0000   // black
 
-#define INFO_MAX_LINES   16
+#define INFO_MAX_LINES   20   // headroom over the current 17 ADDs — the ADD
+                              // macro SILENTLY drops lines past this cap
+                              // (bit us when temp made it exactly 17)
 #define INFO_LINE_BYTES  80   // generous: viewport_name is 64 chars max
 
 static uint16_t           *s_fb;            // PSRAM scratch at PANEL_W × PANEL_H
