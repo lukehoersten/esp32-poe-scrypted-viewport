@@ -513,7 +513,7 @@ curl --data-binary @build/scrypted-viewport.bin \
 | `net_eth.{h,c}` | Internal EMAC + IP101GRI PHY init, DHCP wait, IP getter. Pin map verified against Waveshare wiki + ESPHome's working config. |
 | `mdns_service.{h,c}` | `mdns_init()` + `_scrypted-viewport._tcp.local` advertisement. `mdns_service_refresh()` reapplies hostname + TXT after `/config` writes change them. |
 | `http_api.{h,c}` | `esp_http_server` on :80. All five endpoints (`GET /state`, `GET /config`, `POST /config`, `POST /state`, `POST /frame`) with partial-update + validation + status codes from the spec. |
-| `display.{h,c}` | Pi 7"-style panel: I²C bring-up of the on-panel MCU at `0x45` (power-on register dance), ESP32-P4 MIPI-DSI in DPI video mode at canonical Pi 7" timings, gamma-corrected backlight PWM, orientation-aware blit (memcpy landscape / 90° CW rotate portrait). |
+| `display.{h,c}` | Pi 7"-style panel: I²C bring-up of the on-panel MCU at `0x45` (power-on register dance), ESP32-P4 MIPI-DSI in DPI video mode at canonical Pi 7" timings, gamma-corrected backlight PWM, orientation-aware blit (memcpy landscape / 90° CW rotate portrait). Owns the tear-free triple-buffer scheme (see *Display strategy*): scanning-fb tracking via `on_refresh_done`, free-fb selection for the decoder, `tear_guard_engaged` counter. |
 | `jpeg_decoder.{h,c}` | ESP32-P4 hardware JPEG engine with a 1 MB PSRAM scratch buffer and a `try_lock(0)` for concurrent `/frame` → 503. |
 | `state_machine.{h,c}` | Central wake/sleep transitions (mutex-protected, idempotent). Owns the `esp_timer` idle one-shot. `state_machine_set_local()` is the device-initiated variant — drives the transition *and* fires the outbound `/state` POST. |
 | `state_client.{h,c}` | Worker task + `xQueueOverwrite()` depth-1 queue for outbound POSTs to `<scrypted>/state`. 1 s timeout, fire-and-forget, `state_post_failures` counter. |
@@ -523,11 +523,15 @@ curl --data-binary @build/scrypted-viewport.bin \
 
 ### Memory strategy
 
-The Waveshare board ships with 32 MB PSRAM. Everything large lives there: JPEG input scratch (1 MB), decoder output (768 KB RGB565 native), `esp_lcd_dpi` framebuffer (also PSRAM-backed), local-screens scratch (768 KB). Internal SRAM is reserved for FreeRTOS task stacks and small allocations — `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` keeps allocations ≤ 16 KB in SRAM by default.
+The Waveshare board ships with 32 MB PSRAM. Everything large lives there: the stream body ring (3 × ~1 MB JPEG input buffers), the three `esp_lcd_dpi` BGR888 framebuffers (3 × 1.15 MB — the JPEG decoder writes directly into these, there is no separate decoder output buffer), and the local-screens scratch (~1.15 MB). Internal SRAM is reserved for FreeRTOS task stacks, EMAC DMA buffers, and small allocations — `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` keeps allocations ≤ 16 KB in SRAM by default.
 
 ### Display strategy
 
-JPEG → RGB565 framebuffer → DSI panel, single buffer. No double buffering, no LVGL, no general text engine. The only locally-drawn UI is the IP screen and the Loading screen (both via the 8×8 bitmap font in `local_screens.c`). Brightness PWM is gamma-corrected — `duty = (level/100)^2.2 * 255` — so 0–100 maps to perceptual brightness instead of linear duty cycle.
+JPEG → BGR888 → DSI panel, **triple-buffered**, zero-copy and tear-free. No LVGL, no general text engine. The only locally-drawn UI is the IP screen, the Loading screen, and the info overlay (all via the 8×8 bitmap font in `local_screens.c`). Brightness PWM is gamma-corrected — `duty = (level/100)^2.2 * 255` — so 0–100 maps to perceptual brightness instead of linear duty cycle.
+
+**Why three framebuffers.** The DPI driver owns the framebuffers (`num_fbs = 3`); the hardware JPEG decoder writes straight into one of them, so `esp_lcd_panel_draw_bitmap` takes the IDF fast path — a cache writeback plus an index swap (~40 µs), no memcpy anywhere. But that index swap is *deferred*: the DSI DMA only reloads the new index at the **end of the frame scan in progress** (~21 ms period at ~47 Hz). With two buffers, flipping and immediately decoding the next frame writes into the buffer the DMA is still scanning out — a torn frame. That regime is common once frames arrive back-to-back (measured: ~6% of painted frames at full stream rate).
+
+Waiting for vsync before decoding would fix it at the cost of up to one refresh period of latency per frame. Instead, the three buffers hold three roles — **scanning** (DMA is reading it), **pending** (flipped, displays at the next boundary), **free** — and `display_back_buffer()` always hands the decoder the free one. The scanning buffer is tracked from the driver's `on_refresh_done` ISR (fires exactly when the DMA reloads its index). Three buffers minus at most two excluded roles = always a safe decode target: tear-free by construction, with zero waiting. `/state` reports `tear_guard_engaged` — picks made while the previous buffer was still mid-scan, i.e. frames that would have torn under double buffering. Cost: one extra 1.15 MB PSRAM framebuffer.
 
 ### Error handling
 
@@ -560,7 +564,7 @@ The firmware streams over a long-lived raw TCP socket on port 81 (replacing the 
 |---|---|---|---|
 | `recv` | 14–18 ms | ~70% | Pure wire time for the body, measured on the recv-task (does NOT include decoder-lock acquisition any more) |
 | `dec` | ~5 ms | ~25% | Hardware JPEG decode → BGR888 |
-| `paint` | 16–35 µs | < 0.2% | `esp_lcd_panel_draw_bitmap` — cache writeback + index swap thanks to `num_fbs = 2` and zero-copy decode into the back fb |
+| `paint` | 16–60 µs | < 0.2% | `esp_lcd_panel_draw_bitmap` — cache writeback + index swap thanks to `num_fbs = 3` and zero-copy decode into the free fb (see *Display strategy* for the tear-free triple-buffer model) |
 | `decode_idle` | **27–40 ms** | n/a | Time decode-task spent waiting on the recv→decode signal. Means the decode/paint stage is *idle* most of the time at the source rate — the wire is the cap. |
 
 Scrypted side: `sent=24.0fps painted=24.0fps backpressured=false`, `g2g=31–41 ms`. No `fw-skipped`, no `drops`, no `flushes`.
@@ -573,9 +577,19 @@ The fix wasn't a TCP knob, it was the task architecture. `d1c8d45` split `handle
 
 The full instrumentation that drove the diagnosis (`queued_at_body_start`, `recv_calls`, `recv_chunk_min/avg/max`, `recv_dropped_oldest`, `decode_idle_*`, `so_rcvbuf`) is still in `/state` and the windowed log.
 
+### TCP window + EMAC tuning (the follow-up the task split unlocked)
+
+With recv on its own task and a skip-oldest slot, the window became safe to raise — but "safe" had to be proven, so first the stream gained a decomposition that accounts for the whole frame interval: `interval ≈ hdr_gap (sender idle) + recv (wire) + pend_age (handoff wait) + dec + paint`, plus `wire_*_kbps` — the instantaneous throughput while a body drains, whose ceiling is `TCP_WND / RTT`, making it the definitive "is the window the limiter" metric.
+
+Measured at the default `TCP_WND=5760` (~190 KB frames): wire pinned at 53 Mbps vs ~94 Mbps line rate on the 10/100 PHY, `recv_chunk_max` at exactly 5760, sender backpressured on half its frames — window-bound, three ways.
+
+Raising to `TCP_WND=23040` alone **regressed** (fps 20 → 14, 200–450 ms recv stalls): the EMAC RX DMA pool (20 × 512 B = 10 KB) was smaller than the in-flight window, so a full-window burst overran the RX descriptors, the burst tail dropped with no dup-ACKs behind it, and the sender waited out ~200 ms min-RTO recoveries. **Invariant: the EMAC RX pool must exceed `TCP_WND`.** With `ETH_DMA_BUFFER_SIZE=1600` (one MSS frame per buffer/descriptor) × 24 = 38.4 KB, the stall tail vanished: wire 74 avg / 84 max Mbps, recv 21 ms, painted fps +19%, g2g 73 → ~40–60 ms.
+
+Stopped there deliberately: the interval is now ~half `hdr_gap` (sender has nothing ready), so bigger windows buy little until the source rate rises. `pend_age_*` remains the tripwire — it must stay in microseconds; growth means the kernel-queue latency backlog that killed the pre-split 65535 experiment is back.
+
 ### Current backlog, in rough priority order
 
-1. **(was) Network body shrink — done.** The receiver now drains at line rate without blocking decode. Source rate (Unifi substream `medium-resolution` ≈ 24 fps) is the cap. The ffmpeg `-q:v` knob still works if you want smaller frames for non-streaming reasons; bumping the TCP window is now safe (3-buffer ring + skip-oldest backstop) but won't add fps until source rate goes up.
+1. **(was) Network body shrink — done.** The receiver now drains near line rate without blocking decode: TCP window raised to 23040 with the EMAC RX pool sized above it (see *TCP window + EMAC tuning*), wire 74 Mbps avg. Source rate (Unifi substream `medium-resolution` ≈ 24 fps) is the cap.
 2. **(was) OTA firmware updates — done.** `POST /firmware` ships in `175dd50`, ota_0/ota_1 alternation with `BOOTLOADER_APP_ROLLBACK_ENABLE` for first-boot revert. `curl --data-binary @build/scrypted-viewport.bin http://<viewport>/firmware` reboots into the new image.
 3. **Task watchdog + crash counters** — *low effort*. Enable the ESP-IDF task watchdog, surface its bite count in `/state` alongside the existing `decode_errors` / `state_post_failures`. Good hygiene.
 4. **Multi-camera per viewport** — *medium effort*. Let one viewport listen to events from N cameras, picking which one to stream based on which fired. Useful for "show whichever doorbell rang" or zone monitoring.

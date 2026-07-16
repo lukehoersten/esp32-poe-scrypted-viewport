@@ -1487,6 +1487,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             // missed /state never wedges the logger.
             let painted = "?", paintedMb = "?", g2g = "?", paintedNum = -1;
             let recvStr = "?", decStr = "?", paintStr = "?", idleStr = "?";
+            let tempStr = "?";
             try {
                 const st: any = await fetch(`http://${v.host}/state`, {
                     signal: AbortSignal.timeout(800),
@@ -1501,6 +1502,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                     paintStr   = `${fs.paint_min_us}/${fs.paint_avg_us}/${fs.paint_max_us}`;
                     idleStr    = `${fs.idle_min_us}/${fs.idle_avg_us}/${fs.idle_max_us}`;
                 }
+                // On-die junction temp (°C); free thermal trending under
+                // streaming load, the hottest thing this device does.
+                if (typeof st?.temp_c === "number") tempStr = st.temp_c.toFixed(1);
                 if (fs?.last_paint_event_us_low) {
                     const nowUsLow = (Date.now() * 1000) >>> 0;
                     const diff = (nowUsLow - fs.last_paint_event_us_low) >>> 0;
@@ -1541,7 +1545,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 `${mbPerSec.toFixed(2)}MB/s sent / ${paintedMb}MB/s painted | ` +
                 `socket.write p50=${p50}ms p95=${p95}ms max=${max}ms backpressured=${socketBackpressured} bp=${framesSampled > 0 ? ((framesUnderBp / framesSampled) * 100).toFixed(0) : "?"}% ` +
                 `node_buf=${(nodeBufBytes / 1024).toFixed(0)}KB≈${nodeBufMs}ms/${v.maxNodeBufMb}MB cap | ` +
-                `recv=${recvStr}us dec=${decStr}us paint=${paintStr}us idle=${idleStr}us | g2g=${g2g}`);
+                `recv=${recvStr}us dec=${decStr}us paint=${paintStr}us idle=${idleStr}us | temp=${tempStr}C | g2g=${g2g}`);
 
             droppedFrames = 0;
             droppedOldest = 0;
