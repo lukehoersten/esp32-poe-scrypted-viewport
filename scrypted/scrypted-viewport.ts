@@ -59,7 +59,6 @@ const SCRIPT_VERSION = "2af69f7";
 // All we do here is `declare` each one so TypeScript is happy; the
 // declarations erase at compile time and the values come from the
 // runtime scope.
-declare const sdk: any;
 declare const ScryptedDeviceBase: any;
 declare const ScryptedDeviceType: any;
 declare const ScryptedInterface:  any;
@@ -67,8 +66,6 @@ declare const systemManager:      any;
 declare const endpointManager:    any;
 declare const mediaManager:       any;
 declare const deviceManager:      any;
-declare const log:                any;
-declare const device:             any;
 declare const require:            any;
 
 
@@ -137,6 +134,8 @@ const REREGISTER_INTERVAL_MS     = 5 * 60_000;
 const HTTP_TIMEOUT_MS            = 5_000;
 const DEFAULT_IDLE_TIMEOUT_MS    = 60_000;
 const DEFAULT_BRIGHTNESS         = 100;
+// JPEG end-of-image marker — the frame delimiter for the MJPEG demux loop.
+const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
 // ============================================================================
 // Child: one viewport binding
@@ -399,7 +398,7 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             if (!truthy) return;
             if (!this.host) return;
             if (key === "action_wake") {
-                if (!this.provider.streams.has(this.name) &&
+                if (!this.provider.streams.has(this.nativeId!) &&
                     !this.provider.streamStarting.has(this.nativeId!)) {
                     this.provider.streamStarting.add(this.nativeId!);
                     this.provider.startStream(this)
@@ -407,7 +406,7 @@ class Viewport extends ScryptedDeviceBase implements Settings {
                         .finally(() => this.provider.streamStarting.delete(this.nativeId!));
                 }
             } else {
-                this.provider.stopStream(this.name, /*sendSleep=*/ true);
+                this.provider.stopStream(this.nativeId!, /*sendSleep=*/ true);
             }
             return;
         }
@@ -461,10 +460,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // nativeId -> last-registered config signature, so the "registered" line
     // logs only on a real change, not every 5-minute reregister cycle.
     private lastRegisterSig = new Map<string, string>();
-    streams = new Map<string, {                                   // viewport name -> stream control (accessed by Viewport.putSetting for manual wake/sleep)
-        timeout:   NodeJS.Timeout;
-        abort:     AbortController;       // also tears down the ffmpeg child via its listener
-        interval?: NodeJS.Timeout;        // legacy snapshot-poll mode
+    // nativeId -> stream control (accessed by Viewport.putSetting for
+    // manual wake/sleep). Keyed by nativeId, NOT v.name: the name can
+    // briefly drift to the nativeId on script reload (see
+    // registerViewport), which would strand or duplicate a stream keyed
+    // under the drifted value.
+    streams = new Map<string, {
+        timeout: NodeJS.Timeout;
+        abort:   AbortController;         // also tears down the ffmpeg child via its listener
     }>();
     private scryptedBase = "";
 
@@ -498,9 +501,19 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     //   stop():  drain every resource (streams, listeners, intervals)
     //            and clear in-memory maps. Idempotent.
 
+    // Single-flight guard: the constructor auto-start and a UI START
+    // click can overlap while bootstrap() is mid-await (running only
+    // flips true afterwards); share the in-flight promise instead of
+    // running bootstrap twice.
+    private startingPromise: Promise<void> | null = null;
+
     async start() {
         if (this.running) return;
-        await this.bootstrap();
+        if (!this.startingPromise) {
+            this.startingPromise = this.bootstrap()
+                .finally(() => { this.startingPromise = null; });
+        }
+        await this.startingPromise;
         this.running = true;
     }
 
@@ -549,6 +562,32 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
 
     private async bootstrap() {
+        // Unified script-reload cleanup — MUST run before anything below
+        // attaches listeners or spawns resources.
+        //
+        // Scrypted's Scripts sandbox does NOT release a previous load's
+        // resources before constructing a new instance. setInterval
+        // handles, TCP sockets, ffmpeg children, AbortControllers, and
+        // camera event registrations all survive a script re-paste and
+        // accumulate over time. Every long-lived resource pushes a
+        // cleanup closure onto a single globalThis-anchored array; we
+        // drain that array here so the prior load's resources die before
+        // this load creates its own. Draining any later (it used to run
+        // at the END of bootstrap) would tear down the listeners the
+        // child re-discovery loop below just attached — and, because the
+        // instance maps still referenced them, block the register-cycle
+        // self-heal from ever re-attaching.
+        drainShutdownCleaners(this.console, "start");
+        // Debounce timers are instance-private and can't self-register a
+        // closure at creation time that survives sensibly, so clear them
+        // wholesale on the next load: a timer pending across a re-paste
+        // would fire against this dead instance ~300ms into the new load
+        // and attach a duplicate camera listener.
+        pushShutdownCleaner(() => {
+            for (const t of this.bindingDebounce.values()) { try { clearTimeout(t); } catch {} }
+            this.bindingDebounce.clear();
+        });
+
         // endpointManager.getInsecurePublicLocalEndpoint() takes a nativeId
         // (string) — passing this.id (numeric Scrypted DB ID) throws
         // "invalid nativeId N". this.nativeId is the right key, and an
@@ -629,29 +668,6 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.console.log(`pruned ${staleChildIds.length} stale child id(s): ${staleChildIds.join(", ")}`);
         }
 
-        // Unified script-reload cleanup.
-        //
-        // Scrypted's Scripts sandbox does NOT release a previous load's
-        // resources before constructing a new instance. setInterval
-        // handles, TCP sockets, ffmpeg children, AbortControllers, and
-        // camera event registrations all survive a script re-paste and
-        // accumulate over time. Observable symptoms:
-        //   - duplicate "registered ..." log lines every 5 minutes
-        //     after N reloads
-        //   - duplicate stream-start log lines (and the racing
-        //     pushSnapshots that degrade panel image quality) because
-        //     the old instance's event listener is still subscribed
-        //   - orphaned ffmpeg processes + half-open TCP sockets to the
-        //     firmware after a reload during an active stream
-        //
-        // We solve all of these uniformly: every long-lived resource
-        // pushes a cleanup closure onto a single globalThis-anchored
-        // array. The next constructor drains that array first, which
-        // walks every resource the previous load created and tears it
-        // down via the closure that knows how (clearInterval / abort /
-        // removeListener). The new load then starts with an empty
-        // resource set.
-        drainShutdownCleaners(this.console, "start");
         const reregisterHandle = setInterval(() => {
             for (const v of this.viewports.values()) {
                 this.registerViewport(v).catch(() => {});
@@ -678,10 +694,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     async releaseDevice(id: string, nativeId: string) {
         const v = this.viewports.get(nativeId);
         if (v) {
-            this.stopStream(v.name, /*sendSleep=*/ false);
+            this.stopStream(nativeId, /*sendSleep=*/ false);
             this.detachListener(nativeId);
             this.viewports.delete(nativeId);
         }
+        // Drop every per-device bookkeeping entry, not just the instance.
+        this.lastRegisterSig.delete(nativeId);
+        this.streamStarting.delete(nativeId);
+        const t = this.bindingDebounce.get(nativeId);
+        if (t) { clearTimeout(t); this.bindingDebounce.delete(nativeId); }
         this.childIds = this.childIds.filter(x => x !== nativeId);
     }
 
@@ -779,10 +800,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.childIds = [...this.childIds, nativeId];
         this.console.log(`created viewport "${name}" (${nativeId})`);
 
-        // Kick off the first register cycle (POST /config to the device).
-        // Fire-and-forget — the new device shows up immediately either way.
-        const child = await this.getDevice(nativeId);
-        if (child) this.registerViewport(child).catch(() => {});
+        // Instantiate the child — getDevice runs the first register cycle
+        // (POST /config to the device) for a new instance itself.
+        await this.getDevice(nativeId);
 
         return nativeId;
     }
@@ -810,8 +830,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             // was live we relaunch immediately under the new settings
             // so the user sees the change without waiting for the next
             // camera event.
-            const wasStreaming = this.streams.has(v.name);
-            this.stopStream(v.name, /*sendSleep=*/ false);
+            const wasStreaming = this.streams.has(nid);
+            this.stopStream(nid, /*sendSleep=*/ false);
             this.attachListener(v);
             this.registerViewport(v)
                 .then(() => {
@@ -881,15 +901,24 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 this.handleCameraEvent(v, details, data);
             });
             regs.push(reg);
-            // Register for cross-reload cleanup so a re-paste removes
-            // every listener. Without this each re-paste stacks an extra
-            // callback per event source.
-            pushShutdownCleaner(() => { try { reg.removeListener(); } catch {} });
         }
-        const targetNames = [`${cam.name || cam.id} (${ifaces.join("+")})`];
-        this.listeners.set(v.nativeId!, regs);
+        // One cross-reload cleaner for the whole attach: removes every
+        // listener AND invalidates this instance's bookkeeping. Without
+        // the map invalidation, a drain performed by another instance
+        // (Stop click landing on an old load) leaves attachedCameraId +
+        // listeners claiming live registrations, and the idempotent
+        // fast-path above then blocks the register-cycle self-heal from
+        // ever re-attaching.
+        pushShutdownCleaner(() => {
+            for (const reg of regs) { try { reg.removeListener(); } catch {} }
+            if (this.listeners.get(nid) === regs) {
+                this.listeners.delete(nid);
+                this.attachedCameraId.delete(nid);
+            }
+        });
+        this.listeners.set(nid, regs);
         this.attachedCameraId.set(nid, want);
-        this.console.log(`viewport "${tag}": subscribed to [${targetNames.join(", ")}]`);
+        this.console.log(`viewport "${tag}": subscribed to [${cam.name || cam.id} (${ifaces.join("+")})]`);
     }
 
     private detachListener(nativeId: string) {
@@ -971,7 +1000,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // fires repeatedly, the doorbell ring lands mid-motion) must not
         // queue, relaunch, or extend it. Cheapest possible early-out — before
         // trigger evaluation — so a live stream sees zero per-event work.
-        if (this.streams.has(v.name) || this.streamStarting.has(v.nativeId!)) return;
+        if (this.streams.has(v.nativeId!) || this.streamStarting.has(v.nativeId!)) return;
 
         const iface = details.eventInterface;
         const allowed = v.triggers;
@@ -994,7 +1023,10 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             .finally(() => this.streamStarting.delete(v.nativeId!));
     }
 
-    async startStream(v: Viewport, tEvent: number = Date.now()) {
+    // alreadyAwake: the device initiated this wake (panel tap), so the
+    // {state:"wake"} POST back to it would be a pointless round-trip on
+    // the cold-start critical path.
+    async startStream(v: Viewport, tEvent: number = Date.now(), alreadyAwake = false) {
         const since = () => Date.now() - tEvent;
         this.console.log(`stream "${v.name}": start +${since()}ms`);
         // (event_us_low is stamped per frame at emit time inside the
@@ -1004,14 +1036,28 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
         // Race rule: cancel pending operations on every callback before
         // beginning a fresh stream.
-        this.stopStream(v.name, /*sendSleep=*/ false);
+        this.stopStream(v.nativeId!, /*sendSleep=*/ false);
 
         if (!v.host || !v.cameraId) return;
 
-        await this.postJSON(`http://${v.host}/state`, { state: "wake" });
+        // Compensating sleep for bail-out paths below: once the wake POST
+        // has gone out, giving up without it strands the panel on the
+        // "Loading..." screen — forever, if its idle timer is disabled
+        // (idle_timeout_ms=0). A dark panel is the honest failure signal.
+        const bailSleep = () => {
+            this.postJSON(`http://${v.host}/state`, { state: "sleep" }).catch(() => {});
+        };
+
+        if (!alreadyAwake) {
+            await this.postJSON(`http://${v.host}/state`, { state: "wake" });
+        }
 
         const cam: any = systemManager.getDeviceById(v.cameraId);
-        if (!cam) return;
+        if (!cam) {
+            this.console.warn(`stream "${v.name}": camera ${v.cameraId} not found — sleeping panel`);
+            bailSleep();
+            return;
+        }
 
         // No pre-stream snapshot: the prebuffered stream now paints in ~0.7s
         // (see the prebuffer selection below), so the old takePicture→POST
@@ -1154,17 +1200,26 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 catch { /* try next */ }
             }
         }
-        if (!stream) { stream = await cam.getVideoStream(); pickedDest = "(camera-default)"; }
+        if (!stream) {
+            try { stream = await cam.getVideoStream(); pickedDest = "(camera-default)"; }
+            catch (e) {
+                this.console.warn(`stream "${v.name}": no video stream available (${(e as Error).message}) — sleeping panel`);
+                bailSleep();
+                return;
+            }
+        }
         // True only when we actually got the prebuffered-by-id stream — drives
         // the burst-friendly ffmpeg input flags below.
         const usingPrebuffer = pickedDest.includes("prebuffered");
         this.console.log(`stream "${v.name}": orientation=${v.orientation} panel=${panelW}x${panelH} vf="${vf}" substream=${pickedDest} prebuffer=${prebufferMs}ms usingPrebuffer=${usingPrebuffer}`);
-        const ffmpegInputBuf: Buffer = await mediaManager.convertMediaObjectToBuffer(
-            stream, "x-scrypted/x-ffmpeg-input");
         let ffmpegInput: any;
-        try { ffmpegInput = JSON.parse(ffmpegInputBuf.toString("utf8")); }
-        catch (e) {
-            this.console.warn(`"${v.name}" no usable video stream for ffmpeg — skipping`);
+        try {
+            const ffmpegInputBuf: Buffer = await mediaManager.convertMediaObjectToBuffer(
+                stream, "x-scrypted/x-ffmpeg-input");
+            ffmpegInput = JSON.parse(ffmpegInputBuf.toString("utf8"));
+        } catch (e) {
+            this.console.warn(`"${v.name}" no usable video stream for ffmpeg (${(e as Error).message}) — sleeping panel`);
+            bailSleep();
             return;
         }
         const { spawn } = require("child_process");
@@ -1234,7 +1289,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // complements the point-in-time backpressured= flag.
         let framesSampled     = 0;
         let framesUnderBp     = 0;
-        let lastLogUs = Date.now();
+        let lastLogMs = Date.now();
         let workBuf: Buffer = Buffer.alloc(0);
 
         // Latency probe — wall-clock from "ffmpeg emitted the JPEG"
@@ -1259,8 +1314,27 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             return ok;
         };
 
+        // Single-flight reconnect. A failed Node connect emits 'error'
+        // FOLLOWED BY 'close'; scheduling from both (as this used to)
+        // doubles the outstanding attempts on every failure — an
+        // exponential connection storm against a rebooting device.
+        // 'close' always fires last, so it is the one reconnect trigger;
+        // the pending-timer guard collapses any duplicates.
+        let reconnectTimer: NodeJS.Timeout | null = null;
+        const scheduleReconnect = () => {
+            if (reconnectTimer || abort.signal.aborted) return;
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                openStreamSocket();
+            }, 500);
+        };
         const openStreamSocket = () => {
             if (abort.signal.aborted) return;
+            // Tear down the previous socket first so a straggler that
+            // connects late can't linger with live handlers.
+            if (sock) {
+                try { sock.removeAllListeners(); sock.destroy(); } catch {}
+            }
             socketReady = false;
             socketBackpressured = false;
             // Drop any frame held from the previous socket — it's stale
@@ -1288,15 +1362,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             sock.on("error", (e: Error) => {
                 this.console.warn(`stream "${v.name}" socket: ${e.message}`);
                 socketReady = false;
-                if (!abort.signal.aborted) setTimeout(openStreamSocket, 500);
+                // no reconnect here — 'close' follows 'error' and handles it
             });
             sock.on("close", () => {
                 socketReady = false;
-                if (!abort.signal.aborted) setTimeout(openStreamSocket, 500);
+                scheduleReconnect();
             });
         };
         openStreamSocket();
         abort.signal.addEventListener("abort", () => {
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
             try { sock?.destroy(); } catch {}
         });
 
@@ -1313,6 +1388,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const spawnFfmpeg = () => {
             if (abort.signal.aborted) return;
             workBuf = Buffer.alloc(0);   // reset framer state on each respawn
+            // Resume-scan offset into workBuf: when a chunk arrives without
+            // completing a frame, the next search only needs to cover the
+            // new bytes (minus 1 for a marker straddling the boundary)
+            // instead of rescanning a partially-arrived ~140KB frame from
+            // byte 0 on every chunk.
+            let scanFrom = 0;
             const p = spawn(ffmpegPath, [
                 "-hide_banner", "-loglevel", "error",
                 // INPUT flags depend on the source path:
@@ -1358,10 +1439,14 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 if (abort.signal.aborted) return;
                 workBuf = workBuf.length === 0 ? chunk : Buffer.concat([workBuf, chunk]);
                 while (true) {
-                    const eoi = workBuf.indexOf(Buffer.from([0xff, 0xd9]));
-                    if (eoi < 0) break;
+                    const eoi = workBuf.indexOf(JPEG_EOI, scanFrom);
+                    if (eoi < 0) {
+                        scanFrom = Math.max(0, workBuf.length - 1);
+                        break;
+                    }
                     const frame = workBuf.subarray(0, eoi + 2);
                     workBuf = workBuf.subarray(eoi + 2);
+                    scanFrom = 0;
                     if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8) continue;
 
                     if (!firstFfmpegFrameLogged) {
@@ -1447,7 +1532,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
                 }
                 if (restartCount >= 5) {
                     this.console.warn(`ffmpeg "${v.name}" exited (code=${code}) and has restarted ≥5x in the last 60s — giving up; next camera event will retry`);
-                    this.stopStream(v.name);
+                    this.stopStream(v.nativeId!);
                     return;
                 }
                 restartCount++;
@@ -1473,7 +1558,12 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // line per window instead of two interleaved timelines.
         const streamLogger = setInterval(async () => {
             const now = Date.now();
-            const window = (now - lastLogUs) / 1000;
+            const window = (now - lastLogMs) / 1000;
+            // Roll the window even on quiet ticks — otherwise the first
+            // active window after a lull spans the whole quiet stretch
+            // and under-reports every rate (which can also suppress the
+            // fw-skipped noteworthy trigger).
+            lastLogMs = now;
             if (window <= 0 || (sentFrames === 0 && droppedFrames === 0)) return;
             const sentRate = sentFrames / window;
             const dropRate = droppedFrames / window;
@@ -1554,14 +1644,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             sentFrames    = 0;
             bytesSent     = 0;
             writeLatencies.length = 0;
-            lastLogUs     = now;
         }, 10_000);
         abort.signal.addEventListener("abort", () => clearInterval(streamLogger));
 
         const timeoutMs = v.idleTimeoutMs > 0 ? v.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS;
         const timeout = setTimeout(() => {
             this.console.log(`"${v.name}": Scrypted-side stream timeout — stopping`);
-            this.stopStream(v.name);
+            // A never-sleep viewport (idle_timeout_ms=0, firmware idle
+            // timer disabled) still gets its ffmpeg/socket reclaimed by
+            // this safety timer, but we must not POST sleep and override
+            // the user's always-on setting — the panel just keeps showing
+            // the last frame.
+            this.stopStream(v.nativeId!, /*sendSleep=*/ v.idleTimeoutMs > 0);
         }, timeoutMs);
         // Clear the idle timer on ANY teardown path, not just stopStream.
         // On a StartStop.stop()/re-paste drain the stream is killed via its
@@ -1573,17 +1667,16 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // closure (currentProc); the abort signal listener kills it on
         // shutdown. We don't store the proc in the streams entry
         // because it can change across auto-restarts.
-        this.streams.set(v.name, { timeout, abort });
+        this.streams.set(v.nativeId!, { timeout, abort });
     }
 
-    stopStream(name: string, sendSleep = true) {
-        const s = this.streams.get(name);
+    stopStream(nativeId: string, sendSleep = true) {
+        const s = this.streams.get(nativeId);
         if (!s) return;
         s.abort.abort();   // aborts the in-flight ffmpeg child via its listener
-        if (s.interval) clearInterval(s.interval);
         clearTimeout(s.timeout);
-        this.streams.delete(name);
-        const v = this.findByName(name);
+        this.streams.delete(nativeId);
+        const v = this.viewports.get(nativeId);
         if (sendSleep && v?.host) {
             this.postJSON(`http://${v.host}/state`, { state: "sleep" }).catch(() => {});
         }
@@ -1600,7 +1693,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             : `scale=${panelW}:${panelH}:flags=lanczos,setsar=1`;
     }
 
+    // Inbound routing key → viewport. Match the persisted display_name
+    // first — same precedence registerViewport uses — because v.name can
+    // briefly drift to the nativeId on script reload, which would 404 a
+    // device tap-wake arriving right after a re-paste.
     private findByName(name: string): Viewport | undefined {
+        for (const v of this.viewports.values()) {
+            try { if (v.storage.getItem("display_name") === name) return v; }
+            catch { /* storage not attached yet — fall through to v.name */ }
+        }
         for (const v of this.viewports.values()) if (v.name === name) return v;
         return undefined;
     }
@@ -1628,9 +1729,22 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.console.log(`recv "${viewport}" -> ${state} (device-initiated)`);
 
         if (state === "wake") {
-            await this.startStream(v);
+            // Same guard as every other start path: if a stream is live or
+            // mid-start, leave it alone — a concurrent second startStream
+            // would overwrite the streams entry and orphan the first ffmpeg.
+            const nid = v.nativeId!;
+            if (!this.streams.has(nid) && !this.streamStarting.has(nid)) {
+                this.streamStarting.add(nid);
+                // Fire-and-forget: the device's outbound POST has a 1s
+                // timeout, so awaiting a multi-second startStream here
+                // just turns every tap-wake into a firmware-side
+                // state_post_failure. alreadyAwake — it woke itself.
+                this.startStream(v, Date.now(), /*alreadyAwake=*/ true)
+                    .catch(e => this.console.error("device-initiated wake failed", e))
+                    .finally(() => this.streamStarting.delete(nid));
+            }
         } else {
-            this.stopStream(v.name, /*sendSleep=*/ false);
+            this.stopStream(v.nativeId!, /*sendSleep=*/ false);
         }
         response.send("", { code: 204 });
     }
@@ -1673,7 +1787,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             body:    JSON.stringify(body),
             signal:  AbortSignal.timeout(HTTP_TIMEOUT_MS),
         });
-        if (!res.ok && res.status !== 204) {
+        if (!res.ok) {
             throw new Error(`POST ${url} -> ${res.status}`);
         }
     }

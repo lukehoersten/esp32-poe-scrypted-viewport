@@ -3,7 +3,6 @@
 // require() — drives whether the auto-discovery feature can use a
 // proper library or has to fall back to raw multicast UDP.
 
-declare const sdk:     any;
 declare const require: any;
 
 console.log("------ scriptedEval require() probe ------");
