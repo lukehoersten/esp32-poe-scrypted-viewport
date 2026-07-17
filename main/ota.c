@@ -29,6 +29,9 @@ void ota_arm_healthy_timer(void)
         .callback = &healthy_cb,
         .name     = "ota_healthy",
     };
+    // The handle is deliberately never deleted: one ~50-byte allocation
+    // per boot, and deleting from inside the callback would race the
+    // dispatcher.
     esp_timer_handle_t t = NULL;
     if (esp_timer_create(&args, &t) != ESP_OK) return;
     esp_timer_start_once(t, OTA_HEALTHY_DELAY_US);

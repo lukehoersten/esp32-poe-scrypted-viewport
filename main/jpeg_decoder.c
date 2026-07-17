@@ -44,6 +44,9 @@ esp_err_t jpeg_decoder_init(void)
 
 bool jpeg_decoder_try_lock(uint32_t timeout_ms)
 {
+    // Callable before jpeg_decoder_init (e.g. a wake POST landing in the
+    // display-task boot window) — treat "no decoder yet" as busy.
+    if (!s_mutex) return false;
     return xSemaphoreTake(s_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 

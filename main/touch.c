@@ -30,7 +30,6 @@ static const char *TAG = "touch";
 #define TAP_DEBOUNCE_MS      150
 
 static i2c_master_dev_handle_t s_dev;
-static TaskHandle_t            s_task;
 
 static esp_err_t ft_read(uint8_t reg, uint8_t *buf, size_t n)
 {
@@ -124,6 +123,6 @@ esp_err_t touch_init(void)
                   "(tap=toggle wake/sleep, %dms hold=info overlay)",
              LONG_PRESS_MS);
 
-    BaseType_t ok = xTaskCreate(touch_task, "touch", 3072, NULL, 4, &s_task);
+    BaseType_t ok = xTaskCreate(touch_task, "touch", 3072, NULL, 4, NULL);
     return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
 }

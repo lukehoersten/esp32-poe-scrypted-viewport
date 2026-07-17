@@ -53,6 +53,9 @@ static void on_eth_event(void *arg, esp_event_base_t event_base,
     case ETHERNET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "link down");
         xEventGroupClearBits(s_event_group, BIT_GOT_IP);
+        // Clear the cached address so /state and the info screen don't
+        // keep reporting a lease we no longer hold.
+        s_ip_str[0] = '\0';
         break;
     case ETHERNET_EVENT_START:
         ESP_LOGI(TAG, "ethernet started");

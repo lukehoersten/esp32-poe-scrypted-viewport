@@ -7,10 +7,10 @@
 #include "esp_err.h"
 
 #define JPEG_DECODER_MAX_INPUT_BYTES   (1024 * 1024)        // 1 MB
-#define JPEG_DECODER_MAX_OUTPUT_BYTES  (800 * 480 * 3)      // BGR888 panel native
 
-// One-time setup of the ESP32-P4 hardware JPEG decoder. Allocates reusable
-// DMA-aligned input + output buffers in PSRAM.
+// One-time setup of the ESP32-P4 hardware JPEG decoder. Allocates a reusable
+// DMA-aligned input buffer in PSRAM; output goes to caller-provided buffers
+// (the display back-framebuffer in the hot paths).
 esp_err_t jpeg_decoder_init(void);
 
 // The decoder owns shared scratch buffers. Caller must serialize access.

@@ -44,7 +44,7 @@ esp_err_t stream_server_start(uint16_t port);
 // microseconds. Fields are zero before the first window rolls.
 typedef struct {
     uint64_t frames;          // count of painted frames in the window
-    uint64_t bytes;           // total body bytes received in the window
+    uint64_t bytes;           // body bytes of painted frames in the window
     uint64_t window_us;       // wall-clock span of the window
     uint64_t window_end_us;   // esp_timer_get_time() at window roll
     uint32_t recv_min_us, recv_avg_us, recv_max_us;

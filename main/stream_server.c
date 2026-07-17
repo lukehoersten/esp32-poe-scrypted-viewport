@@ -31,9 +31,6 @@ static const char *TAG = "stream";
 
 #define HEADER_V0_BYTES 8    // legacy: jpeg_len + seq
 #define HEADER_V1_BYTES 16   // current: magic + jpeg_len + seq + event_us_low
-#define HEADER_BYTES    HEADER_V0_BYTES   // FIONREAD threshold for
-                                          // "another header may already
-                                          // be queued" check.
 #define MAGIC_V1        0x56505254u   // "VPRT" big-endian
 #define NUM_BODY_BUFS   3             // ping-pong ring: 1 recv + 1 pending
                                       // + 1 decode → recv never blocks.
@@ -132,41 +129,29 @@ static esp_err_t alloc_body_bufs(void)
     return ESP_OK;
 }
 
-// recv() in a loop until n bytes are read or the connection drops.
-// Used for short fixed-size reads (header bytes).
-static esp_err_t read_n(int fd, void *buf, size_t n)
-{
-    uint8_t *p = (uint8_t *)buf;
-    size_t   got = 0;
-    while (got < n) {
-        ssize_t r = recv(fd, p + got, n - got, 0);
-        if (r <= 0) return ESP_FAIL;
-        got += (size_t)r;
-    }
-    return ESP_OK;
-}
-
 // ───────────────────────── recv-task ─────────────────────────────────────────
 
-// Per-frame body read with instrumentation: count recv() syscalls and track
-// chunk size distribution. Returns ESP_OK on full body; ESP_FAIL on EOF/error.
-static esp_err_t read_body_instrumented(int fd, void *buf, size_t n,
-                                        uint32_t *out_calls,
-                                        uint32_t *out_chunk_min,
-                                        uint32_t *out_chunk_max)
+// recv() in a loop until n bytes are read or the connection drops, with
+// optional instrumentation: count recv() syscalls and track chunk size
+// distribution (pass NULL out-params to skip, e.g. for short header reads).
+// Returns ESP_OK on full read; ESP_FAIL on EOF/error.
+static esp_err_t read_n(int fd, void *buf, size_t n,
+                        uint32_t *out_calls,
+                        uint32_t *out_chunk_min,
+                        uint32_t *out_chunk_max)
 {
     uint8_t *p = (uint8_t *)buf;
     size_t   got = 0;
-    *out_calls     = 0;
-    *out_chunk_min = UINT32_MAX;
-    *out_chunk_max = 0;
+    if (out_calls)     *out_calls     = 0;
+    if (out_chunk_min) *out_chunk_min = UINT32_MAX;
+    if (out_chunk_max) *out_chunk_max = 0;
     while (got < n) {
         ssize_t r = recv(fd, p + got, n - got, 0);
         if (r <= 0) return ESP_FAIL;
         uint32_t rb = (uint32_t)r;
-        (*out_calls)++;
-        if (rb < *out_chunk_min) *out_chunk_min = rb;
-        if (rb > *out_chunk_max) *out_chunk_max = rb;
+        if (out_calls)     (*out_calls)++;
+        if (out_chunk_min && rb < *out_chunk_min) *out_chunk_min = rb;
+        if (out_chunk_max && rb > *out_chunk_max) *out_chunk_max = rb;
         got += (size_t)r;
     }
     return ESP_OK;
@@ -247,7 +232,7 @@ static void handle_client_recv(int fd, const char *peer)
 
     while (1) {
         uint8_t first4[4];
-        if (read_n(fd, first4, 4) != ESP_OK) {
+        if (read_n(fd, first4, 4, NULL, NULL, NULL) != ESP_OK) {
             ESP_LOGI(TAG, "client %s disconnected (header read)", peer);
             return;
         }
@@ -257,7 +242,7 @@ static void handle_client_recv(int fd, const char *peer)
         uint32_t jpeg_len, seq, event_us_low;
         if (first_word == MAGIC_V1) {
             uint8_t rest[HEADER_V1_BYTES - 4];
-            if (read_n(fd, rest, sizeof(rest)) != ESP_OK) {
+            if (read_n(fd, rest, sizeof(rest), NULL, NULL, NULL) != ESP_OK) {
                 ESP_LOGI(TAG, "client %s disconnected (v1 header read)", peer);
                 return;
             }
@@ -269,7 +254,7 @@ static void handle_client_recv(int fd, const char *peer)
                          | ((uint32_t)rest[10] << 8)  |  (uint32_t)rest[11];
         } else {
             uint8_t rest[HEADER_V0_BYTES - 4];
-            if (read_n(fd, rest, sizeof(rest)) != ESP_OK) {
+            if (read_n(fd, rest, sizeof(rest), NULL, NULL, NULL) != ESP_OK) {
                 ESP_LOGI(TAG, "client %s disconnected (v0 header read)", peer);
                 return;
             }
@@ -306,8 +291,8 @@ static void handle_client_recv(int fd, const char *peer)
         uint8_t *body = s_bufs[s_recv_idx];
         int64_t  t0   = esp_timer_get_time();
         uint32_t calls = 0, chunk_min = 0, chunk_max = 0;
-        if (read_body_instrumented(fd, body, jpeg_len,
-                                   &calls, &chunk_min, &chunk_max) != ESP_OK) {
+        if (read_n(fd, body, jpeg_len,
+                   &calls, &chunk_min, &chunk_max) != ESP_OK) {
             ESP_LOGI(TAG, "client %s disconnected (body read)", peer);
             return;
         }
@@ -431,7 +416,6 @@ static void decode_task(void *arg)
     uint64_t gap_samples = 0;   // first frame of a conn has no gap
     int64_t  page_min = INT64_MAX, page_max = 0, page_sum = 0;
     uint32_t wire_min = UINT32_MAX, wire_max = 0;   // kbit/s
-    uint64_t recv_bytes = 0;                        // bytes behind recv_sum
     uint32_t queued_min = UINT32_MAX, queued_max = 0; uint64_t queued_sum = 0;
     uint32_t calls_min  = UINT32_MAX, calls_max  = 0; uint64_t calls_sum  = 0;
     uint32_t chunk_min  = UINT32_MAX, chunk_max  = 0; uint64_t chunk_total_calls = 0;
@@ -454,8 +438,6 @@ static void decode_task(void *arg)
         // a strict subset of idle minus claim overhead.
         int64_t idle_us  = t_prev_paint_done ? (t_entry - t_prev_paint_done) : 0;
         int64_t dwait_us = t_signal - t_wait_start;
-
-        bytes_in_window += meta.jpeg_len;
 
         // New connection? Reset stale-seq tracking. recv-task bumped
         // conn_id at accept; if we observe a different one here, we're
@@ -558,9 +540,12 @@ static void decode_task(void *arg)
 
         if (recv_us < recv_min) recv_min = recv_us;
         if (recv_us > recv_max) recv_max = recv_us;
-        recv_sum   += recv_us;
-        recv_bytes += meta.jpeg_len;   // painted-frame bytes, matches recv_sum
-                                       // for the window wire-rate average
+        recv_sum        += recv_us;
+        // Painted-frame bytes only, so avg-jpeg / MB/s / chunk_avg /
+        // wire_avg all share the same denominator population as the
+        // other per-frame stats (frames discarded while asleep or
+        // stale-seq'd don't skew the window).
+        bytes_in_window += meta.jpeg_len;
         if (dec_us  < dec_min)  dec_min  = dec_us;
         if (dec_us  > dec_max)  dec_max  = dec_us;
         dec_sum  += dec_us;
@@ -600,7 +585,7 @@ static void decode_task(void *arg)
             uint32_t chunk_avg  = chunk_total_calls > 0
                 ? (uint32_t)(bytes_in_window / chunk_total_calls) : 0;
             uint32_t wire_avg   = recv_sum > 0
-                ? (uint32_t)((recv_bytes * 8000u) / (uint64_t)recv_sum) : 0;
+                ? (uint32_t)((bytes_in_window * 8000u) / (uint64_t)recv_sum) : 0;
             int64_t  gap_avg    = gap_samples > 0
                 ? (gap_sum / (int64_t)gap_samples) : 0;
 
@@ -671,7 +656,6 @@ static void decode_task(void *arg)
                 .recv_chunk_min  = (chunk_min  == UINT32_MAX ? 0 : chunk_min),
                 .recv_chunk_avg  = chunk_avg,
                 .recv_chunk_max  = chunk_max,
-                .so_rcvbuf       = s_stats.so_rcvbuf,
                 .recv_dropped_oldest = dropped_oldest,
                 .decode_idle_min_us  = (uint32_t)(dwait_min == INT64_MAX ? 0 : dwait_min),
                 .decode_idle_avg_us  = (uint32_t)(dwait_sum / window_samples),
@@ -688,7 +672,10 @@ static void decode_task(void *arg)
                 .pend_age_max_us  = (uint32_t)page_max,
             };
             portENTER_CRITICAL(&s_stats_mux);
-            s_stats = snap;
+            // so_rcvbuf is written by recv-task under this same mux at
+            // accept time; carry it forward inside the critical section.
+            snap.so_rcvbuf = s_stats.so_rcvbuf;
+            s_stats        = snap;
             portEXIT_CRITICAL(&s_stats_mux);
 
             t_window_start  = now;
@@ -699,7 +686,7 @@ static void decode_task(void *arg)
             gap_min  = page_min = INT64_MAX;
             gap_max  = page_max = gap_sum = page_sum = 0;
             gap_samples = 0;
-            wire_min = UINT32_MAX; wire_max = 0; recv_bytes = 0;
+            wire_min = UINT32_MAX; wire_max = 0;
             queued_min = calls_min = chunk_min = UINT32_MAX;
             queued_max = calls_max = chunk_max = 0;
             queued_sum = calls_sum = chunk_total_calls = 0;

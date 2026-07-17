@@ -33,14 +33,22 @@ static const char *TAG = "http_api";
 
 #define MAX_BODY_BYTES   2048
 #define MIN_IDLE_TIMEOUT 5000
+// mDNS hostname is "viewport-<name>" and a DNS label caps at 63 bytes,
+// so the name itself must stay <= 63 - strlen("viewport-") = 54 chars.
+#define MAX_VIEWPORT_NAME 54
 
 // ============================================================================
 // GET /state
 // ============================================================================
 static esp_err_t state_get_handler(httpd_req_t *req)
 {
+    // Snapshot under the lock, build JSON unlocked — the stream decode-task
+    // takes this mutex on every painted frame, so keep the hold time to a
+    // struct copy rather than ~25 cJSON allocations.
     viewport_state_lock();
-    viewport_state_t *st = viewport_state_get();
+    viewport_state_t snap = *viewport_state_get();
+    viewport_state_unlock();
+    viewport_state_t *st = &snap;
 
     uint64_t now_us  = (uint64_t)esp_timer_get_time();
     uint64_t up_ms   = (now_us - st->boot_us) / 1000;
@@ -87,8 +95,6 @@ static esp_err_t state_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(root, "temp_c",
                                 round((double)temp_c * 10.0) / 10.0);
     }
-
-    viewport_state_unlock();
 
     // Most recent closed window of live-stream stats. Populated every
     // 30 painted stream frames; zero before the first window rolls.
@@ -188,12 +194,17 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 // ============================================================================
 // POST /config — partial-update, atomic, validated
 // ============================================================================
+static esp_err_t respond_status(httpd_req_t *req, const char *status, const char *body)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
+}
+
 static esp_err_t respond_400(httpd_req_t *req, const char *reason)
 {
-    ESP_LOGW(TAG, "/config 400: %s", reason);
-    httpd_resp_set_status(req, "400 Bad Request");
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, reason, HTTPD_RESP_USE_STRLEN);
+    ESP_LOGW(TAG, "400: %s", reason);
+    return respond_status(req, "400 Bad Request", reason);
 }
 
 static esp_err_t read_body(httpd_req_t *req, char *buf, size_t cap)
@@ -233,9 +244,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     if ((j = cJSON_GetObjectItemCaseSensitive(root, "viewport"))) {
         if (!cJSON_IsString(j) || j->valuestring[0] == '\0' ||
-            strlen(j->valuestring) >= sizeof(vp)) {
+            strlen(j->valuestring) > MAX_VIEWPORT_NAME) {
             cJSON_Delete(root);
-            return respond_400(req, "viewport must be a non-empty string < 64 chars");
+            return respond_400(req, "viewport must be a non-empty string <= 54 chars"
+                                    " (mDNS hostname label limit)");
         }
         strncpy(vp, j->valuestring, sizeof(vp) - 1);
         have_vp = true;
@@ -333,7 +345,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         display_set_brightness(bright);
     }
     if (name_or_orient_changed) {
-        mdns_service_refresh();
+        esp_err_t mdns_err = mdns_service_refresh();
+        if (mdns_err != ESP_OK) {
+            ESP_LOGW(TAG, "mdns_service_refresh failed: %s",
+                     esp_err_to_name(mdns_err));
+        }
     }
 
     httpd_resp_set_status(req, "204 No Content");
@@ -383,13 +399,6 @@ static esp_err_t state_post_handler(httpd_req_t *req)
 // ============================================================================
 // POST /frame
 // ============================================================================
-static esp_err_t respond_status(httpd_req_t *req, const char *status, const char *body)
-{
-    httpd_resp_set_status(req, status);
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, body, body ? HTTPD_RESP_USE_STRLEN : 0);
-}
-
 static esp_err_t frame_post_handler(httpd_req_t *req)
 {
     // Content-Type must be image/jpeg.
@@ -573,10 +582,24 @@ static esp_err_t firmware_post_handler(httpd_req_t *req)
     uint8_t buf[4096];
     int remaining = req->content_len;
     int last_logged_pct = -1;
+    int consecutive_timeouts = 0;
     while (remaining > 0) {
         int want = remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf);
         int n = httpd_req_recv(req, (char *)buf, want);
-        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            // A stalled client would otherwise spin here forever with
+            // s_ota_in_progress held, wedging OTA until reboot. Each
+            // timeout is one httpd recv-timeout period, so ~10 in a row
+            // means the sender is gone.
+            if (++consecutive_timeouts >= 10) {
+                err_status = "408 Request Timeout";
+                err_msg = "body stalled";
+                result = ESP_FAIL;
+                goto done;
+            }
+            continue;
+        }
+        consecutive_timeouts = 0;
         if (n <= 0) {
             err_status = "400 Bad Request";
             err_msg = "body read failed";

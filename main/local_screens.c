@@ -9,13 +9,14 @@
 
 #include "chip_temp.h"
 #include "display.h"
+#include "jpeg_decoder.h"
 #include "net_eth.h"
 #include "viewport_state.h"
 
 static const char *TAG = "screens";
 
-#define PANEL_W      800
-#define PANEL_H      480
+#define PANEL_W      VIEWPORT_PANEL_WIDTH
+#define PANEL_H      VIEWPORT_PANEL_HEIGHT
 #define MAX_BUF_PX   (PANEL_W * PANEL_H)
 
 // 8x8 bitmap font, lit pixels = foreground. Covers the characters used by
@@ -150,7 +151,11 @@ esp_err_t local_screens_init(void)
         .callback = &overlay_expired_cb,
         .name     = "info_overlay",
     };
-    esp_timer_create(&args, &s_overlay_timer);
+    esp_err_t err = esp_timer_create(&args, &s_overlay_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "overlay timer create failed: %s", esp_err_to_name(err));
+        return err;
+    }
     return ESP_OK;
 }
 
@@ -174,7 +179,11 @@ esp_err_t local_screens_overlay(uint32_t duration_ms)
     if (!display_is_up()) return ESP_ERR_INVALID_STATE;
     esp_timer_stop(s_overlay_timer);
     display_wake();
+    // Serialize the overlay paint against the stream decode-task's paints
+    // (concurrent esp_lcd_panel_draw_bitmap calls aren't safe).
+    if (!jpeg_decoder_try_lock(500)) return ESP_ERR_TIMEOUT;
     esp_err_t err = local_screens_show_info();
+    jpeg_decoder_unlock();
     if (err != ESP_OK) return err;
     s_overlay_active = true;
     return esp_timer_start_once(s_overlay_timer,

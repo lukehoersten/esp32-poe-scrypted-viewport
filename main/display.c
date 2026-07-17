@@ -32,7 +32,6 @@ static const char *TAG = "display";
 #define I2C_FREQ_HZ           400000
 
 #define PANEL_MCU_ADDR        0x45    // ATTINY88 on the Pi 7" panel architecture
-#define TOUCH_FT5426_ADDR     0x38
 
 // ATTINY88 register map. Source:
 //   linux/drivers/regulator/rpi-panel-attiny-regulator.c (rpi-6.6.y)
@@ -63,8 +62,8 @@ enum {
 // ESP32-P4. The Linux upstream modeline differs in HFP/VSW; if pixels look
 // shifted left/right these are the first knobs to revisit.
 // ============================================================================
-#define PANEL_H_ACTIVE        800
-#define PANEL_V_ACTIVE        480
+#define PANEL_H_ACTIVE        VIEWPORT_PANEL_WIDTH
+#define PANEL_V_ACTIVE        VIEWPORT_PANEL_HEIGHT
 #define RPI_HSW                2
 #define RPI_HBP               46
 #define RPI_HFP              210
@@ -428,6 +427,18 @@ static esp_err_t dsi_bring_up(void)
 // ============================================================================
 // Public API
 // ============================================================================
+
+// 0-100 user percentage → gamma-corrected 0-255 PWM duty. s_last_pwm
+// always holds a DUTY, never a raw percentage — display_wake() writes it
+// straight to REG_PWM.
+static uint8_t pct_to_duty(uint8_t pct)
+{
+    if (pct > 100) pct = 100;
+    float frac = (float)pct / 100.0f;
+    float gamma = powf(frac, 2.2f);
+    return (uint8_t)(gamma * 255.0f + 0.5f);
+}
+
 esp_err_t display_init(void)
 {
     if (s_up) return ESP_OK;
@@ -448,8 +459,9 @@ esp_err_t display_init(void)
 
     // Cache configured brightness, leave backlight off — first wake applies it.
     viewport_state_lock();
-    s_last_pwm = viewport_state_get()->brightness;
+    uint8_t pct = viewport_state_get()->brightness;
     viewport_state_unlock();
+    s_last_pwm = pct_to_duty(pct);
     mcu_write_u8(REG_PWM, 0);
 
     return ESP_OK;
@@ -461,10 +473,7 @@ i2c_master_bus_handle_t display_i2c_bus(void) { return s_i2c_bus; }
 
 esp_err_t display_set_brightness(uint8_t pct)
 {
-    if (pct > 100) pct = 100;
-    float frac = (float)pct / 100.0f;
-    float gamma = powf(frac, 2.2f);
-    uint8_t duty = (uint8_t)(gamma * 255.0f + 0.5f);
+    uint8_t duty = pct_to_duty(pct);
 
     s_last_pwm = duty;
     if (!s_up) return ESP_ERR_INVALID_STATE;
@@ -495,14 +504,6 @@ static inline void rgb565_to_rgb888(uint16_t px, uint8_t *out)
     out[0] = (uint8_t)(( px        & 0x1F) * 255 / 31);  // B
     out[1] = (uint8_t)(((px >>  5) & 0x3F) * 255 / 63);  // G
     out[2] = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);  // R
-}
-
-esp_err_t display_present_bgr888(const void *bgr888)
-{
-    if (!s_up) return ESP_ERR_INVALID_STATE;
-    return esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
-                                     PANEL_H_ACTIVE, PANEL_V_ACTIVE,
-                                     bgr888);
 }
 
 void *display_back_buffer(size_t *out_size)

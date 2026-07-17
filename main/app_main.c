@@ -56,7 +56,9 @@ void app_main(void)
     // don't get a DHCP lease. mDNS + HTTP advertise / bind anyway and will
     // start serving the moment the link comes up.
     // ------------------------------------------------------------------
-    char flags[8] = { '-','-','-','-','-','-','-', 0 };  // E M H S D J T
+    char flags[5] = { '-','-','-','-', 0 };  // E M H S (display-task
+                                             // subsystems D J T report
+                                             // separately in dsp_init)
     esp_err_t eth_err = net_eth_init();
     mark(eth_err, 'E', &flags[0]);
 

@@ -38,16 +38,6 @@ esp_err_t display_present_rgb565(const uint16_t *src,
                                  uint16_t        src_w,
                                  uint16_t        src_h);
 
-// Zero-copy hot path. Source is already 800x480 with bytes in [B, G, R]
-// memory order (i.e. the format the panel pipeline natively wants);
-// hand it straight to esp_lcd_panel_draw_bitmap. No CPU pixel work, no
-// format conversion, no rotation — Scrypted is responsible for sending
-// the buffer pre-rotated and pre-scaled to panel-native dimensions.
-// If the buffer happens to be one of the panel's own framebuffers
-// (see display_back_buffer / display_flip_back_buffer below), the IDF
-// driver skips the memcpy entirely; otherwise it copies via CPU.
-esp_err_t display_present_bgr888(const void *bgr888);
-
 // Framebuffer accessors for the zero-memcpy frame path. The DPI panel
 // owns three BGR888 framebuffers (triple buffering): one scanning out,
 // one pending display at the next frame boundary, one free.

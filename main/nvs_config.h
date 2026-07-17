@@ -4,8 +4,8 @@
 
 // Read the persisted config into viewport_state. Safe to call on a fresh
 // device: missing keys keep their first-boot defaults from viewport_state_init.
-// Sets state = ASLEEP and configured = true if a viewport name + scrypted URL
-// are both present.
+// Recomputes `configured` (true iff a scrypted URL is present); run state
+// is untouched (stays at the boot default).
 esp_err_t nvs_config_load(void);
 
 // Persist the current viewport_state to NVS atomically. The caller is expected
