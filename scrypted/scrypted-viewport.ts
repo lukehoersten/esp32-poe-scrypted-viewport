@@ -675,13 +675,15 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
 
     private viewports = new Map<string, Viewport>();             // nativeId -> child instance
     private listeners = new Map<string, EventListenerRegister[]>(); // nativeId -> all event listeners for this viewport (camera + child devices)
-    // nativeId -> cameraId we currently have a listener attached for.
-    // Source of truth for attachListener idempotency: lets it self-heal
-    // (re-attach after the reload storage-race) without stacking duplicate
-    // listeners on every register cycle. "" = processed-but-no-camera
-    // (suppresses repeated "no camera assigned" warnings); absent = never
-    // processed.
-    private attachedCameraId = new Map<string, string>();
+    // nativeId -> "cameraId|trigger,trigger" signature of the currently
+    // attached listener set. Source of truth for attachListener
+    // idempotency: lets it self-heal (re-attach after the reload
+    // storage-race) without stacking duplicate listeners on every
+    // register cycle, and forces a re-attach when the camera OR the
+    // selected wake triggers change. "" = processed-but-no-camera
+    // (suppresses repeated "no camera assigned" warnings); absent =
+    // never processed.
+    private attachedListenerSig = new Map<string, string>();
     // nativeId -> last-registered config signature, so the "registered" line
     // logs only on a real change, not every 5-minute reregister cycle.
     private lastRegisterSig = new Map<string, string>();
@@ -780,7 +782,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         this.viewports.clear();
         this.listeners.clear();
         this.streams.clear();
-        this.attachedCameraId.clear();
+        this.attachedListenerSig.clear();
         this.lastRegisterSig.clear();
         this.running = false;
     }
@@ -1105,29 +1107,36 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         const tag = v.name || v.storage.getItem("display_name") || v.nativeId;
         const nid  = v.nativeId!;
         const want = v.cameraId || "";
-        const have = this.attachedCameraId.get(nid);
+        const triggers = Array.from(v.triggers).sort();
+        const wantSig = want ? `${want}|${triggers.join(",")}` : "";
+        const have = this.attachedListenerSig.get(nid);
 
-        // Idempotent fast-path: already listening on the right camera and
-        // the listeners are still installed → nothing to do. This is what
-        // lets registerViewport call us on every (5-min) cycle to self-heal
-        // the reload storage-race without restacking listeners or spamming
-        // logs. (The empty-camera case dedups on `have === want` below.)
-        if (want === have && (want === "" || (this.listeners.get(nid)?.length ?? 0) > 0)) return;
+        // Idempotent fast-path: already listening on the right camera with
+        // the right trigger set and the listeners are still installed →
+        // nothing to do. This is what lets registerViewport call us on
+        // every (5-min) cycle to self-heal the reload storage-race without
+        // restacking listeners or spamming logs. (The listener-less cases
+        // — no camera, or tap-only with zero triggers — dedup on the
+        // signature alone.)
+        const wantAnyListener = want !== "" && triggers.length > 0;
+        if (wantSig === have &&
+            (!wantAnyListener || (this.listeners.get(nid)?.length ?? 0) > 0)) return;
 
-        // State changed (first attach, camera swapped, or listeners lost):
-        // tear down whatever was there before re-deciding.
+        // State changed (first attach, camera swapped, triggers changed,
+        // or listeners lost): tear down whatever was there before
+        // re-deciding.
         this.detachListener(nid);
 
         if (!want) {
             // Record the empty state so subsequent register cycles don't
             // re-warn every 5 minutes. Cleared by detachListener on rebind.
-            this.attachedCameraId.set(nid, "");
+            this.attachedListenerSig.set(nid, "");
             this.console.warn(`viewport "${tag}": no camera assigned — open Settings and pick a camera; subscription skipped`);
             return;
         }
         const cam = systemManager.getDeviceById(v.cameraId);
         if (!cam) {
-            // Leave attachedCameraId unset so the next register cycle retries
+            // Leave the signature unset so the next register cycle retries
             // (the camera device may simply not be loaded yet).
             this.console.warn(`viewport "${tag}": camera ${v.cameraId} not found`);
             return;
@@ -1143,11 +1152,21 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // itself (unifi-protect/src/main.ts pushes BinarySensor onto the
         // camera's interfaces when isDoorbell). So listening on `cam`
         // for BinarySensor is all that's needed — no child traversal.
-        const ifaces = [
-            ScryptedInterface.BinarySensor,    // doorbell ring
-            ScryptedInterface.MotionSensor,    // motion
-            ScryptedInterface.ObjectDetector,  // person / etc
-        ];
+        //
+        // Subscribe ONLY to the interfaces the selected wake triggers
+        // need — a doorbell-only viewport shouldn't take a callback per
+        // motion re-assert. handleCameraEvent still filters by trigger
+        // (defense in depth: ObjectDetector fires for non-person classes
+        // too). Zero triggers = tap-only mode: no listeners at all.
+        const ifaces: any[] = [];
+        if (triggers.includes("doorbell")) ifaces.push(ScryptedInterface.BinarySensor);
+        if (triggers.includes("motion"))   ifaces.push(ScryptedInterface.MotionSensor);
+        if (triggers.includes("person"))   ifaces.push(ScryptedInterface.ObjectDetector);
+        if (!ifaces.length) {
+            this.attachedListenerSig.set(nid, wantSig);
+            this.console.log(`viewport "${tag}": tap-only (no wake triggers selected) — camera subscription skipped`);
+            return;
+        }
 
         const regs: EventListenerRegister[] = [];
         for (const iface of ifaces) {
@@ -1159,7 +1178,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         // One cross-reload cleaner for the whole attach: removes every
         // listener AND invalidates this instance's bookkeeping. Without
         // the map invalidation, a drain performed by another instance
-        // (Stop click landing on an old load) leaves attachedCameraId +
+        // (Stop click landing on an old load) leaves the signature +
         // listeners claiming live registrations, and the idempotent
         // fast-path above then blocks the register-cycle self-heal from
         // ever re-attaching.
@@ -1167,11 +1186,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             for (const reg of regs) { try { reg.removeListener(); } catch {} }
             if (this.listeners.get(nid) === regs) {
                 this.listeners.delete(nid);
-                this.attachedCameraId.delete(nid);
+                this.attachedListenerSig.delete(nid);
             }
         });
         this.listeners.set(nid, regs);
-        this.attachedCameraId.set(nid, want);
+        this.attachedListenerSig.set(nid, wantSig);
         this.console.log(`viewport "${tag}": subscribed to [${cam.name || cam.id} (${ifaces.join("+")})]`);
     }
 
@@ -1182,8 +1201,8 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.listeners.delete(nativeId);
         }
         // Clear the idempotency tracker so the next attachListener re-decides
-        // from scratch (re-attach after a rebind / camera swap).
-        this.attachedCameraId.delete(nativeId);
+        // from scratch (re-attach after a rebind / camera or trigger change).
+        this.attachedListenerSig.delete(nativeId);
     }
 
     private async registerViewport(v: Viewport) {
