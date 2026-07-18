@@ -10,7 +10,7 @@ The stream is real video: one `ffmpeg` child pulls the camera's substream, scale
 
 `scrypted-viewport.ts` in this directory does all of that as a single-file TypeScript script for the **Scripts plugin**. Each viewport is a child Scrypted device under the script — you add, remove, and edit viewports entirely through the Scrypted UI; no script editing required after the initial paste.
 
-v2 will repackage this single-file script as a proper installable plugin; the streaming path is already in place.
+v2 will repackage this single-file script as a proper installable plugin ([plan](PLUGIN-CONVERSION.md)); the streaming path is already in place.
 
 ## Install
 
@@ -27,8 +27,9 @@ On the "Scrypted Viewport" device page, click **+ Add Device**. You'll get a sma
 
 | Field | What to enter |
 | --- | --- |
-| **Viewport name** | Lowercase routing key, e.g. `mudroom`. Becomes the device's mDNS hostname (`viewport-mudroom.local`) and the value the firmware sends back in callbacks. |
-| **IP or hostname** | The device's LAN address — an IP or a hostname string (e.g. `viewport-<mac>.local`). Set it manually; the script POSTs to this string directly and does **not** auto-resolve mDNS. See [Finding a viewport's IP / hostname](#finding-a-viewports-ip--hostname). |
+| **Viewport name** | Lowercase routing key, e.g. `mudroom` (≤ 54 chars). Becomes the device's mDNS hostname (`viewport-mudroom.local`) and the value the firmware sends back in callbacks. **Leave it blank when picking a discovered host** — the name auto-fills from the device's mDNS advertisement. |
+| **IP or hostname** | Dropdown of viewports discovered on the LAN via mDNS, shown as `<ip> — <name> (v<fw>, <res>)`; picking one stores just the address. Manual entry (IP or hostname) also works. |
+| **Wake triggers** | Multi-select of `doorbell` / `motion` / `person`; `doorbell` is dropped automatically if the chosen camera can't ring. |
 | **Camera** | Dropdown — pick the camera whose events should wake this viewport. The dropdown is filtered to devices implementing `Camera`. |
 | **Orientation** | `portrait` (480×800, default) or `landscape` (800×480). Tells the device + script what dimensions to send. |
 
@@ -50,9 +51,10 @@ To verify: on a wake, the plugin log's `substream=` shows `id:N(prebuffered)` an
 Open the viewport device's page → **Settings**. The fields are grouped:
 
 **Binding**
-- **IP or hostname** — where the firmware lives on the LAN (set manually; no mDNS auto-resolve).
+- **Viewport name** — the canonical routing key. Renaming here re-registers the firmware (its mDNS hostname follows) and renames the Scrypted device. **This field, not Scrypted's device-name pencil, is the name the firmware knows** — the pencil rename deliberately does not propagate.
+- **IP or hostname** — where the firmware lives on the LAN. mDNS-discovered viewports appear as dropdown choices; manual entry also works. If the device later renumbers, the script auto-heals the stored host (see below).
 - **Camera** — which Scrypted camera drives the wake events and provides the video stream.
-- **Wake triggers** — multi-select of `doorbell`, `motion`, `person`. Default: **person + doorbell** (motion is opt-in — doorbell cameras fire it constantly). The `doorbell` option only appears for doorbell-capable cameras. Clear all of them for tap-only mode (the viewport never wakes from Scrypted; user must tap the panel to see the camera).
+- **Wake triggers** — multi-select of `doorbell`, `motion`, `person`. Default: **person + doorbell** (motion is opt-in — doorbell cameras fire it constantly). The `doorbell` option only appears for doorbell-capable cameras. The script subscribes only to the event interfaces the selected triggers need (the log's `subscribed to [...]` line shows exactly which). Clear all of them for tap-only mode — no camera subscription at all; the user must tap the panel to see the camera.
 
 **Display**
 - **Orientation** — `portrait` (480×800) or `landscape` (800×480). Sent to the device in `/config`.
@@ -80,13 +82,14 @@ Open the viewport device's page → **Settings** menu → **Delete Device**. The
   - open the TCP data socket and spawn the ffmpeg child that streams MJPEG frames,
   - arm a per-stream safety timer at the viewport's `idle_timeout_ms`.
   - Events that arrive while a stream is already live or starting are ignored — the wake window is anchored to the first event and isn't extended or restarted.
-- **Device-initiated `{state: "wake"}` callback** (operator tapped the panel) → same `startStream` path.
+- **Device-initiated `{state: "wake"}` callback** (operator tapped the panel) → same guarded `startStream` path, run fire-and-forget so the device gets its `204` immediately (its outbound POST times out at 1 s), and skipping the redundant wake POST back (the device is already awake).
 - **Device-initiated `{state: "sleep"}` callback** → `stopStream` without echoing sleep back (the device already knows). This is how the script learns the device slept itself (tap-to-sleep or its own idle timer).
-- **Per-stream safety timer fires** → `stopStream` and POST `{state: "sleep"}` to the device.
+- **Per-stream safety timer fires** → `stopStream` and POST `{state: "sleep"}` to the device — unless the viewport's idle timeout is `0` (never-sleep), in which case the ffmpeg/socket are reclaimed but no sleep is sent and the panel keeps its last frame.
 
 ## What the script does on script load + every 5 minutes
 
-- Re-POST `/config` to every known viewport with its current settings. A device that rebooted or got a new DHCP lease re-syncs within 5 minutes without manual intervention.
+- Re-POST `/config` to every known viewport with its current settings. A device that rebooted re-syncs within 5 minutes without manual intervention.
+- **mDNS auto-heal**: if a registration fails (device renumbered), browse the LAN and match by the device's advertised MAC (stable identity) or name; on a hit at a new address, rewrite the stored host and retry. The log shows `host <old> -> <new> (mdns auto-heal)`. This removes the need for a DHCP reservation.
 
 ## Local type-checking (optional)
 
@@ -101,25 +104,22 @@ That pulls in `@scrypted/sdk` and `@types/node` so the TS server can resolve eve
 
 ## v1 limitations
 
-- Packaged as a single-file Scripts paste rather than an installable plugin (v2 repackages it). Updating means re-pasting the file.
-- Manual IP per viewport (no mDNS-SD discovery). A DHCP reservation is the simplest way to keep it stable.
+- Packaged as a single-file Scripts paste rather than an installable plugin ([v2 repackages it](PLUGIN-CONVERSION.md)). Updating means re-pasting the file.
 - Fast wake depends on a rebroadcast prebuffer on the streamed substream — see [Fast wake — camera prebuffer](#fast-wake--camera-prebuffer-required). Without it the stream still works but the first live frame waits a full keyframe interval (~5 s).
 - No retry on transport errors. Best-effort matches the device's own semantics; the next event or callback re-syncs.
 
-## Finding a viewport's IP / hostname
+## Discovery details / manual fallback
 
-The script does NOT auto-resolve mDNS — it just POSTs to the host string you enter. The host field accepts either an IP or a hostname (the OS resolver handles `.local` lookups inside the Scrypted container).
+The script discovers viewports itself: it browses `_scrypted-viewport._tcp` with a plain `dgram` socket on an ephemeral port (legacy-unicast mDNS query — no `:5353` bind, so it coexists with Scrypted's HomeKit mDNS and any host `avahi-daemon`, and works under Docker **host networking** or a native install). `scrypted/diagnostic.ts` is a paste-and-run probe of the same code path — if it reports `0 responses`, Scrypted is likely in a Docker container on bridge networking; switch it to host networking.
 
-On a fresh device the mDNS hostname is `viewport-<mac>.local` (the MAC with colons stripped). You can read the MAC straight off the device's info screen at boot, or discover it from your shell:
+Manual entry always works as a fallback. From your shell:
 
 | OS | Browse all viewports on the LAN | Resolve a hostname → IP |
 |---|---|---|
 | macOS | `dns-sd -B _scrypted-viewport._tcp local.` | `dns-sd -G v4 viewport-<mac>.local` |
 | Linux (with `avahi`) | `avahi-browse -tr _scrypted-viewport._tcp` | `avahi-resolve -n viewport-<mac>.local` |
 
-Once you've POSTed `/config` with a friendlier name (e.g. `mudroom`) via the kitchen viewport's settings, the device re-advertises as `viewport-mudroom.local` and you can use that instead. The MAC-derived hostname stays available as a fallback.
-
-If Scrypted runs in a Docker container without host networking, `.local` resolution won't reach the LAN — enter a static IP and add a DHCP reservation so it stays stable.
+On a fresh device the mDNS hostname is `viewport-<mac>.local` (the MAC with colons stripped, also shown on the device's info screen); after `/config` names it, it re-advertises as `viewport-<name>.local`.
 
 ## End-to-end smoke test
 

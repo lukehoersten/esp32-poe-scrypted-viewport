@@ -14,6 +14,12 @@ Status legend:
 - 🟡 partial — compiles cleanly, builds against ESP-IDF 5.4 for `esp32p4`, but not yet run on a board.
 - ✅ verified — confirmed on hardware. Annotate with the date and board rev.
 
+> **Iterating on an already-flashed device:** `make ota [VIEWPORT=<host>]`
+> builds with a fresh git stamp, pushes over the LAN, and verifies the
+> `pending-verify -> valid` OTA sequence (auto-retrying the known
+> first-push silent rollback). The USB commands below are for first
+> flash / bring-up only.
+
 ---
 
 ## Status snapshot
@@ -179,7 +185,7 @@ Expected `/state` body on a fresh device (no `/config` posted yet):
 }
 ```
 
-Expected mDNS browse output should show a `_scrypted-viewport._tcp` instance with TXT records `version=`, `resolution=`, `orientation=`, `name=` (empty for `name`).
+Expected mDNS browse output should show a `_scrypted-viewport._tcp` instance with TXT records `version=`, `resolution=`, `orientation=`, `name=` (MAC-derived default until `/config` names it), and `mac=` (since v1.4.0 — the stable identity the Scrypted script's discovery/auto-heal matches on).
 
 **Status**: ✅ verified 2026-06-14 alongside M1.
 
@@ -559,7 +565,7 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 
 **Visual checks (panel-attached)**
 
-- Fresh flash → screen shows the info screen (~15 lines of `label  value` pairs, white on black, auto-scaled). With no `/config` posted it reports `name unset`, `config no`, `state asleep`, `scrypt none`.
+- Fresh flash → screen shows the info screen (~17 lines of `label  value` pairs, white on black, auto-scaled). With no `/config` posted it reports the MAC-derived default name, `config no`, `state asleep`, `scrypt none`.
 - `POST /config` with viewport + scrypted → device transitions to ASLEEP, backlight off.
 - `POST /state {state:wake}` (or tap) → backlight on, `Loading...` centered until the first `/frame` lands.
 - `POST /frame` while AWAKE → loading screen replaced by the JPEG.
@@ -614,7 +620,7 @@ Run these once all milestones are implemented and individually verified. The poi
 
 - Cable pull mid-frame: device idle-sleeps after `idle_timeout_ms`. On reconnect, mDNS re-advertises; Scrypted re-finds and continues. (Link-loss/recovery part verified 2026-06-14 with the device idle — see M1 section. Mid-frame variant still pending.)
 - Scrypted unreachable on tap: device still toggles backlight, `state_post_failures` increments. Recovery: Scrypted comes back, next tap syncs.
-- DHCP lease change: device gets new IP, re-advertises via mDNS. Scrypted's periodic browse picks up the new address.
+- DHCP lease change: device gets new IP, re-advertises via mDNS. The script's next 5-minute register fails against the stale host, which triggers its mDNS auto-heal — browse, match by `mac` TXT, rewrite host, retry. Verified 2026-07-18 by saving a wrong IP: `host 10.0.13.99 -> 10.0.13.83 (mdns auto-heal)`.
 - `/state_post_failures` count should be observable via `GET /state`.
 
 ### D. Longevity

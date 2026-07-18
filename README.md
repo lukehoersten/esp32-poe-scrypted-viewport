@@ -24,7 +24,7 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 ## Related docs
 
 - [`TESTING.md`](TESTING.md) — **the self-contained verification reference.** Status snapshot for every milestone, hardware prerequisites + open unknowns, bench-order playbook, per-milestone `curl` recipes, integration test suite. Start here before flashing anything.
-- [`scrypted/README.md`](scrypted/README.md) — Scrypted-side script install + per-viewport binding UI (Path B with camera picker and mDNS auto-resolve).
+- [`scrypted/README.md`](scrypted/README.md) — Scrypted-side script install + per-viewport binding UI (camera picker, wake triggers, mDNS-discovered host dropdowns).
 - [`scrypted/PLUGIN-CONVERSION.md`](scrypted/PLUGIN-CONVERSION.md) — TODO: plan for repackaging the script as a real installable Scrypted plugin (kills the Scripts-sandbox reload-leak machinery, makes deploys scriptable).
 
 ## Status
@@ -32,7 +32,7 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 | Layer | Where we are | What's pending |
 | --- | --- | --- |
 | Firmware (`main/`) | Full path ✅ on hardware: Ethernet, panel, streaming, OTA. Painted = sent = 24 fps at the Unifi medium substream, sub-50 ms glass-to-glass over a raw TCP data socket (:81). Binary ~900 KB, ESP-IDF 5.4 / `esp32p4`. See [What's next](#whats-next) for the measured budget. | Backlog only (task-watchdog counters, multi-camera per viewport, production sealing). |
-| Scrypted side (`scrypted/`) | v1 Script — DeviceProvider with per-viewport child devices, camera picker, and live ffmpeg MJPEG streaming over the TCP data socket with prebuffer fast-start (~0.7 s wake-to-video). Verified end-to-end. | v2: repackage the single-file script as an installable plugin — planned in [`scrypted/PLUGIN-CONVERSION.md`](scrypted/PLUGIN-CONVERSION.md). |
+| Scrypted side (`scrypted/`) | v1.4 Script — DeviceProvider with per-viewport child devices, camera picker with trigger-scoped event subscriptions, live ffmpeg MJPEG streaming over the TCP data socket with prebuffer fast-start (~0.7 s wake-to-video), and built-in mDNS discovery (host dropdowns, auto-naming, auto-heal on DHCP renumber). Verified end-to-end. | v2: repackage the single-file script as an installable plugin — planned in [`scrypted/PLUGIN-CONVERSION.md`](scrypted/PLUGIN-CONVERSION.md). |
 | Hardware | Ethernet pin map confirmed (Waveshare wiki + ESPHome). Hosyond panel architecture confirmed (Pi 7"-style, TC358762 bridge + ATTINY MCU at I²C `0x45`). Jumper wiring documented. | Schematic confirmation needed for DSI FPC pin count, I²C GPIO mapping, BOOT button GPIO, flash size. All gated by [`TESTING.md`'s Hardware prerequisites](TESTING.md#hardware-prerequisites). |
 
 See [`TESTING.md`](TESTING.md) for the full milestone-by-milestone status and the bench-order playbook.
@@ -76,23 +76,24 @@ The ESP32 publishes itself via **mDNS-SD (service discovery)**. Scrypted discove
 
 The device runs an mDNS responder (ESP-IDF `mdns` component) that serves all of the following from itself — no external DNS server is involved:
 
-- **Hostname / A record**: `viewport.local` before configuration, `viewport-<name>.local` after (e.g. `viewport-mudroom.local`). The `viewport-` prefix is a namespace that avoids collisions with other LAN devices.
+- **Hostname / A record**: `viewport-<name>.local`. The name always has a value — a MAC-derived default (colons stripped, e.g. `viewport-e8f60ae09094.local`) until `/config` sets a friendlier one (`viewport-mudroom.local`). The `viewport-` prefix is a namespace that avoids collisions with other LAN devices.
 - **Service advertisement**: `_scrypted-viewport._tcp.local` on port 80.
 - **SRV record**: hostname + port.
 - **TXT records**:
-  - `version=1.0.0`
+  - `version=1.4.0`
   - `resolution=<effective>` (e.g. `480x800` for portrait, `800x480` for landscape)
   - `orientation=<portrait|landscape>`
-  - `name=<viewport name>` (empty until `/config`)
+  - `name=<viewport name>` (MAC-derived default until `/config`)
+  - `mac=<aa:bb:cc:dd:ee:ff>` — stable identity for discovery; names are editable, the MAC is not
 
-Scrypted-side discovery flow:
+Scrypted-side discovery (implemented in the script — see `mdnsBrowse` in [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts)):
 
-1. Browse `_scrypted-viewport._tcp.local` via a Node mDNS-SD library (`bonjour-service`, `mdns`, etc.). These libraries talk to the multicast layer directly — they do **not** need OS-level `.local` resolution.
-2. Each browse result contains `{name, host, port, addresses, txt}`. Use the **IP** from `addresses`, not the hostname, for all subsequent calls.
-3. Match TXT `name=` against the operator's `viewport → camera` config bindings.
-4. Re-browse periodically (every few minutes) to catch DHCP renumbering.
+1. The Scripts sandbox has **no third-party mDNS libraries** (`bonjour-service`, `multicast-dns`, `mdns` all fail to resolve — verified), so the script browses with a plain `dgram` socket on an **ephemeral port**: per RFC 6762 §6.7 a query from a non-5353 source port is a *legacy unicast* query and responders reply unicast straight back to it. No `:5353` bind means no conflict with Scrypted's own HomeKit mDNS stack or a host `avahi-daemon`, and it works under Docker host-networking or a native install alike.
+2. One PTR response packet carries PTR + SRV + TXT + A together (RFC 6763 §12.1), so parsing is per-packet with no follow-up queries. The **IP** from the A record is what's used for all subsequent calls.
+3. Discovered viewports surface as dropdown choices on the host field (add-device form + each viewport's settings page), and a blank name on create inherits the discovered TXT `name`.
+4. **Auto-heal instead of periodic re-browse**: when a `/config` registration fails (DHCP renumber), the script re-browses and matches by TXT `mac` first, then `name`; on a hit at a new address it rewrites the stored host and retries. This removes the need for a DHCP reservation.
 
-If mDNS-SD is unavailable in the deployment (some Docker setups, certain VLAN configurations), allow the operator to set an explicit `http://<ip>:<port>` per viewport in Scrypted-side config as a fallback.
+Manual entry (IP or hostname) always remains available on the host field — discovery is best-effort and degrades to typing.
 
 ### Discover from the CLI
 
@@ -124,7 +125,9 @@ Returns `200 OK` with JSON:
 ```json
 {
   "name": "mudroom",
-  "version": "1.0.0",
+  "mac": "e8:f6:0a:e0:90:94",
+  "version": "1.4.0",
+  "ota_state": "valid",
   "configured": true,
   "state": "awake",
   "uptime_ms": 12345678,
@@ -133,13 +136,18 @@ Returns `200 OK` with JSON:
   "decode_errors": 0,
   "state_post_failures": 2,
   "resolution": "480x800",
+  "panel_width": 800,
+  "panel_height": 480,
   "ip": "192.168.1.42",
   "free_heap": 123456,
-  "free_psram": 12345678
+  "free_psram": 12345678,
+  "tear_guard_engaged": 111,
+  "temp_c": 55.0,
+  "stream": { "frames": 30, "window_us": 1250000, "...": "..." }
 }
 ```
 
-`state` is `awake` or `asleep` (it reports the screen's current state only). `configured` is the separate flag that reports whether `viewport` and `scrypted` are both set. `last_frame_ms_ago` is `null` if no frame has been received since boot.
+`state` is `awake` or `asleep` (it reports the screen's current state only). `configured` reports whether a `scrypted` URL is registered (the name always has a MAC-derived default, so it doesn't factor in). `last_frame_ms_ago` is `null` if no frame has been received since boot. `ota_state` is the running image's OTA slot state (`pending-verify` right after an OTA until the 30 s healthy timer marks it `valid` — the rollback tell, see [POST /firmware](#post-firmware)). `temp_c` is the on-die junction temperature (~10–20 °C above ambient; omitted if the sensor is unavailable). `tear_guard_engaged` counts frames the triple-buffer guard saved from tearing. `stream` is the most recent 30-painted-frame window of data-plane stats (recv/decode/paint/idle min/avg/max, wire rate, header-gap and pending-age decomposition, drop counters — see `stream_server.h` for field semantics); all zeros before the first window rolls.
 
 ### POST /state
 
@@ -168,7 +176,7 @@ Returns the persisted config:
 }
 ```
 
-Before first `/config`: returns `200` with `viewport` and `scrypted` as `null`; the rest carry their first-boot defaults (`brightness: 80`, `orientation: "portrait"`, `idle_timeout_ms: 60000`).
+Before first `/config`: returns `200` with `scrypted` as `null`; `viewport` carries its MAC-derived default and the rest their first-boot defaults (`brightness: 80`, `orientation: "portrait"`, `idle_timeout_ms: 60000`).
 
 ### POST /config
 
@@ -185,7 +193,7 @@ Before first `/config`: returns `200` with `viewport` and `scrypted` as `null`; 
 - **Partial update**: only fields present in the body are changed; omitted fields keep their current values. The persisted config is replaced atomically with the merged result.
 - Persisted to NVS, survives reboot.
 - Idempotent; reposting the same body yields the same state.
-- `viewport` must be non-empty; `scrypted` must be `http://...` and is the Scrypted plugin's base URL. The device POSTs state changes to `<scrypted>/state`.
+- `viewport` must be non-empty and ≤ 54 chars (so the `viewport-<name>` mDNS hostname fits the 63-byte DNS label limit); `scrypted` must be `http://...` and is the Scrypted plugin's base URL. The device POSTs state changes to `<scrypted>/state`.
 - `idle_timeout_ms`: `0` disables the idle timer; non-zero values must be ≥ `5000`. Otherwise `400`. Scrypted should use the same value for its own per-stream timeout so both ends agree, but they time independently — either can end the session.
 - `orientation`: `portrait` (480x800) or `landscape` (800x480). Default `portrait` on first boot. Changing orientation takes effect immediately, including for the IP and Loading screens. Scrypted must send JPEGs at the new effective resolution after a change.
 - `brightness`: integer `0`–`100`. Default `80` on first boot. Applied immediately if awake; takes effect on next wake if asleep. PWM is gamma-corrected so the scale is perceptual.
@@ -420,7 +428,7 @@ There is no factory-reset gesture. To wipe NVS, plug USB and run `idf.py erase-f
 
 The device renders exactly two things itself; everything else is a JPEG from Scrypted:
 
-- **Info screen**: ~15 lines of `label  value` pairs (white on black, auto-scaled) covering the full `GET /config` + `GET /state` dump — name, host, ip, state, configured, scrypted, orientation, brightness, idle, firmware, uptime, frames, errors, free heap, free PSRAM. Shown on first boot until `/config`, on NVS erase, and as a 15 s overlay on a touch long-press.
+- **Info screen**: ~17 lines of `label  value` pairs (white on black, auto-scaled) covering the full `GET /config` + `GET /state` dump — name, mac, host, ip, state, configured, scrypted, orientation, brightness, idle, firmware, uptime, frames, errors, free heap, free PSRAM, chip temperature. Shown on first boot until `/config`, on NVS erase, and as a 15 s overlay on a touch long-press.
 - **Loading screen**: shown from a wake — and re-shown on each new stream connection — until the first frame paints, so a stale prior frame never flashes during the connect→first-frame gap. Plain "Loading…" text. Rendered in the current orientation.
 
 Both use a small embedded bitmap font — full lowercase a–z, digits, period, colon, dash, slash, plus uppercase `L` for "Loading...". No LVGL, no general text engine.
@@ -429,9 +437,10 @@ Both use a small embedded bitmap font — full lowercase a–z, digits, period, 
 
 The Scrypted side is **code, not configuration** — Scrypted has no built-in concept of a network framebuffer. The code is small and lives inside Scrypted:
 
-- **v1** (in this repo at [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts), install instructions in [`scrypted/README.md`](scrypted/README.md)): a Scrypted Script (in the Scripts plugin) — listens for camera events and, on wake, spawns one `ffmpeg` child (via `MediaManager`) that pulls the camera's substream, scales/rotates to panel-native 800×480, and streams MJPEG frames to the firmware over a **raw TCP data socket (port 81)** at ~24 fps. It also exposes a `POST /state` handler at the plugin's endpoint root (e.g. `http://scrypted.local:11080/endpoint/scrypted-viewport/state`) via the EndpointManager. Single-file TypeScript, no package install.
+- **v1** (in this repo at [`scrypted/scrypted-viewport.ts`](scrypted/scrypted-viewport.ts), install instructions in [`scrypted/README.md`](scrypted/README.md)): a Scrypted Script (in the Scripts plugin) — subscribes to the bound camera's events (only the interfaces the selected wake triggers need) and, on wake, spawns one `ffmpeg` child (via `MediaManager`) that pulls the camera's substream, scales/rotates to panel-native 800×480, and streams MJPEG frames to the firmware over a **raw TCP data socket (port 81)** at ~24 fps. It also exposes a `POST /state` handler at the plugin's endpoint root (e.g. `http://scrypted.local:11080/endpoint/scrypted-viewport/state`) via the EndpointManager. Single-file TypeScript, no package install.
 - **Fast start via prebuffer**: the script requests the camera's prebuffered substream so ffmpeg opens on an already-buffered keyframe, cutting wake-to-first-frame from ~5–6 s to ~0.7 s. Requires a rebroadcast prebuffer on the streamed substream — see [`scrypted/README.md`](scrypted/README.md#fast-wake--camera-prebuffer-required).
-- **Next (v2)**: repackage the single-file script as a proper installable plugin. The streaming path itself (ffmpeg → framed MJPEG over the TCP data socket) is already in place; the firmware's `POST /frame` remains for one-shot snapshots and debug.
+- **Built-in discovery**: the script browses `_scrypted-viewport._tcp` itself (dependency-free legacy-unicast `dgram` query — see [Discovery](#discovery)), offers discovered viewports as host-field choices, names new viewports from the advertised TXT `name`, and auto-heals a viewport's stored host when a registration fails after a DHCP renumber.
+- **Next (v2)**: repackage the single-file script as a proper installable plugin — planned in [`scrypted/PLUGIN-CONVERSION.md`](scrypted/PLUGIN-CONVERSION.md). The streaming path itself (ffmpeg → framed MJPEG over the TCP data socket) is already in place; the firmware's `POST /frame` remains for one-shot snapshots and debug.
 
 Either way, no Scrypted core changes and no external service.
 
@@ -497,7 +506,7 @@ Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its
 ## Ops
 
 - Firmware updates: `POST /firmware` with the raw built `.bin` (see [POST /firmware](#post-firmware)). First flash of any new device still needs USB to install the bootloader + initial image; every update after that is over the LAN. Rollback is armed — a panicking new image reverts to the previous slot on next reset.
-- Provisioning: flash the same firmware to every device. On first boot the screen shows its IP; register it from Scrypted via `POST /config`.
+- Provisioning: flash the same firmware to every device. On first boot it advertises itself via mDNS and shows the info screen; in Scrypted, "+ Add Device" lists it in the host dropdown (name auto-fills from the advertisement) — no IP hunting needed.
 - Viewport names must be unique across the LAN — mDNS hostnames are derived from `viewport` and two devices configured with the same name will collide.
 - NVS wipe: plug USB and run `idf.py erase-flash` followed by `idf.py flash`. The device boots clean and shows the info screen until `/config` is POSTed.
 - No DHCP lease: keep retrying; do not reboot. The info screen shows "ip no network" until a lease arrives.
@@ -507,6 +516,8 @@ Scrypted should use the same `idle_timeout_ms` value it sent in `/config` as its
 
 ## Build
 
+First flash of a new board goes over USB:
+
 ```sh
 source ~/Dev/code/git/esp32/env.sh
 cd ~/Dev/code/git/esp32/projects/esp32-poe-scrypted-viewport
@@ -515,14 +526,12 @@ idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
 ```
 
-After the first USB flash, subsequent updates go over the LAN — no cable
-needed:
+Every update after that is one command over the LAN — build, OTA push,
+and rollback-checked verification (see [POST /firmware](#post-firmware)
+for what it does and the underlying curl):
 
 ```sh
-idf.py build
-curl --data-binary @build/scrypted-viewport.bin \
-    -H 'Content-Type: application/octet-stream' \
-    http://<device-ip>/firmware
+make ota [VIEWPORT=<host>]
 ```
 
 ## Firmware implementation notes
@@ -533,17 +542,19 @@ curl --data-binary @build/scrypted-viewport.bin \
 | --- | --- |
 | `app_main.c` | Boot sequence: NVS → state → Ethernet → mDNS → HTTP → state machine → state-client worker → display → JPEG decoder → touch. |
 | `viewport_state.{h,c}` | Shared runtime state behind a FreeRTOS mutex; every module reads/writes through `viewport_state_lock`. |
-| `nvs_config.{h,c}` | Persist viewport, scrypted URL, idle timeout, orientation, brightness to NVS. Load on boot; flip state UNCONFIGURED → ASLEEP when both name + URL are present. |
+| `nvs_config.{h,c}` | Persist viewport, scrypted URL, idle timeout, orientation, brightness to NVS. Load on boot; recomputes `configured` (true iff a scrypted URL is present). |
 | `net_eth.{h,c}` | Internal EMAC + IP101GRI PHY init, DHCP wait, IP getter. Pin map verified against Waveshare wiki + ESPHome's working config. |
 | `mdns_service.{h,c}` | `mdns_init()` + `_scrypted-viewport._tcp.local` advertisement. `mdns_service_refresh()` reapplies hostname + TXT after `/config` writes change them. |
-| `http_api.{h,c}` | `esp_http_server` on :80. All five endpoints (`GET /state`, `GET /config`, `POST /config`, `POST /state`, `POST /frame`) with partial-update + validation + status codes from the spec. |
+| `http_api.{h,c}` | `esp_http_server` on :80. All six endpoints (`GET/POST /state`, `GET/POST /config`, `POST /frame`, `POST /firmware`) with partial-update + validation + status codes from the spec. |
 | `display.{h,c}` | Pi 7"-style panel: I²C bring-up of the on-panel MCU at `0x45` (power-on register dance), ESP32-P4 MIPI-DSI in DPI video mode at canonical Pi 7" timings, gamma-corrected backlight PWM, orientation-aware blit (memcpy landscape / 90° CW rotate portrait). Owns the tear-free triple-buffer scheme (see *Display strategy*): scanning-fb tracking via `on_refresh_done`, free-fb selection for the decoder, `tear_guard_engaged` counter. |
 | `jpeg_decoder.{h,c}` | ESP32-P4 hardware JPEG engine with a 1 MB PSRAM scratch buffer and a `try_lock(0)` for concurrent `/frame` → 503. |
 | `state_machine.{h,c}` | Central wake/sleep transitions (mutex-protected, idempotent). Owns the `esp_timer` idle one-shot. `state_machine_set_local()` is the device-initiated variant — drives the transition *and* fires the outbound `/state` POST. |
 | `state_client.{h,c}` | Worker task + `xQueueOverwrite()` depth-1 queue for outbound POSTs to `<scrypted>/state`. 1 s timeout, fire-and-forget, `state_post_failures` counter. |
-| `touch.{h,c}` | FT5426 polling at 30 ms over the shared I²C bus. Tap = down→up within 500 ms, 150 ms debounce. |
-| `local_screens.{h,c}` | 8×8 bitmap font (sparse 95-char table populated for the IP and Loading strings), centered text rendering at scale 3×/4× into a PSRAM scratch FB, routed through `display_present_rgb565()` so orientation is automatic. |
-| `touch.{h,c}` | FT5426 polling. Short tap → toggle wake/sleep. ≥1.5 s hold → 15 s info-screen overlay. (Replaced `button.{h,c}` — no usable hardware button.) |
+| `touch.{h,c}` | FT5426 polling at 30 ms over the shared I²C bus. Short tap (down→up within 500 ms, 150 ms debounce) → toggle wake/sleep. ≥1.5 s hold → 15 s info-screen overlay. (No usable hardware button — GPIO35 is owned by EMAC.) |
+| `local_screens.{h,c}` | 8×8 bitmap font (sparse 95-char table), auto-scaled text rendering into a PSRAM scratch FB, routed through `display_present_rgb565()` so orientation is automatic. Info screen + Loading screen + long-press overlay timer. |
+| `stream_server.{h,c}` | Raw-TCP frame ingestion on :81 — dedicated recv-task + decode-task with a 3-buffer PSRAM ring, drop-oldest handoff, and the windowed data-plane stats behind `/state`'s `stream` object. |
+| `ota.{h,c}` | 30 s healthy-uptime timer that marks a `pending-verify` image `valid` (cancels bootloader rollback), plus the `ota_state` string for `/state`. |
+| `chip_temp.{h,c}` | On-die temperature sensor (TSENS); `NAN` when unavailable. Feeds `/state`'s `temp_c` and the info screen. |
 
 ### Memory strategy
 
