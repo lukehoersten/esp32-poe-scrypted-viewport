@@ -233,6 +233,29 @@ endpoint — replaces USB reflash once the device is on the LAN.
   previous slot on next reset. `/state` reports the current state via
   `ota_state`.
 
+The repo Makefile wraps the whole loop (recipes run in bash regardless
+of your interactive shell; `idf.py` env is sourced per-recipe):
+
+```sh
+make ota                    # reconfigure (fresh git stamp) + build + push + verify
+make ota VIEWPORT=<host>    # same, against a specific device (default 10.0.13.83)
+make build                  # incremental firmware build
+make cleanbuild             # wipe build/ + rebuild (fixes stale CMake generator cache)
+make verify                 # post-push pending-verify -> valid check only
+make check                  # type-check the Scrypted plugin (tsc --noEmit)
+```
+
+`make ota` (via `tools/ota.sh`) encodes the acceptance criterion from
+the rollback bullet above: the fresh boot must report
+`ota_state=pending-verify` before flipping to `valid` — a boot that
+reads `valid` immediately means the bootloader silently reverted to the
+old slot, and the script re-pushes once automatically (a known quirk of
+first pushes). It also runs `idf.py reconfigure` first because the
+embedded git hash is stamped at CMake configure time only; without it
+the binary reports a stale SHA after new commits.
+
+The raw mechanism underneath:
+
 ```sh
 idf.py build
 curl -v --data-binary @build/scrypted-viewport.bin \
