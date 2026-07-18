@@ -23,12 +23,14 @@ static esp_err_t apply_state(bool include_hostname)
 {
     char hostname[80];
     char name[64];
+    char mac[18];
     const char *resolution, *orientation;
 
     viewport_state_lock();
     viewport_state_t *st = viewport_state_get();
     snprintf(hostname, sizeof(hostname), "viewport-%s", st->viewport_name);
     snprintf(name,     sizeof(name),     "%s",         st->viewport_name);
+    snprintf(mac,      sizeof(mac),      "%s",         st->mac_str);
     resolution  = viewport_state_resolution_str();
     orientation = (st->orientation == VIEWPORT_ORIENTATION_PORTRAIT)
                       ? "portrait" : "landscape";
@@ -42,6 +44,9 @@ static esp_err_t apply_state(bool include_hostname)
         { "resolution",  resolution },
         { "orientation", orientation },
         { "name",        name },
+        // Stable identity for the Scrypted plugin's discovery/auto-heal:
+        // names are user-editable, the MAC is not.
+        { "mac",         mac },
     };
     return mdns_service_txt_set(SERVICE, PROTO, txt,
                                 sizeof(txt) / sizeof(txt[0]));
