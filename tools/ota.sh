@@ -11,8 +11,10 @@
 #        tools/ota.sh verify <host>           # post-push verification only
 set -euo pipefail
 
-cmd="${1:?usage: tools/ota.sh {push|verify} <host> [bin]}"
-host="${2:?usage: tools/ota.sh {push|verify} <host> [bin]}"
+usage() { echo "usage: tools/ota.sh {push|verify} <host> [bin]" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+cmd="$1"
+host="$2"
 bin="${3:-build/scrypted-viewport.bin}"
 
 state_line() {
@@ -68,7 +70,6 @@ case "$cmd" in
         verify
         ;;
     *)
-        echo "usage: tools/ota.sh {push|verify} <host> [bin]" >&2
-        exit 2
+        usage
         ;;
 esac
