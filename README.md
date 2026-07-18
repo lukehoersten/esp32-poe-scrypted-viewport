@@ -23,7 +23,7 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 
 ## Related docs
 
-- [`TESTING.md`](TESTING.md) — **the self-contained verification reference.** Status snapshot for every milestone, hardware prerequisites + open unknowns, bench-order playbook, per-milestone `curl` recipes, integration test suite. Start here before flashing anything.
+- [`TESTING.md`](TESTING.md) — **the verification reference.** New-unit bring-up playbook, regression `curl` recipes, outstanding tests, and the performance-review methodology. (All bring-up milestones are ✅ verified; the historical milestone log lives in git history.)
 - [`scrypted/README.md`](scrypted/README.md) — Scrypted-side script install + per-viewport binding UI (camera picker, wake triggers, mDNS-discovered host dropdowns).
 - [`scrypted/PLUGIN-CONVERSION.md`](scrypted/PLUGIN-CONVERSION.md) — TODO: plan for repackaging the script as a real installable Scrypted plugin (kills the Scripts-sandbox reload-leak machinery, makes deploys scriptable).
 
@@ -33,9 +33,9 @@ Scrypted Viewport owns Ethernet, JPEG decode, display, touch input and outbound 
 | --- | --- | --- |
 | Firmware (`main/`) | Full path ✅ on hardware: Ethernet, panel, streaming, OTA. Painted = sent = 24 fps at the Unifi medium substream, sub-50 ms glass-to-glass over a raw TCP data socket (:81). Binary ~900 KB, ESP-IDF 5.4 / `esp32p4`. See [What's next](#whats-next) for the measured budget. | Backlog only (task-watchdog counters, multi-camera per viewport, production sealing). |
 | Scrypted side (`scrypted/`) | v1.4 Script — DeviceProvider with per-viewport child devices, camera picker with trigger-scoped event subscriptions, live ffmpeg MJPEG streaming over the TCP data socket with prebuffer fast-start (~0.7 s wake-to-video), and built-in mDNS discovery (host dropdowns, auto-naming, auto-heal on DHCP renumber). Verified end-to-end. | v2: repackage the single-file script as an installable plugin — planned in [`scrypted/PLUGIN-CONVERSION.md`](scrypted/PLUGIN-CONVERSION.md). |
-| Hardware | Ethernet pin map confirmed (Waveshare wiki + ESPHome). Hosyond panel architecture confirmed (Pi 7"-style, TC358762 bridge + ATTINY MCU at I²C `0x45`). Jumper wiring documented. | Schematic confirmation needed for DSI FPC pin count, I²C GPIO mapping, BOOT button GPIO, flash size. All gated by [`TESTING.md`'s Hardware prerequisites](TESTING.md#hardware-prerequisites). |
+| Hardware | Ethernet pin map confirmed (Waveshare wiki + ESPHome). Hosyond panel architecture confirmed (Pi 7"-style, TC358762 bridge + ATTINY MCU at I²C `0x45`). All bring-up unknowns resolved — wiring + gotchas in [`TESTING.md`](TESTING.md#new-unit-bring-up). | Per-unit flash-size silkscreen check (16 vs 32 MB) when provisioning new boards. |
 
-See [`TESTING.md`](TESTING.md) for the full milestone-by-milestone status and the bench-order playbook.
+See [`TESTING.md`](TESTING.md) for the new-unit bring-up playbook, regression recipes, and the outstanding-test backlog.
 
 ## Hardware
 
