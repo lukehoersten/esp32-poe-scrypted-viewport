@@ -425,6 +425,14 @@ class Viewport extends ScryptedDeviceBase implements Settings {
         const settings: Setting[] = [
             {
                 group: "Binding",
+                key: "display_name",
+                title: "Viewport name",
+                description: "Friendly routing key used in firmware registration and callbacks. Renaming re-registers the device (its mDNS hostname follows). This — not the Scrypted device-name pencil — is the name the firmware knows.",
+                placeholder: "mudroom",
+                value: this.storage.getItem("display_name") || this.name || "",
+            } as any,
+            {
+                group: "Binding",
                 key: "host",
                 title: "IP or hostname",
                 description: "Viewport's address on the LAN. Viewports discovered via mDNS appear as choices (picking one stores just the address); manual entry also works — the device's info screen shows its MAC + IP.",
@@ -599,6 +607,29 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             } else {
                 this.provider.stopStream(this.nativeId!, /*sendSleep=*/ true);
             }
+            return;
+        }
+        if (key === "display_name") {
+            // The stored display_name is the canonical name (v.name drifts
+            // on reload, so registration deliberately ignores it). Renames
+            // therefore must land here — update storage, mirror the name
+            // onto the Scrypted device record so the UI matches, and
+            // re-register so the firmware + its mDNS hostname follow.
+            const newName = String(value ?? "").trim();
+            if (!newName) return;   // name is load-bearing; ignore empty
+            this.storage.setItem("display_name", newName);
+            try {
+                await deviceManager.onDeviceDiscovered({
+                    providerNativeId: this.provider.nativeId,
+                    nativeId: this.nativeId,
+                    name: newName,
+                    type: ScryptedDeviceType.SmartDisplay,
+                    interfaces: [ScryptedInterface.Settings],
+                });
+            } catch (e) {
+                this.console.warn(`rename: device record update failed: ${(e as Error).message}`);
+            }
+            await this.provider.onBindingChanged(this);
             return;
         }
         if (key === "triggers") {
@@ -963,7 +994,17 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     }
 
     async createDevice(settings: DeviceCreatorSettings): Promise<string> {
-        const name = String(settings.name || "viewport").trim();
+        const host = parseHostInput(settings.host);
+        // Name precedence: what the user typed > the discovered device's
+        // advertised TXT name (so picking "10.0.13.83 — kitchen (…)" from
+        // the dropdown names the viewport "kitchen" without retyping) >
+        // the "viewport" fallback.
+        let name = String(settings.name || "").trim();
+        if (!name) {
+            const discovered = await this.browseCached();
+            const d = discovered.find(x => x.ip === host || x.hostname === host);
+            name = d?.name || "viewport";
+        }
         const nativeId = `vp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
         // 1. Register the device with Scrypted FIRST. deviceManager
@@ -987,7 +1028,7 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         childStore.setItem("display_name", name);
         // A discovered-choice pick arrives as "ip — name (v..)"; store the
         // address token only. Manual IPs/hostnames pass through unchanged.
-        childStore.setItem("host",         parseHostInput(settings.host));
+        childStore.setItem("host",         host);
         childStore.setItem("cameraId",     String(settings.cameraId || ""));
         childStore.setItem("orientation",  String(settings.orientation || "portrait"));
         // settings.triggers arrives as an array from the multi-select.
