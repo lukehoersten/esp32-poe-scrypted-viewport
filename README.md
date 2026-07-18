@@ -589,7 +589,7 @@ Every endpoint is idempotent; every failure leaves the device in a sane state.
 
 ## What's next
 
-M1 – M8 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg + the zero-copy `JPEG → BGR888 → DSI` hot path now sustains **painted = sent = 24 fps** at the Unifi medium substream rate, sub-50 ms glass-to-glass, no source-side backpressure.
+M1 – M9 are all ✅ on hardware (see [`TESTING.md`](TESTING.md) for verification details). End-to-end Scrypted streaming via ffmpeg + the zero-copy `JPEG → BGR888 → DSI` hot path now sustains **painted = sent = 24 fps** at the Unifi medium substream rate, sub-50 ms glass-to-glass, no source-side backpressure.
 
 ### Measured per-frame budget
 

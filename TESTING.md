@@ -34,7 +34,7 @@ Status legend:
 | M6 | State + Idle Timer (`POST /state`, 409 guard) | ✅ | ✅ |
 | M7 | Touch + Outbound `/state` POST | ✅ | ✅ |
 | M8 | Local Screens + touch long-press | ✅ | ✅ |
-| M9 | Live Stream (`POST /stream`) | ⬜ | ⬜ |
+| M9 | Live Stream (raw TCP data socket `:81`) | ✅ | ✅ |
 
 ---
 
@@ -590,13 +590,15 @@ Tap rapidly (faster than the receiver can ack) and confirm the receiver only see
 
 ---
 
-## M9 — Live Stream (`POST /stream`)
+## M9 — Live Stream (raw TCP data socket `:81`)
 
-**Acceptance**: ≥ 10 fps multipart MJPEG over a single chunked POST.
+**Acceptance** (as designed: ≥ 10 fps): sustained live video from a real camera through Scrypted to the panel.
 
-**How to verify**: ffmpeg-driven test stream from a host, measure fps from the device's frame counter.
+**What shipped** (the design changed from the original `POST /stream` chunked-HTTP idea): a long-lived raw TCP connection to port 81 carrying length-prefixed JPEGs (16-byte `VPRT` v1 header — magic, length, seq, event-timestamp), received by a dedicated recv-task and handed to a decode/paint task through a 3-buffer PSRAM ring with drop-oldest semantics. See the README's *Measured per-frame budget* and *TCP window + EMAC tuning* sections for the architecture and numbers.
 
-**Status**: ⬜ pending.
+**How to verify**: trigger a camera event (or tap the panel) with the Scrypted script installed; watch the script's 10 s stream-health log and `curl http://<ip>/state | jq .stream` for the firmware's 30-frame windows.
+
+**Status**: ✅ verified on hardware (stream server `d1c8d45` recv/decode task split; TCP window + EMAC RX pool tuning follow-up). Steady state at the Unifi medium substream: **painted = sent = 24 fps**, wire 74 Mbps avg, glass-to-glass ~40–100 ms, no drops/flushes, `decode_errors=0` across thousands of frames. Re-confirmed 2026-07-18 during the v1.4.0 verification (24 fps painted, g2g ~100 ms on the first windows of a cold start).
 
 ---
 
