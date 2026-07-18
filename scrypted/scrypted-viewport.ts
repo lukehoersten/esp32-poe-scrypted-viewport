@@ -137,6 +137,189 @@ const DEFAULT_BRIGHTNESS         = 100;
 // JPEG end-of-image marker — the frame delimiter for the MJPEG demux loop.
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
+// ---------------------------------------------------------------------------
+// mDNS discovery of viewports on the LAN.
+//
+// The firmware advertises `_scrypted-viewport._tcp` (port 80) with TXT
+// records name/version/resolution/orientation/mac. We browse with a plain
+// dgram socket on an EPHEMERAL port: per RFC 6762 §6.7 a query from a
+// non-5353 source port is a "legacy unicast" query and responders reply
+// unicast straight back to that port — verified in the ESP-IDF responder
+// (mdns_send.c directs the answer at the querier's addr/port whenever
+// src_port != 5353). This sidesteps binding :5353 entirely, so we never
+// conflict with Scrypted's own HomeKit mDNS stack or a host avahi-daemon,
+// and it works under Docker host-networking or a native install alike.
+//
+// One response packet carries PTR + SRV + TXT + A together (RFC 6763
+// §12.1 additional-record rules), so correlation is per-packet — no
+// follow-up queries needed.
+
+const MDNS_SERVICE = "_scrypted-viewport._tcp.local";
+
+type DiscoveredViewport = {
+    name: string;         // TXT name — the viewport routing key
+    ip: string;           // A record
+    port: number;         // SRV port (the HTTP control plane, 80)
+    hostname: string;     // SRV target, e.g. "viewport-kitchen.local"
+    version?: string;
+    resolution?: string;
+    orientation?: string;
+    mac?: string;         // stable identity (firmware ≥ the mac-TXT build)
+};
+
+// Build the one-shot PTR question for MDNS_SERVICE.
+function buildMdnsQuery(): Buffer {
+    const labels = MDNS_SERVICE.split(".");
+    let qnameLen = 1;   // trailing root byte
+    for (const l of labels) qnameLen += 1 + l.length;
+    const buf = Buffer.alloc(12 + qnameLen + 4);
+    buf.writeUInt16BE(Date.now() & 0xffff, 0);  // ID — echoed in legacy-unicast replies
+    buf.writeUInt16BE(1, 4);                    // QDCOUNT=1; flags + other counts 0
+    let off = 12;
+    for (const l of labels) {
+        buf.writeUInt8(l.length, off++);
+        buf.write(l, off, "ascii");
+        off += l.length;
+    }
+    buf.writeUInt8(0, off++);
+    buf.writeUInt16BE(12, off);      // QTYPE  PTR
+    buf.writeUInt16BE(1, off + 2);   // QCLASS IN
+    return buf;
+}
+
+// Decode a (possibly compressed) DNS name at `off`. Returns the dotted
+// name and the offset just past its in-place encoding.
+function readDnsName(msg: Buffer, off: number): { name: string; next: number } {
+    const parts: string[] = [];
+    let next = -1;
+    let jumps = 0;
+    while (off < msg.length) {
+        const len = msg[off];
+        if (len === 0) { if (next < 0) next = off + 1; break; }
+        if ((len & 0xc0) === 0xc0) {             // compression pointer
+            if (next < 0) next = off + 2;
+            if (++jumps > 16) break;             // malformed-loop guard
+            off = ((len & 0x3f) << 8) | msg[off + 1];
+            continue;
+        }
+        parts.push(msg.subarray(off + 1, off + 1 + len).toString("ascii"));
+        off += 1 + len;
+    }
+    return { name: parts.join("."), next: next < 0 ? off : next };
+}
+
+// Parse one mDNS response packet into any advertised viewports it contains.
+// Correlation is within the packet: PTR names an instance; the instance's
+// SRV gives hostname+port; TXT gives the metadata; A maps hostname → IPv4.
+function parseMdnsResponse(msg: Buffer): DiscoveredViewport[] {
+    try {
+        if (msg.length < 12) return [];
+        const qd = msg.readUInt16BE(4);
+        const total = msg.readUInt16BE(6) + msg.readUInt16BE(8) + msg.readUInt16BE(10);
+        let off = 12;
+        for (let i = 0; i < qd; i++) off = readDnsName(msg, off).next + 4;
+
+        const ptrs: string[] = [];
+        const srvs  = new Map<string, { target: string; port: number }>();
+        const txts  = new Map<string, Record<string, string>>();
+        const addrs = new Map<string, string>();
+        for (let i = 0; i < total && off < msg.length; i++) {
+            const rec = readDnsName(msg, off);
+            off = rec.next;
+            if (off + 10 > msg.length) break;
+            const type  = msg.readUInt16BE(off);
+            const rdlen = msg.readUInt16BE(off + 8);
+            off += 10;
+            if (off + rdlen > msg.length) break;
+            const key = rec.name.toLowerCase();
+            if (type === 12 && key === MDNS_SERVICE) {                       // PTR
+                ptrs.push(readDnsName(msg, off).name);
+            } else if (type === 33) {                                        // SRV
+                srvs.set(key, { target: readDnsName(msg, off + 6).name,
+                                port:   msg.readUInt16BE(off + 4) });
+            } else if (type === 16) {                                        // TXT
+                const kv: Record<string, string> = {};
+                for (let t = off; t < off + rdlen; ) {
+                    const l = msg[t];
+                    const s = msg.subarray(t + 1, t + 1 + l).toString("utf8");
+                    const eq = s.indexOf("=");
+                    if (eq > 0) kv[s.slice(0, eq)] = s.slice(eq + 1);
+                    t += 1 + l;
+                }
+                txts.set(key, kv);
+            } else if (type === 1 && rdlen === 4) {                          // A
+                addrs.set(key, `${msg[off]}.${msg[off + 1]}.${msg[off + 2]}.${msg[off + 3]}`);
+            }
+            off += rdlen;
+        }
+
+        const out: DiscoveredViewport[] = [];
+        for (const inst of ptrs) {
+            const key = inst.toLowerCase();
+            const srv = srvs.get(key);
+            const txt = txts.get(key) || {};
+            const ip  = srv ? addrs.get(srv.target.toLowerCase()) : undefined;
+            if (!srv || !ip) continue;
+            out.push({
+                name: txt["name"] || inst.split(".")[0],
+                ip,
+                port: srv.port,
+                hostname: srv.target,
+                version: txt["version"],
+                resolution: txt["resolution"],
+                orientation: txt["orientation"],
+                mac: txt["mac"],
+            });
+        }
+        return out;
+    } catch { return []; }
+}
+
+// One-shot browse. Best-effort by design: any failure (sandbox without
+// dgram, no multicast route, zero responders) resolves to [] after the
+// timeout — callers degrade to manual host entry.
+function mdnsBrowse(console: any, timeoutMs = 1200): Promise<DiscoveredViewport[]> {
+    return new Promise((resolve) => {
+        let sock: any = null;
+        const found = new Map<string, DiscoveredViewport>();   // dedupe by mac, else ip
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            try { sock?.close(); } catch {}
+            resolve(Array.from(found.values()));
+        };
+        try {
+            const dgram = require("dgram");
+            sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
+            sock.on("error", (e: Error) => {
+                console.warn(`mdns browse: ${e.message}`);
+                finish();
+            });
+            sock.on("message", (msg: Buffer) => {
+                for (const v of parseMdnsResponse(msg)) found.set(v.mac || v.ip, v);
+            });
+            const query = buildMdnsQuery();
+            const send = () => { try { sock.send(query, 5353, "224.0.0.251"); } catch {} };
+            sock.bind(0, send);          // ephemeral source port → unicast replies
+            setTimeout(send, 400);       // mDNS is lossy; ask twice
+            setTimeout(finish, timeoutMs);
+        } catch (e) {
+            console.warn(`mdns browse unavailable: ${(e as Error).message}`);
+            finish();
+        }
+    });
+}
+
+// "10.0.13.83 — kitchen (v1.3.2, 480x800)" — shown as a host choice; only
+// the first whitespace-delimited token (the address) is stored.
+function hostChoice(d: DiscoveredViewport): string {
+    return `${d.ip} — ${d.name} (v${d.version || "?"}, ${d.resolution || "?"})`;
+}
+function parseHostInput(value: any): string {
+    return String(value ?? "").trim().split(/\s/)[0];
+}
+
 // ============================================================================
 // Child: one viewport binding
 // ============================================================================
@@ -236,13 +419,18 @@ class Viewport extends ScryptedDeviceBase implements Settings {
     }
 
     async getSettings(): Promise<Setting[]> {
+        // Discovered viewports become host-field choices (best-effort, []
+        // on any failure — manual entry always works).
+        const discovered = await this.provider.browseCached();
         const settings: Setting[] = [
             {
                 group: "Binding",
                 key: "host",
                 title: "IP or hostname",
-                description: "Viewport's address on the LAN. Set this manually — find it via your DHCP table, or `dns-sd -G v4 viewport-<mac>.local` on macOS, or `avahi-resolve -n viewport-<mac>.local` on Linux. The info screen on the device itself shows its MAC + IP.",
+                description: "Viewport's address on the LAN. Viewports discovered via mDNS appear as choices (picking one stores just the address); manual entry also works — the device's info screen shows its MAC + IP.",
                 placeholder: "192.168.1.42",
+                combobox: true,
+                choices: discovered.map(hostChoice),
                 value: this.host,
             } as any,
             {
@@ -360,6 +548,9 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             try {
                 const stateRes  = await fetchJsonRetry(`http://${this.host}/state`);
                 const configRes = await fetchJsonRetry(`http://${this.host}/config`);
+                // Seed the stable identity for mdns auto-heal: MAC survives
+                // renames and renumbers, unlike name or host.
+                if (stateRes?.mac) this.storage.setItem("mac", String(stateRes.mac));
                 settings.push(
                     { group: "Status (live)", key: "_st_name",   title: "name",                value: stateRes.name,                                                 readonly: true } as any,
                     { group: "Status (live)", key: "_st_mac",    title: "mac",                 value: stateRes.mac,                                                  readonly: true } as any,
@@ -419,7 +610,10 @@ class Viewport extends ScryptedDeviceBase implements Settings {
             if (!this.cameraIsDoorbell) arr = arr.filter(t => t !== "doorbell");
             this.storage.setItem("triggers", JSON.stringify(arr));
         } else {
-            this.storage.setItem(key, String(value ?? ""));
+            // host may arrive as a discovered choice "ip — name (v..)" —
+            // keep only the address token.
+            this.storage.setItem(key, key === "host" ? parseHostInput(value)
+                                                     : String(value ?? ""));
             if (key === "cameraId") {
                 // The camera binding drives which wake triggers are valid
                 // (doorbell only for doorbell cameras). Reconcile the stored
@@ -470,6 +664,18 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         abort:   AbortController;         // also tears down the ffmpeg child via its listener
     }>();
     private scryptedBase = "";
+    // Last mDNS browse, reused briefly so settings-UI re-renders (which
+    // call getSettings repeatedly) don't spam the LAN with queries.
+    private lastBrowse: { at: number; results: DiscoveredViewport[] } | null = null;
+
+    async browseCached(): Promise<DiscoveredViewport[]> {
+        if (this.lastBrowse && Date.now() - this.lastBrowse.at < 30_000) {
+            return this.lastBrowse.results;
+        }
+        const results = await mdnsBrowse(this.console);
+        this.lastBrowse = { at: Date.now(), results };
+        return results;
+    }
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -711,6 +917,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
     // ------------------------------------------------------------------------
 
     async getCreateDeviceSettings(): Promise<Setting[]> {
+        // Best-effort LAN browse — discovered viewports become dropdown
+        // choices on the host field; [] just means manual entry.
+        const discovered = await this.browseCached();
         return [
             {
                 key: "name",
@@ -721,9 +930,11 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             {
                 key: "host",
                 title: "IP or hostname",
-                description: "Where the firmware lives on the LAN — either an IP or `viewport-<mac>.local` (the device prints its own MAC on the info screen). The script POSTs to this string directly; no auto-resolution.",
+                description: "Where the firmware lives on the LAN. Viewports discovered via mDNS appear as choices (picking one stores just the address); manual entry of an IP or `viewport-<mac>.local` also works.",
                 placeholder: "192.168.1.42",
-            },
+                combobox: true,
+                choices: discovered.map(hostChoice),
+            } as any,
             {
                 key: "cameraId",
                 title: "Camera",
@@ -774,7 +985,9 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
         //    it into storage as a stable fallback for register/log paths.
         const childStore = deviceManager.getDeviceStorage(nativeId);
         childStore.setItem("display_name", name);
-        childStore.setItem("host",         String(settings.host || ""));
+        // A discovered-choice pick arrives as "ip — name (v..)"; store the
+        // address token only. Manual IPs/hostnames pass through unchanged.
+        childStore.setItem("host",         parseHostInput(settings.host));
         childStore.setItem("cameraId",     String(settings.cameraId || ""));
         childStore.setItem("orientation",  String(settings.orientation || "portrait"));
         // settings.triggers arrives as an array from the multi-select.
@@ -977,6 +1190,31 @@ class ScryptedViewportProvider extends ScryptedDeviceBase
             this.attachListener(v);
         } catch (e) {
             this.console.warn(`register "${name}" failed:`, (e as Error).message);
+            await this.tryMdnsHeal(v, name);
+        }
+    }
+
+    // Register failed → maybe the device renumbered (DHCP). Browse the LAN
+    // and match by MAC first (stable identity, seeded from /state or a
+    // prior heal), falling back to the advertised name. On a hit at a
+    // different address, rewrite host and retry the register once. Runs
+    // only on register failure, so it's naturally rate-limited to the
+    // 5-minute reregister cycle; the recursion terminates because a second
+    // failure re-browses and finds match.ip === v.host.
+    private async tryMdnsHeal(v: Viewport, name: string) {
+        try {
+            // Fresh browse, not the 30s cache — we're diagnosing a failure.
+            const discovered = await mdnsBrowse(this.console);
+            const knownMac = v.storage.getItem("mac") || "";
+            const match = (knownMac ? discovered.find(d => d.mac === knownMac) : undefined)
+                       ?? discovered.find(d => d.name === name);
+            if (!match || match.ip === v.host) return;
+            this.console.log(`viewport "${name}": host ${v.host || "?"} -> ${match.ip} (mdns auto-heal)`);
+            v.storage.setItem("host", match.ip);
+            if (match.mac) v.storage.setItem("mac", match.mac);
+            await this.registerViewport(v);
+        } catch (e) {
+            this.console.warn(`mdns heal "${name}" failed:`, (e as Error).message);
         }
     }
 
